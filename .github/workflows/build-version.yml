@@ -1,0 +1,56 @@
+name: Build version
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup update stable
+          rustup target add --toolchain stable "$TARGET"
+          host=$(rustc +stable -vV | awk '$1 == "host:" {print $2}')
+          lld="$(rustc +stable --print sysroot)/lib/rustlib/$host/bin/rust-lld"
+          RUSTFLAGS="-C linker=$lld -C linker-flavor=ld.lld" \
+            cargo +stable build --locked --release --bins --target "$TARGET"
+      - name: Verify ELF and package binaries
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          cd "target/$TARGET/release"
+          for bin in aidbg aidbg-server; do
+            file "$bin"
+            if readelf -lW "$bin" | grep 'INTERP' >/dev/null; then exit 1; fi
+            if readelf -dW "$bin" | grep '(NEEDED)' >/dev/null; then exit 1; fi
+            case "$ARCH" in
+              x86_64) readelf -hW "$bin" | grep 'X86-64' ;;
+              aarch64) readelf -hW "$bin" | grep 'AArch64' ;;
+              *) exit 1 ;;
+            esac
+          done
+          tar -czf "$GITHUB_WORKSPACE/aidbg-$GITHUB_REF_NAME-linux-$ARCH.tar.gz" aidbg aidbg-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}
+          path: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error

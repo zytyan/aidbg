@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package aidbg;
+
+service Debugger {
+  rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
+  rpc QuerySnapshot (QuerySnapshotRequest) returns (SnapshotReply);
+}
+
+enum FreezeMode {
+  TRY = 0;
+  NEVER = 1;
+  REQUIRED = 2;
+}
+
+message Selection {
+  repeated string fields = 1;
+  optional int32 tid = 2;
+  optional uint32 frames = 3;
+}
+
+message SnapshotRequest {
+  int32 pid = 1;
+  FreezeMode freeze = 2;
+  Selection selection = 3;
+}
+
+message QuerySnapshotRequest {
+  string snapshot_id = 1;
+  Selection selection = 2;
+}
+
+message SnapshotReply {
+  string snapshot_id = 1;
+  // The snapshot payload is also the document exported and saved by the CLI.
+  bytes snapshot_json = 2;
+}
