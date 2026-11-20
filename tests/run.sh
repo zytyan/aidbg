@@ -10,3 +10,7 @@ cc -Wall -Wextra -Werror -O2 -g -fomit-frame-pointer -fno-optimize-sibling-calls
   -fPIE -pie tests/fixture.c -pthread -Lartifacts -lfixture \
   '-Wl,-rpath,$ORIGIN' -o artifacts/fixture
 python3 tests/run.py
+cc -Wall -Wextra -Werror -O2 -g -fPIE -pie tests/breakpoint_fixture.c -pthread -ldl   -o artifacts/breakpoint_fixture
+cc -Wall -Wextra -Werror -O2 -g -fno-pie -no-pie tests/breakpoint_fixture.c -pthread -ldl   -o artifacts/breakpoint_fixture_nopie
+c++ -Wall -Wextra -Werror -O2 -g -fPIC -shared tests/cpp_symbols.cc -o artifacts/libcppsymbols.so
+python3 tests/breakpoints.py

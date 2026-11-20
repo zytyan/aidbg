@@ -1,9 +1,9 @@
-use crate::modules::{self, Module};
+use crate::modules::{self, Layout, Module, ModuleInfo};
 use crate::regs::{FP, PC, Registers, SP};
 use crate::trace::Trace;
 use crate::{Result, error, hex};
 use gimli::{
-    BaseAddresses, CfaRule, DebugFrame, EhFrame, Encoding, EndianRcSlice, EvaluationResult,
+    BaseAddresses, CfaRule, DebugFrame, EhFrame, Encoding, EndianArcSlice, EvaluationResult,
     Expression, LittleEndian, Location, RegisterRule, UnwindContext, UnwindSection, Value, Vendor,
 };
 use object::{Object, ObjectSection};
@@ -11,38 +11,40 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::Metadata;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 const MAX_DEPTH: usize = 32;
 const MAX_IMAGE: u64 = 32 * 1024 * 1024;
 const MAX_IMAGES_TOTAL: u64 = 64 * 1024 * 1024;
-type Data = EndianRcSlice<LittleEndian>;
+type Data = EndianArcSlice<LittleEndian>;
 
 struct Image {
     bytes: Vec<u8>,
     eh: EhFrame<Data>,
     debug: DebugFrame<Data>,
     bases: BaseAddresses,
+    layout: Layout,
 }
 
 impl Image {
-    fn new(bytes: Vec<u8>) -> Result<Self> {
+    fn new(bytes: Vec<u8>, module: &Module) -> Result<Self> {
         let obj = object::File::parse(&*bytes)?;
         if !modules::is_executable_module(&obj) {
             return Err(error("unsupported module ELF"));
         }
+        let layout = Layout::new(&obj, module)?;
         let section = |name| -> Result<Data> {
             // Frame sections are typically small. Bound decompression before
             // asking object to allocate uncompressed bytes.
-            let data: Rc<[u8]> = if let Some(s) = obj.section_by_name(name) {
+            let data: Arc<[u8]> = if let Some(s) = obj.section_by_name(name) {
                 let compressed = s.compressed_data()?;
                 if compressed.uncompressed_size > MAX_IMAGE {
                     return Err(error("CFI section exceeds byte budget"));
                 }
-                Rc::from(s.uncompressed_data()?.as_ref())
+                Arc::from(s.uncompressed_data()?.as_ref())
             } else {
-                Rc::from(&[][..])
+                Arc::from(&[][..])
             };
             Ok(Data::new(data, LittleEndian))
         };
@@ -64,6 +66,7 @@ impl Image {
             eh,
             debug,
             bases,
+            layout,
         })
     }
 
@@ -259,7 +262,11 @@ pub struct Frame {
     module_id: Option<usize>,
     file_offset: Option<String>,
     elf_address: Option<String>,
+    module_instance: Option<String>,
+    module_offset: Option<String>,
     function: Option<String>,
+    #[serde(flatten)]
+    names: Option<crate::cpp_names::Names>,
     method: &'static str,
     #[serde(skip)]
     link_pc: Option<u64>,
@@ -298,10 +305,33 @@ impl Images {
                 let cap = (MAX_IMAGES_TOTAL - self.bytes).min(MAX_IMAGE);
                 let bytes = m.read_image(root, exe, cap).map_err(|e| e.to_string())?;
                 self.bytes += bytes.len() as u64;
-                Image::new(bytes).map_err(|e| e.to_string())
+                Image::new(bytes, m).map_err(|e| e.to_string())
             })
             .as_ref()
             .map_err(String::as_str)
+    }
+
+    pub fn module_info(
+        &self,
+        id: usize,
+        m: &Module,
+        root: Option<&Path>,
+        exe: Option<&Metadata>,
+    ) -> ModuleInfo {
+        let info = m.info(id, exe, None);
+        if let Some(Ok(image)) = self.data.get(&id)
+            && let Ok(obj) = object::File::parse(&*image.bytes)
+        {
+            let kind = match obj.kind() {
+                object::ObjectKind::Dynamic => "shared_object",
+                _ => "executable_mapping",
+            };
+            return info.with_elf(obj.build_id().ok().flatten(), &image.layout, kind);
+        }
+        if let Some(kind) = root.and_then(|root| m.image_kind(root)) {
+            return m.info(id, exe, Some(kind));
+        }
+        info
     }
 
     pub fn symbolize(&self, stack: &mut Stack) {
@@ -313,7 +343,14 @@ impl Images {
                 continue;
             };
             if let Ok(obj) = object::File::parse(&*image.bytes) {
-                frame.function = modules::symbol(&obj, pc);
+                frame.names = modules::symbol(&obj, pc);
+                frame.function = frame.names.as_ref().map(|names| {
+                    names
+                        .demangled_name
+                        .as_ref()
+                        .unwrap_or(&names.display_name)
+                        .clone()
+                });
             }
         }
     }
@@ -343,7 +380,7 @@ impl Images {
                     .iter()
                     .enumerate()
                     .find_map(|(i, m)| m.executable_at(lookup).map(|map| (i, m, map)));
-                let file_offset = d.and_then(|(_, _, m)| m.offset.checked_add(lookup - m.start));
+                let file_offset = d.and_then(|(_, _, m)| m.file_offset(lookup));
                 let mut frame = Frame {
                     pc: hex(pc),
                     lookup_pc: hex(lookup),
@@ -351,7 +388,10 @@ impl Images {
                     module_id: d.map(|(i, _, _)| i),
                     file_offset: file_offset.map(hex),
                     elf_address: None,
+                    module_instance: None,
+                    module_offset: None,
                     function: None,
+                    names: None,
                     method,
                     link_pc: None,
                 };
@@ -366,15 +406,17 @@ impl Images {
                     bias: 0,
                 };
                 let step = (|| -> Result<Step> {
-                    let ((id, module, _), off) = d
-                        .zip(file_offset)
-                        .ok_or_else(|| error("PC outside known file-backed modules"))?;
+                    let (id, module, map) =
+                        d.ok_or_else(|| error("PC outside known file-backed modules"))?;
                     let image = self.image(id, module, root, exe).map_err(error)?;
-                    let obj = object::File::parse(&*image.bytes)?;
-                    let link = modules::link_address(&obj, off)
+                    let (instance, link) = image
+                        .layout
+                        .for_address(map, lookup)
                         .ok_or_else(|| error("no executable ELF segment for PC"))?;
                     frame.link_pc = Some(link);
                     frame.elf_address = Some(hex(link));
+                    frame.module_instance = Some(hex(instance.base));
+                    frame.module_offset = Some(hex(link - image.layout.elf_base));
                     c.bias = lookup.wrapping_sub(link);
                     image.step(link, c)
                 })();

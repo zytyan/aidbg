@@ -1,11 +1,18 @@
+#[path = "aidbg-server/breakpoint_service.rs"]
+mod breakpoint_service;
+
 use aidbg::rpc::{
-    FreezeMode, MAX_DOCUMENT, MAX_RPC, QuerySnapshotRequest, SnapshotReply, SnapshotRequest,
+    BreakpointCapabilitiesRequest, BreakpointEventsRequest, DisassembleRequest, DocumentReply,
+    FreezeMode, InstallBreakpointRequest, MAX_DOCUMENT, MAX_RPC, QuerySnapshotRequest,
+    RemoveBreakpointRequest, ResolveAddressRequest, SearchSymbolsRequest, SnapshotReply,
+    SnapshotRequest, SymbolMatch,
     debugger_server::{Debugger, DebuggerServer},
 };
 use aidbg::{
     Result, Snapshot,
     selection::{Filter, with_id},
 };
+use breakpoint_service::Breakpoints;
 use clap::Parser;
 use std::fs::{self, File, Permissions};
 use std::io::{self, Read, Write};
@@ -18,7 +25,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 #[derive(Parser)]
-#[command(about = "Run the local aidbg snapshot service")]
+#[command(about = "Run the local aidbg debugger service")]
 struct Args {
     /// Absolute path in a private directory owned by this user.
     #[arg(long)]
@@ -94,6 +101,7 @@ struct Service {
     store: Arc<Store>,
     // The blocking job owns this guard until capture has finished cleanup.
     capture_lock: Arc<Mutex<()>>,
+    breakpoints: Breakpoints,
 }
 
 #[tonic::async_trait]
@@ -103,20 +111,22 @@ impl Debugger for Service {
         request: Request<SnapshotRequest>,
     ) -> std::result::Result<Response<SnapshotReply>, Status> {
         let req = request.into_inner();
-        if req.pid <= 0 || req.pid as u32 == std::process::id() {
-            return Err(Status::invalid_argument(
-                "expected a positive PID other than the server PID",
-            ));
-        }
+        validate_pid(req.pid)?;
         let mode = FreezeMode::try_from(req.freeze)
             .map_err(|_| Status::invalid_argument("unknown freeze mode"))?;
         let filter =
             Filter::parse(req.selection).map_err(|e| Status::invalid_argument(e.to_string()))?;
         let store = Arc::clone(&self.store);
         let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
         let result = tokio::task::spawn_blocking(move || {
             let snapshot = {
                 let _guard = guard;
+                if mode != FreezeMode::Never && breakpoints.contains(req.pid) {
+                    return Err(Status::failed_precondition(
+                        "an active breakpoint session owns this PID",
+                    ));
+                }
                 Snapshot::run(req.pid, mode)
             };
             store.save(snapshot, filter).map_err(internal)
@@ -133,12 +143,144 @@ impl Debugger for Service {
         let req = request.into_inner();
         let filter =
             Filter::parse(req.selection).map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let id = match req.event_id {
+            Some(event) if req.snapshot_id.is_empty() => self.breakpoints.snapshot_id(event)?,
+            None if !req.snapshot_id.is_empty() => req.snapshot_id,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "provide a snapshot ID or an event ID",
+                ));
+            }
+        };
         let store = Arc::clone(&self.store);
-        let reply = tokio::task::spawn_blocking(move || store.query(&req.snapshot_id, filter))
+        let reply = tokio::task::spawn_blocking(move || store.query(&id, filter))
             .await
             .map_err(internal)??;
         Ok(Response::new(reply))
     }
+
+    async fn install_breakpoint(
+        &self,
+        request: Request<InstallBreakpointRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            document(breakpoints.install(req)?)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn remove_breakpoint(
+        &self,
+        request: Request<RemoveBreakpointRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            document(breakpoints.remove(req.pid, req.breakpoint_id)?)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn breakpoint_events(
+        &self,
+        request: Request<BreakpointEventsRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        document(self.breakpoints.events(request.into_inner()))
+    }
+
+    async fn search_symbols(
+        &self,
+        request: Request<SearchSymbolsRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let mode = SymbolMatch::try_from(req.match_mode)
+            .map_err(|_| Status::invalid_argument("unknown symbol match mode"))?;
+        tokio::task::spawn_blocking(move || {
+            let result = aidbg::symbols::search(
+                req.pid,
+                &req.pattern,
+                mode,
+                req.module.as_deref(),
+                req.limit.unwrap_or(256),
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            document(result)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn resolve_address(
+        &self,
+        request: Request<ResolveAddressRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        tokio::task::spawn_blocking(move || {
+            let result = aidbg::symbols::resolve(req.pid, req.address)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            document(result)
+        })
+        .await
+        .map_err(internal)?
+    }
+    async fn disassemble(
+        &self,
+        request: Request<DisassembleRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        tokio::task::spawn_blocking(move || {
+            let window = aidbg::disassembly::disassemble(
+                req.pid,
+                req.address,
+                req.before.unwrap_or(4),
+                req.after.unwrap_or(8),
+                req.start,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            document(window)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn breakpoint_capabilities(
+        &self,
+        _: Request<BreakpointCapabilitiesRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        document(aidbg::breakpoint::capabilities())
+    }
+}
+
+fn validate_pid(pid: i32) -> std::result::Result<(), Status> {
+    if pid <= 0 || pid as u32 == std::process::id() {
+        return Err(Status::invalid_argument(
+            "expected a positive PID other than the server PID",
+        ));
+    }
+    Ok(())
+}
+
+fn document(value: impl serde::Serialize) -> std::result::Result<Response<DocumentReply>, Status> {
+    let json = serde_json::to_vec(&value).map_err(internal)?;
+    if json.len() > MAX_DOCUMENT {
+        return Err(Status::resource_exhausted(
+            "response exceeds the document size limit",
+        ));
+    }
+    Ok(Response::new(DocumentReply { json }))
 }
 
 fn private_directory(path: &Path) -> Result<()> {
@@ -189,11 +331,14 @@ async fn main() -> Result<()> {
     };
     fs::set_permissions(&socket.path, Permissions::from_mode(0o600))?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let store = Arc::new(Store(args.state_dir));
+    let (breakpoints, saver) = Breakpoints::new(Arc::clone(&store))?;
     let service = Service {
-        store: Arc::new(Store(args.state_dir)),
+        store,
+        breakpoints: breakpoints.clone(),
         capture_lock: Arc::new(Mutex::new(())),
     };
-    Server::builder()
+    let result = Server::builder()
         .add_service(
             DebuggerServer::new(service)
                 .max_decoding_message_size(MAX_RPC)
@@ -205,6 +350,15 @@ async fn main() -> Result<()> {
                 _=term.recv()=>{},
             }
         })
-        .await?;
+        .await;
+    tokio::task::spawn_blocking(move || {
+        breakpoints.stop();
+        if saver.join().is_err() {
+            return Err(io::Error::other("event writer panicked"));
+        }
+        Ok(())
+    })
+    .await??;
+    result?;
     Ok(())
 }

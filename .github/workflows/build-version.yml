@@ -10,19 +10,26 @@ permissions:
 
 jobs:
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+      - name: Install compiler for bundled Capstone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
+          CC: musl-gcc
         run: |
           set -euo pipefail
           rustup update stable

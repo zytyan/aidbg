@@ -1,0 +1,812 @@
+use crate::modules::{self, Backing, Layout, Mapping, Module, ModuleIdentity, id_hex, signed_hex};
+use crate::procfs::Status;
+use crate::rpc::SymbolMatch;
+use crate::{Result, error, hex};
+use gimli::{ColumnType, DwarfSections, EndianSlice, LittleEndian};
+use nix::libc;
+use object::{Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+const IMAGE_LIMIT: u64 = 128 * 1024 * 1024;
+const DEBUG_LIMIT: u64 = 256 * 1024 * 1024;
+const MAX_RESULTS: u32 = 4096;
+
+struct Process {
+    _dir: File,
+    root: PathBuf,
+    exe: Option<fs::Metadata>,
+    modules: Vec<Module>,
+    anonymous: Vec<Mapping>,
+}
+
+impl Process {
+    fn open(pid: i32) -> Result<Self> {
+        let dir = File::open(format!("/proc/{pid}"))?;
+        let root = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        if Status::read(&root)?.field("Tgid") != Some(&pid.to_string()) {
+            return Err(error("pass the process ID (thread-group leader)"));
+        }
+        let space = modules::address_space(&root)?;
+        let exe = fs::metadata(root.join("exe")).ok();
+        Ok(Self {
+            _dir: dir,
+            root,
+            exe,
+            modules: space.modules,
+            anonymous: space.anonymous,
+        })
+    }
+}
+
+fn path_matches(module: &Module, filter: &str) -> bool {
+    let path = module.path();
+    path == Path::new(filter) || path.file_name() == Some(OsStr::new(filter))
+}
+
+fn module_matches(module: &Module, filter: &str, build_id: Option<&[u8]>) -> bool {
+    path_matches(module, filter)
+        || build_id.is_some_and(|id| id_hex(id).eq_ignore_ascii_case(filter))
+}
+
+fn may_be_build_id(filter: &str) -> bool {
+    filter.len() >= 2
+        && filter.len().is_multiple_of(2)
+        && filter.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+struct DebugFile {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn debug_bytes(path: &Path) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > DEBUG_LIMIT {
+        return Err(error("invalid or oversized external debug file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(DEBUG_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > DEBUG_LIMIT {
+        return Err(error("external debug file exceeds byte limit"));
+    }
+    Ok(bytes)
+}
+
+fn external_debug(
+    root: &Path,
+    module: &Module,
+    obj: &object::File<'_>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let build_id = obj.build_id().ok().flatten();
+    let debuglink = obj.gnu_debuglink().ok().flatten().filter(|(name, _)| {
+        let name = Path::new(OsStr::from_bytes(name));
+        name.file_name()
+            .is_some_and(|basename| name.as_os_str() == basename)
+    });
+    let target_root = root.join("root");
+    let target_debug = target_root.join("usr/lib/debug");
+    let host_debug = Path::new("/usr/lib/debug");
+    let mut candidates = Vec::new();
+    if let Some(id) = build_id.filter(|id| !id.is_empty()) {
+        let id = id_hex(id);
+        let relative = format!(".build-id/{}/{}.debug", &id[..2], &id[2..]);
+        candidates.push((target_debug.join(&relative), None));
+        candidates.push((host_debug.join(relative), None));
+    }
+    let module_path = module.path();
+    if let Some((name, crc)) = debuglink
+        && let Ok(relative) = module_path.strip_prefix("/")
+        && let Some(dir) = relative.parent()
+    {
+        let name = OsStr::from_bytes(name);
+        candidates.push((target_root.join(dir).join(name), Some(crc)));
+        candidates.push((target_root.join(dir).join(".debug").join(name), Some(crc)));
+        candidates.push((target_debug.join(dir).join(name), Some(crc)));
+        candidates.push((host_debug.join(dir).join(name), Some(crc)));
+    }
+    for (path, crc) in candidates {
+        let Ok(bytes) = debug_bytes(&path) else {
+            continue;
+        };
+        if crc.is_some_and(|expected| crc32fast::hash(&bytes) != expected) {
+            continue;
+        }
+        let Ok(debug) = object::File::parse(&*bytes) else {
+            continue;
+        };
+        if !modules::is_executable_module(&debug)
+            || debug.architecture() != obj.architecture()
+            || (debug.symbol_table().is_none() && !debug.has_debug_symbols())
+        {
+            continue;
+        }
+        let Ok(found_id) = debug.build_id() else {
+            continue;
+        };
+        let identity_ok = match (crc, build_id, found_id) {
+            (_, Some(expected), Some(found)) => expected == found,
+            (Some(_), _, _) => true,
+            _ => false,
+        };
+        if identity_ok {
+            let display = path
+                .strip_prefix(&target_root)
+                .map(|p| Path::new("/").join(p))
+                .unwrap_or(path);
+            return Some((display, bytes));
+        }
+    }
+    None
+}
+
+impl DebugFile {
+    fn discover(root: &Path, module: &Module, obj: &object::File<'_>) -> Option<Self> {
+        let (path, bytes) = external_debug(root, module, obj)?;
+        Some(Self { path, bytes })
+    }
+
+    fn parse(&self) -> Option<object::File<'_>> {
+        object::File::parse(&*self.bytes).ok()
+    }
+
+    fn display_path(&self) -> String {
+        self.path.to_string_lossy().into_owned()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+struct Source {
+    table: &'static str,
+    debug_file: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct Symbol {
+    #[serde(flatten)]
+    names: crate::cpp_names::Names,
+    name: String,
+    elf_address: String,
+    size: u64,
+    kind: String,
+    binding: &'static str,
+    visibility: &'static str,
+    elf_type: u8,
+    sources: Vec<Source>,
+}
+
+#[derive(Clone, Serialize)]
+struct Match {
+    module: ModuleIdentity,
+    instance: String,
+    load_bias: String,
+    runtime_address: String,
+    module_offset: String,
+    #[serde(flatten)]
+    symbol: Symbol,
+}
+
+fn symbol_record<'a>(sym: impl ObjectSymbol<'a>, name: &str, source: Source) -> Symbol {
+    let (elf_type, binding, visibility) = match sym.flags() {
+        SymbolFlags::Elf { st_info, st_other } => {
+            let binding = match st_info.0 >> 4 {
+                0 => "local",
+                1 => "global",
+                2 => "weak",
+                10 => "gnu_unique",
+                _ => "other",
+            };
+            let visibility = match st_other.0 & 3 {
+                0 => "default",
+                1 => "internal",
+                2 => "hidden",
+                _ => "protected",
+            };
+            (st_info.0 & 15, binding, visibility)
+        }
+        _ => (0, "other", "other"),
+    };
+    Symbol {
+        names: crate::cpp_names::names(name),
+        name: name.to_owned(),
+        elf_address: hex(sym.address()),
+        size: sym.size(),
+        kind: format!("{:?}", sym.kind()).to_ascii_lowercase(),
+        binding,
+        visibility,
+        elf_type,
+        sources: vec![source],
+    }
+}
+
+fn has_elf_address<'a>(symbol: &impl ObjectSymbol<'a>) -> bool {
+    symbol.is_definition()
+        || (symbol.section_index().is_some()
+            && matches!(symbol.flags(), SymbolFlags::Elf { st_info, .. }
+                if st_info.0 & 15 == object::elf::STT_GNU_IFUNC.0))
+}
+
+fn symbol_entries<'a>(
+    image: &'a object::File<'a>,
+    debug: Option<&'a object::File<'a>>,
+) -> impl Iterator<Item = (object::Symbol<'a, 'a>, &'static str, bool)> + 'a {
+    image
+        .symbols()
+        .map(|s| (s, ".symtab", false))
+        .chain(image.dynamic_symbols().map(|s| (s, ".dynsym", false)))
+        .chain(
+            debug
+                .into_iter()
+                .flat_map(|obj| obj.symbols().map(|s| (s, ".symtab", true))),
+        )
+}
+
+fn find_symbols(
+    image: &object::File<'_>,
+    debug: Option<&DebugFile>,
+    matches: impl Fn(&str) -> bool,
+    limit: usize,
+) -> (BTreeMap<(u64, String, u8), Symbol>, bool) {
+    let parsed = debug.and_then(DebugFile::parse);
+    let mut results: BTreeMap<_, Symbol> = BTreeMap::new();
+    let debug_path = debug.map(DebugFile::display_path);
+    let mut truncated = false;
+    for (sym, table, external) in symbol_entries(image, parsed.as_ref()) {
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() || !matches(name) || !has_elf_address(&sym) {
+            continue;
+        }
+        let address = sym.address();
+        let row = symbol_record(
+            sym,
+            name,
+            Source {
+                table,
+                debug_file: if external { debug_path.clone() } else { None },
+            },
+        );
+        let key = (address, row.name.clone(), row.elf_type);
+        if let Some(existing) = results.get_mut(&key) {
+            for source in row.sources {
+                if !existing.sources.contains(&source) {
+                    existing.sources.push(source);
+                }
+            }
+        } else if results.len() < limit {
+            results.insert(key, row);
+        } else {
+            truncated = true;
+        }
+    }
+    (results, truncated)
+}
+
+enum Matcher<'a> {
+    Exact(&'a str),
+    Glob(glob::Pattern),
+    Regex(regex::Regex),
+}
+
+impl<'a> Matcher<'a> {
+    fn new(mode: SymbolMatch, pattern: &'a str) -> Result<Self> {
+        if pattern.is_empty() || pattern.len() > 1024 {
+            return Err(error("symbol pattern must contain 1–1024 bytes"));
+        }
+        Ok(match mode {
+            SymbolMatch::Exact => Self::Exact(pattern),
+            SymbolMatch::Glob => Self::Glob(glob::Pattern::new(pattern)?),
+            SymbolMatch::Regex => Self::Regex(
+                regex::RegexBuilder::new(pattern)
+                    .size_limit(1024 * 1024)
+                    .build()?,
+            ),
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Exact(pattern) => name == *pattern,
+            Self::Glob(pattern) => pattern.matches(name),
+            Self::Regex(pattern) => pattern.is_match(name),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SearchIssue {
+    module: ModuleIdentity,
+    error: String,
+}
+
+#[derive(Serialize)]
+pub struct Search {
+    matches: Vec<Match>,
+    truncated: bool,
+    issues: Vec<SearchIssue>,
+}
+
+pub fn search(
+    pid: i32,
+    pattern: &str,
+    mode: SymbolMatch,
+    filter: Option<&str>,
+    limit: u32,
+) -> Result<Search> {
+    if !(1..=MAX_RESULTS).contains(&limit) {
+        return Err(error("symbol result limit must be in 1..=4096"));
+    }
+    let matcher = Matcher::new(mode, pattern)?;
+    let process = Process::open(pid)?;
+    let mut results = Search {
+        matches: Vec::new(),
+        truncated: false,
+        issues: Vec::new(),
+    };
+    for module in &process.modules {
+        if filter.is_some_and(|f| !path_matches(module, f) && !may_be_build_id(f)) {
+            continue;
+        }
+        let bytes = match module.read_image(&process.root, process.exe.as_ref(), IMAGE_LIMIT) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if filter.is_none_or(|f| path_matches(module, f)) {
+                    results.issues.push(SearchIssue {
+                        module: module.identity(None),
+                        error: e.to_string(),
+                    });
+                }
+                continue;
+            }
+        };
+        let Ok(image) = object::File::parse(&*bytes) else {
+            continue;
+        };
+        if !modules::is_executable_module(&image) {
+            continue;
+        }
+        let build_id = image.build_id().ok().flatten();
+        if filter.is_some_and(|f| !module_matches(module, f, build_id)) {
+            continue;
+        }
+        let layout = Layout::new(&image, module)?;
+        if layout.instances.is_empty() {
+            results.issues.push(SearchIssue {
+                module: module.identity(build_id),
+                error: "could not match ELF load segments to executable mappings".into(),
+            });
+            continue;
+        }
+        let identity = module.identity(build_id);
+        let debug = DebugFile::discover(&process.root, module, &image);
+        let (symbols, truncated) = find_symbols(
+            &image,
+            debug.as_ref(),
+            |name| matcher.matches(name),
+            limit as usize + 1,
+        );
+        results.truncated |= truncated;
+        for instance in &layout.instances {
+            for ((elf_address, _, _), symbol) in &symbols {
+                let Some(runtime) =
+                    layout.runtime(*instance, *elf_address, module, &process.anonymous)
+                else {
+                    continue;
+                };
+                if results.matches.len() == limit as usize {
+                    results.truncated = true;
+                    return Ok(results);
+                }
+                results.matches.push(Match {
+                    module: identity.clone(),
+                    instance: hex(instance.base),
+                    load_bias: signed_hex(instance.bias),
+                    runtime_address: hex(runtime),
+                    module_offset: hex(elf_address - layout.elf_base),
+                    symbol: symbol.clone(),
+                });
+            }
+        }
+    }
+    Ok(results)
+}
+
+pub(crate) struct BreakpointSite {
+    pub address: u64,
+    backing: Backing,
+    file_offset: u64,
+}
+
+impl BreakpointSite {
+    pub fn still_mapped(&self, root: &Path) -> Result<bool> {
+        Ok(modules::read(root)?.iter().any(|module| {
+            module.backing == self.backing
+                && module
+                    .executable_at(self.address)
+                    .is_some_and(|map| map.file_offset(self.address) == Some(self.file_offset))
+        }))
+    }
+}
+
+pub(crate) fn breakpoint_site(
+    root: &Path,
+    filter: &str,
+    name: &str,
+    base: Option<u64>,
+) -> Result<BreakpointSite> {
+    if filter.len() > 4096 || name.len() > 1024 {
+        return Err(error("module or symbol name exceeds length limit"));
+    }
+    let exe = fs::metadata(root.join("exe")).ok();
+    let mut found = None;
+    for module in modules::read(root)? {
+        if !path_matches(&module, filter) && !may_be_build_id(filter) {
+            continue;
+        }
+        let bytes = match module.read_image(root, exe.as_ref(), IMAGE_LIMIT) {
+            Ok(bytes) => bytes,
+            Err(e) if path_matches(&module, filter) => return Err(e),
+            Err(_) => continue,
+        };
+        let Ok(image) = object::File::parse(&*bytes) else {
+            continue;
+        };
+        if !modules::is_executable_module(&image)
+            || !module_matches(&module, filter, image.build_id().ok().flatten())
+        {
+            continue;
+        }
+        let layout = Layout::new(&image, &module)?;
+        let debug = DebugFile::discover(root, &module, &image);
+        let parsed = debug.as_ref().and_then(DebugFile::parse);
+        let addresses: BTreeSet<_> = symbol_entries(&image, parsed.as_ref())
+            .filter(|(s, _, _)| {
+                s.kind() == SymbolKind::Text && has_elf_address(s) && s.name().ok() == Some(name)
+            })
+            .map(|(s, _, _)| s.address())
+            .collect();
+        for &instance in layout
+            .instances
+            .iter()
+            .filter(|i| base.is_none_or(|base| i.base == base))
+        {
+            for &elf_address in &addresses {
+                let Some(address) = layout.runtime(instance, elf_address, &module, &[]) else {
+                    continue;
+                };
+                let Some(map) = module.executable_at(address) else {
+                    continue;
+                };
+                let file_offset = map
+                    .file_offset(address)
+                    .ok_or_else(|| error("invalid map offset"))?;
+                if found.is_some() {
+                    return Err(error(
+                        "ambiguous module or symbol; specify a full module path and load instance",
+                    ));
+                }
+                found = Some(BreakpointSite {
+                    address,
+                    backing: module.backing.clone(),
+                    file_offset,
+                });
+            }
+        }
+    }
+    found.ok_or_else(|| error("executable symbol not found in a loaded module instance"))
+}
+
+#[derive(Serialize)]
+struct Line {
+    file: PathBuf,
+    line: Option<u64>,
+    column: Option<u64>,
+    source: Option<String>,
+}
+
+fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>> {
+    let mut total = 0;
+    let sections = DwarfSections::load(|id: gimli::SectionId| -> Result<_> {
+        let Some(section) = obj.section_by_name(id.name()) else {
+            return Ok(std::borrow::Cow::Borrowed(&[][..]));
+        };
+        let length = section.compressed_data()?.uncompressed_size;
+        if length > DEBUG_LIMIT - total {
+            return Err(error("DWARF decompression exceeds byte limit"));
+        }
+        total += length;
+        Ok(section.uncompressed_data()?)
+    })?;
+    let dwarf = sections.borrow(|s| EndianSlice::new(s, LittleEndian));
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(program) = unit.line_program.clone() else {
+            continue;
+        };
+        let mut ranges = dwarf.unit_ranges(&unit)?;
+        let mut contains = false;
+        let mut had_ranges = false;
+        while let Some(range) = ranges.next()? {
+            had_ranges = true;
+            if (range.begin..range.end).contains(&pc) {
+                contains = true;
+                break;
+            }
+        }
+        if had_ranges && !contains {
+            continue;
+        }
+        let (program, sequences) = program.sequences()?;
+        for sequence in sequences.iter().filter(|s| (s.start..s.end).contains(&pc)) {
+            let mut rows = program.resume_from(sequence);
+            let mut line = None;
+            while let Some((header, row)) = rows.next_row()? {
+                if row.end_sequence() || row.address() > pc {
+                    break;
+                }
+                let Some(file) = row.file(header) else {
+                    continue;
+                };
+                let mut path = PathBuf::new();
+                if let Some(dir) = &unit.comp_dir {
+                    path.push(dir.to_string_lossy().as_ref());
+                }
+                if let Some(dir) = file.directory(header) {
+                    path.push(dwarf.attr_string(&unit, dir)?.to_string_lossy().as_ref());
+                }
+                path.push(
+                    dwarf
+                        .attr_string(&unit, file.path_name())?
+                        .to_string_lossy()
+                        .as_ref(),
+                );
+                line = Some(Line {
+                    file: path,
+                    line: row.line().map(|n| n.get()),
+                    column: match row.column() {
+                        ColumnType::LeftEdge => None,
+                        ColumnType::Column(n) => Some(n.get()),
+                    },
+                    source: None,
+                });
+            }
+            if line.is_some() {
+                return Ok(line);
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Serialize)]
+pub struct ResolvedAddress {
+    runtime_address: String,
+    module: Option<ModuleIdentity>,
+    instance: Option<String>,
+    elf_address: Option<String>,
+    module_offset: Option<String>,
+    file_offset: Option<String>,
+    display: Option<String>,
+    symbol: Option<Symbol>,
+    source_line: Option<Line>,
+    issues: Vec<String>,
+}
+
+pub fn resolve(pid: i32, address: u64) -> Result<ResolvedAddress> {
+    let process = Process::open(pid)?;
+    let mut result = ResolvedAddress {
+        runtime_address: hex(address),
+        module: None,
+        instance: None,
+        elf_address: None,
+        module_offset: None,
+        file_offset: None,
+        display: None,
+        symbol: None,
+        source_line: None,
+        issues: Vec::new(),
+    };
+    let file_mapping = process
+        .modules
+        .iter()
+        .find_map(|module| module.mapping_at(address).map(|map| (module, map)));
+    let anonymous_mapping = || {
+        let map = process.anonymous.iter().find(|map| map.contains(address))?;
+        let module = process
+            .modules
+            .iter()
+            .find(|module| module.maps.iter().any(|file_map| file_map.end == map.start))?;
+        Some((module, map))
+    };
+    let Some((module, map)) = file_mapping.or_else(anonymous_mapping) else {
+        return Ok(result);
+    };
+    let name = module
+        .path()
+        .file_name()
+        .map(OsStr::to_string_lossy)
+        .unwrap_or_default()
+        .into_owned();
+    if file_mapping.is_some() {
+        result.module = Some(module.identity(None));
+        if let Some(offset) = map.file_offset(address) {
+            result.display = Some(format!("{name}+{} (file offset)", hex(offset)));
+            result.file_offset = Some(hex(offset));
+        }
+    }
+    let bytes = match module.read_image(&process.root, process.exe.as_ref(), IMAGE_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            result.issues.push(e.to_string());
+            return Ok(result);
+        }
+    };
+    let image = match object::File::parse(&*bytes) {
+        Ok(image) if modules::is_executable_module(&image) => image,
+        Ok(_) => return Ok(result),
+        Err(e) => {
+            result.issues.push(e.to_string());
+            return Ok(result);
+        }
+    };
+    let layout = Layout::new(&image, module)?;
+    let relocated = if file_mapping.is_some() {
+        layout.for_address(map, address)
+    } else {
+        layout.zerofill_address(map, address, module)
+    };
+    let Some((instance, link)) = relocated else {
+        if file_mapping.is_some() {
+            result
+                .issues
+                .push("address does not match a loaded ELF segment".into());
+        }
+        return Ok(result);
+    };
+    result.module = Some(module.identity(image.build_id().ok().flatten()));
+    result.instance = Some(hex(instance.base));
+    result.elf_address = Some(hex(link));
+    result.module_offset = Some(hex(link - layout.elf_base));
+    result.display = Some(format!("{name}+{}", hex(link - layout.elf_base)));
+    let debug = DebugFile::discover(&process.root, module, &image);
+    let debug_image = debug.as_ref().and_then(DebugFile::parse);
+    let is_exec = map.executable();
+    let mut best = None;
+    for (sym, table, external) in symbol_entries(&image, debug_image.as_ref()) {
+        let Ok(name) = sym.name() else { continue };
+        if name.is_empty() || !has_elf_address(&sym) || (is_exec && sym.kind() != SymbolKind::Text)
+        {
+            continue;
+        }
+        let Some(delta) = link.checked_sub(sym.address()) else {
+            continue;
+        };
+        if delta >= sym.size().max(1) {
+            continue;
+        }
+        if best.is_none_or(|best| delta < best) {
+            best = Some(delta);
+            result.display = Some(if delta == 0 {
+                name.into()
+            } else {
+                format!("{name}+{}", hex(delta))
+            });
+            result.symbol = Some(symbol_record(
+                sym,
+                name,
+                Source {
+                    table,
+                    debug_file: external
+                        .then(|| debug.as_ref().expect("parsed debug image").display_path()),
+                },
+            ));
+        }
+    }
+    if let (Some(file), Some(obj)) = (debug.as_ref(), debug_image.as_ref()) {
+        match dwarf_line(obj, link) {
+            Ok(line) => {
+                result.source_line = line.map(|mut line| {
+                    line.source = Some(file.display_path());
+                    line
+                })
+            }
+            Err(e) => result.issues.push(e.to_string()),
+        }
+    }
+    if result.source_line.is_none() {
+        match dwarf_line(&image, link) {
+            Ok(line) => result.source_line = line,
+            Err(e) => result.issues.push(e.to_string()),
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn code_start(root: &Path, address: u64) -> Option<u64> {
+    let exe = fs::metadata(root.join("exe")).ok();
+    let modules = modules::read(root).ok()?;
+    let (module, map) = modules
+        .iter()
+        .find_map(|m| m.executable_at(address).map(|map| (m, map)))?;
+    let bytes = module.read_image(root, exe.as_ref(), IMAGE_LIMIT).ok()?;
+    let image = object::File::parse(&*bytes).ok()?;
+    let layout = Layout::new(&image, module).ok()?;
+    let (instance, link) = layout.for_address(map, address)?;
+    let find = |obj: &object::File<'_>| {
+        obj.symbols()
+            .chain(obj.dynamic_symbols())
+            .filter(|sym| sym.kind() == SymbolKind::Text && has_elf_address(sym))
+            .filter(|sym| {
+                link.checked_sub(sym.address())
+                    .is_some_and(|delta| delta < sym.size().max(1))
+            })
+            .map(|sym| sym.address())
+            .max()
+    };
+    let entry = find(&image).or_else(|| {
+        let debug = DebugFile::discover(root, module, &image)?;
+        find(&debug.parse()?)
+    })?;
+    let runtime = instance.relocate(entry)?;
+    map.contains(runtime).then_some(runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_and_verifies_build_id_debug_files() -> Result<()> {
+        let path = std::env::current_exe()?;
+        let bytes = fs::read(&path)?;
+        let image = object::File::parse(&*bytes)?;
+        let id = image
+            .build_id()?
+            .ok_or_else(|| error("test executable lacks a build ID"))?;
+        let module = modules::read(Path::new("/proc/self"))?
+            .into_iter()
+            .find(|module| module.path() == path)
+            .ok_or_else(|| error("test executable is missing from proc maps"))?;
+        let root = tempfile::tempdir()?;
+        let hex = id_hex(id);
+        let candidate = PathBuf::from(format!(
+            "usr/lib/debug/.build-id/{}/{}.debug",
+            &hex[..2],
+            &hex[2..]
+        ));
+        let file = root.path().join("root").join(&candidate);
+        fs::create_dir_all(file.parent().expect("debug file directory"))?;
+
+        let note = image
+            .section_by_name(".note.gnu.build-id")
+            .expect("GNU build ID note");
+        let (offset, _) = note.file_range().expect("build ID note file offset");
+        let position = note
+            .data()?
+            .windows(id.len())
+            .position(|window| window == id)
+            .expect("build ID in GNU note");
+        let mut mismatch = bytes.clone();
+        mismatch[usize::try_from(offset)? + position] ^= 1;
+        fs::write(&file, &mismatch)?;
+        assert!(external_debug(root.path(), &module, &image).is_none());
+
+        fs::write(&file, &bytes)?;
+        let (found_path, found) = external_debug(root.path(), &module, &image)
+            .ok_or_else(|| error("verified debug file was not discovered"))?;
+        assert_eq!(found_path, Path::new("/").join(candidate));
+        assert_eq!(object::File::parse(&*found)?.build_id()?, Some(id));
+        Ok(())
+    }
+}

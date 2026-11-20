@@ -5,6 +5,13 @@ package aidbg;
 service Debugger {
   rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
   rpc QuerySnapshot (QuerySnapshotRequest) returns (SnapshotReply);
+  rpc InstallBreakpoint (InstallBreakpointRequest) returns (DocumentReply);
+  rpc RemoveBreakpoint (RemoveBreakpointRequest) returns (DocumentReply);
+  rpc BreakpointEvents (BreakpointEventsRequest) returns (DocumentReply);
+  rpc SearchSymbols (SearchSymbolsRequest) returns (DocumentReply);
+  rpc ResolveAddress (ResolveAddressRequest) returns (DocumentReply);
+  rpc Disassemble (DisassembleRequest) returns (DocumentReply);
+  rpc BreakpointCapabilities (BreakpointCapabilitiesRequest) returns (DocumentReply);
 }
 
 enum FreezeMode {
@@ -28,6 +35,7 @@ message SnapshotRequest {
 message QuerySnapshotRequest {
   string snapshot_id = 1;
   Selection selection = 2;
+  optional uint64 event_id = 3;
 }
 
 message SnapshotReply {
@@ -35,3 +43,76 @@ message SnapshotReply {
   // The snapshot payload is also the document exported and saved by the CLI.
   bytes snapshot_json = 2;
 }
+
+message DocumentReply {
+  bytes json = 1;
+}
+
+enum CaptureScope {
+  THREAD = 0;
+  PROCESS = 1;
+}
+
+message SymbolLocation {
+  string module = 1;
+  string symbol = 2;
+  optional uint64 instance = 3;
+}
+
+enum BreakpointKind {
+  HARDWARE = 0;
+  SOFTWARE = 1;
+  WRITE = 2;
+  READ_WRITE = 3;
+}
+
+message InstallBreakpointRequest {
+  int32 pid = 1;
+  oneof location {
+    uint64 address = 2;
+    SymbolLocation symbol = 3;
+  }
+  CaptureScope scope = 4;
+  optional uint32 timeout_ms = 5;
+  BreakpointKind kind = 6;
+  optional uint32 length = 7;
+}
+
+message RemoveBreakpointRequest {
+  int32 pid = 1;
+  uint64 breakpoint_id = 2;
+}
+
+message BreakpointEventsRequest {
+  optional uint64 breakpoint_id = 1;
+  uint64 after_event_id = 2;
+}
+
+enum SymbolMatch {
+  EXACT = 0;
+  GLOB = 1;
+  REGEX = 2;
+}
+
+message SearchSymbolsRequest {
+  int32 pid = 1;
+  string pattern = 2;
+  SymbolMatch match_mode = 3;
+  optional string module = 4;
+  optional uint32 limit = 5;
+}
+
+message ResolveAddressRequest {
+  int32 pid = 1;
+  uint64 address = 2;
+}
+
+message DisassembleRequest {
+  int32 pid = 1;
+  uint64 address = 2;
+  optional uint32 before = 3;
+  optional uint32 after = 4;
+  optional uint64 start = 5;
+}
+
+message BreakpointCapabilitiesRequest {}

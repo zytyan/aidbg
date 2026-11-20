@@ -18,8 +18,24 @@ pub struct Mapping {
     pub perms: String,
 }
 
+impl Mapping {
+    pub fn executable(&self) -> bool {
+        self.perms.as_bytes().get(2) == Some(&b'x')
+    }
+
+    pub fn contains(&self, address: u64) -> bool {
+        (self.start..self.end).contains(&address)
+    }
+
+    pub fn file_offset(&self, address: u64) -> Option<u64> {
+        self.contains(address)
+            .then(|| self.offset.checked_add(address - self.start))
+            .flatten()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Backing {
+pub(crate) struct Backing {
     major: u32,
     minor: u32,
     inode: u64,
@@ -27,7 +43,7 @@ struct Backing {
 }
 
 pub struct Module {
-    backing: Backing,
+    pub(crate) backing: Backing,
     pub maps: Vec<Mapping>,
 }
 
@@ -35,10 +51,30 @@ pub struct Module {
 pub struct ModuleInfo {
     id: usize,
     kind: &'static str,
+    #[serde(flatten)]
+    identity: ModuleIdentity,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    load_instances: Vec<LoadInstanceInfo>,
+    mappings: Vec<MappingInfo>,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct ModuleIdentity {
     path: String,
     device: String,
     inode: String,
-    mappings: Vec<MappingInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_id: Option<String>,
+}
+
+pub(crate) fn id_hex(id: &[u8]) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Serialize)]
+struct LoadInstanceInfo {
+    base: String,
+    load_bias: String,
 }
 
 #[derive(Serialize)]
@@ -60,48 +96,129 @@ fn field<'a>(rest: &mut &'a [u8]) -> Result<&'a str> {
     Ok(answer)
 }
 
-pub fn read(base: &Path) -> Result<Vec<Module>> {
+fn map_entries(base: &Path) -> Result<Vec<(Backing, Mapping)>> {
     let data = fs::read(base.join("maps"))?;
+    data.split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let mut rest = line;
+            let (start, end) = field(&mut rest)?
+                .split_once('-')
+                .ok_or_else(|| error("invalid maps range"))?;
+            let perms = field(&mut rest)?.to_owned();
+            let offset = u64::from_str_radix(field(&mut rest)?, 16)?;
+            let (major, minor) = field(&mut rest)?
+                .split_once(':')
+                .ok_or_else(|| error("invalid maps device"))?;
+            let inode = field(&mut rest)?.parse::<u64>()?;
+            Ok((
+                Backing {
+                    major: u32::from_str_radix(major, 16)?,
+                    minor: u32::from_str_radix(minor, 16)?,
+                    inode,
+                    path: rest.trim_ascii_start().to_vec(),
+                },
+                Mapping {
+                    start: u64::from_str_radix(start, 16)?,
+                    end: u64::from_str_radix(end, 16)?,
+                    offset,
+                    perms,
+                },
+            ))
+        })
+        .collect()
+}
+
+pub fn mapping_at(root: &Path, address: u64) -> Result<Option<Mapping>> {
+    Ok(map_entries(root)?
+        .into_iter()
+        .map(|(_, map)| map)
+        .find(|map| map.contains(address)))
+}
+
+pub(crate) fn private_code_mapping(
+    root: &Path,
+    address: u64,
+    executable: bool,
+) -> Result<Option<CodeMapping>> {
+    let Some((backing, map)) = map_entries(root)?.into_iter().find(|(_, map)| {
+        map.contains(address)
+            && (!executable || map.executable())
+            && map.perms.as_bytes().get(3) == Some(&b'p')
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(match backing.inode {
+        0 => CodeMapping::Anonymous {
+            start: map.start,
+            end: map.end,
+            name: backing.path,
+        },
+        inode => CodeMapping::File {
+            major: backing.major,
+            minor: backing.minor,
+            inode,
+            offset: map
+                .file_offset(address)
+                .ok_or_else(|| error("invalid mapping offset"))?,
+        },
+    }))
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) enum CodeMapping {
+    File {
+        major: u32,
+        minor: u32,
+        inode: u64,
+        offset: u64,
+    },
+    Anonymous {
+        start: u64,
+        end: u64,
+        name: Vec<u8>,
+    },
+}
+
+pub fn is_executable_address(root: &Path, address: u64) -> Result<bool> {
+    // Absolute breakpoints can also point to anonymous executable mappings.
+    Ok(map_entries(root)?
+        .iter()
+        .any(|(_, map)| map.executable() && map.contains(address)))
+}
+
+pub struct AddressSpace {
+    pub modules: Vec<Module>,
+    pub anonymous: Vec<Mapping>,
+}
+
+pub fn address_space(base: &Path) -> Result<AddressSpace> {
     let mut files = BTreeMap::<Backing, Vec<Mapping>>::new();
-    let mut executable = BTreeSet::new();
-    for line in data.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
-        let mut rest = line;
-        let (start, end) = field(&mut rest)?
-            .split_once('-')
-            .ok_or_else(|| error("invalid maps range"))?;
-        let perms = field(&mut rest)?.to_owned();
-        let offset = u64::from_str_radix(field(&mut rest)?, 16)?;
-        let (major, minor) = field(&mut rest)?
-            .split_once(':')
-            .ok_or_else(|| error("invalid maps device"))?;
-        let inode = field(&mut rest)?.parse::<u64>()?;
-        let path = rest.trim_ascii_start();
-        if inode == 0 && path != b"[vdso]" {
+    let mut loaded = BTreeSet::new();
+    let mut anonymous = Vec::new();
+    for (backing, map) in map_entries(base)? {
+        if backing.inode == 0 && backing.path != b"[vdso]" {
+            if backing.path.is_empty() || backing.path.starts_with(b"[anon:") {
+                anonymous.push(map);
+            }
             continue;
         }
-        let backing = Backing {
-            major: u32::from_str_radix(major, 16)?,
-            minor: u32::from_str_radix(minor, 16)?,
-            inode,
-            path: path.to_vec(),
-        };
-        if perms.as_bytes().get(2) == Some(&b'x') {
-            executable.insert(backing.clone());
+        if map.executable() {
+            loaded.insert(backing.clone());
         }
-        files.entry(backing).or_default().push(Mapping {
-            start: u64::from_str_radix(start, 16)?,
-            end: u64::from_str_radix(end, 16)?,
-            offset,
-            perms,
-        });
+        files.entry(backing).or_default().push(map);
     }
     let mut modules: Vec<_> = files
         .into_iter()
-        .filter(|(k, _)| executable.contains(k))
+        .filter(|(key, _)| loaded.contains(key))
         .map(|(backing, maps)| Module { backing, maps })
         .collect();
-    modules.sort_unstable_by_key(|m| m.maps[0].start);
-    Ok(modules)
+    modules.sort_unstable_by_key(|module| module.maps[0].start);
+    Ok(AddressSpace { modules, anonymous })
+}
+
+pub fn read(base: &Path) -> Result<Vec<Module>> {
+    Ok(address_space(base)?.modules)
 }
 
 impl Module {
@@ -122,9 +239,8 @@ impl Module {
         ModuleInfo {
             id,
             kind,
-            path: String::from_utf8_lossy(&b.path).into_owned(),
-            device: format!("{:x}:{:x}", b.major, b.minor),
-            inode: b.inode.to_string(),
+            identity: self.identity(None),
+            load_instances: Vec::new(),
             mappings: self
                 .maps
                 .iter()
@@ -138,10 +254,31 @@ impl Module {
         }
     }
 
+    pub fn identity(&self, build_id: Option<&[u8]>) -> ModuleIdentity {
+        let b = &self.backing;
+        ModuleIdentity {
+            path: String::from_utf8_lossy(&b.path).into_owned(),
+            device: format!("{:x}:{:x}", b.major, b.minor),
+            inode: b.inode.to_string(),
+            build_id: build_id.map(id_hex),
+        }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        let path = self
+            .backing
+            .path
+            .strip_suffix(b" (deleted)")
+            .unwrap_or(&self.backing.path);
+        PathBuf::from(OsString::from_vec(path.to_vec()))
+    }
+
+    pub fn mapping_at(&self, address: u64) -> Option<&Mapping> {
+        self.maps.iter().find(|m| m.contains(address))
+    }
+
     pub fn executable_at(&self, pc: u64) -> Option<&Mapping> {
-        self.maps
-            .iter()
-            .find(|m| m.start <= pc && pc < m.end && m.perms.as_bytes().get(2) == Some(&b'x'))
+        self.maps.iter().find(|m| m.contains(pc) && m.executable())
     }
 
     fn matches(&self, m: &fs::Metadata) -> bool {
@@ -158,11 +295,7 @@ impl Module {
         if is_main {
             candidates.push(root.join("exe"));
         }
-        if let Some(m) = self
-            .maps
-            .iter()
-            .find(|m| m.perms.as_bytes().get(2) == Some(&b'x'))
-        {
+        if let Some(m) = self.maps.iter().find(|m| m.executable()) {
             candidates.push(
                 root.join("map_files")
                     .join(format!("{:x}-{:x}", m.start, m.end)),
@@ -224,20 +357,227 @@ pub fn is_executable_module(obj: &object::File<'_>) -> bool {
         && matches!(obj.kind(), ObjectKind::Dynamic | ObjectKind::Executable)
 }
 
-pub fn link_address(obj: &object::File<'_>, offset: u64) -> Option<u64> {
-    obj.segments().find_map(|p| {
-        let (off, size) = p.file_range();
-        if !matches!(p.flags(), SegmentFlags::Elf {p_flags, ..} if (p_flags & object::elf::PF_X).0 != 0) {
-            return None;
+#[derive(Clone, Copy)]
+pub struct LoadSegment {
+    pub address: u64,
+    pub memory_size: u64,
+    pub offset: u64,
+    pub file_size: u64,
+    pub executable: bool,
+}
+
+pub fn load_segments(obj: &object::File<'_>) -> impl Iterator<Item = LoadSegment> {
+    // The ELF ObjectSegment iterator yields only PT_LOAD program headers.
+    obj.segments().map(|segment| {
+        let (offset, file_size) = segment.file_range();
+        let executable = matches!(segment.flags(), SegmentFlags::Elf { p_flags, .. }
+            if (p_flags & object::elf::PF_X).0 != 0);
+        LoadSegment {
+            address: segment.address(),
+            memory_size: segment.size(),
+            offset,
+            file_size,
+            executable,
         }
-        let delta = offset.checked_sub(off)?;
-        (delta < size)
-            .then(|| p.address().checked_add(delta))
-            .flatten()
     })
 }
 
-pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<String> {
+impl LoadSegment {
+    pub fn contains(self, address: u64) -> bool {
+        address
+            .checked_sub(self.address)
+            .is_some_and(|delta| delta < self.memory_size)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Instance {
+    pub base: u64,
+    pub bias: i128,
+}
+
+impl Instance {
+    pub fn relocate(self, address: u64) -> Option<u64> {
+        u64::try_from(i128::from(address) + self.bias).ok()
+    }
+
+    fn unrelocate(self, address: u64) -> Option<u64> {
+        u64::try_from(i128::from(address) - self.bias).ok()
+    }
+}
+
+pub struct Layout {
+    pub elf_base: u64,
+    segments: Vec<LoadSegment>,
+    pub instances: Vec<Instance>,
+    page: u64,
+}
+
+impl Layout {
+    pub fn new(obj: &object::File<'_>, module: &Module) -> Result<Self> {
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
+        if page == 0 || !page.is_power_of_two() {
+            return Err(error("invalid system page size"));
+        }
+        let segments: Vec<_> = load_segments(obj).collect();
+        let elf_base = segments
+            .iter()
+            .map(|s| s.address & !(page - 1))
+            .min()
+            .ok_or_else(|| error("ELF image has no loadable segments"))?;
+        let mut layout = Self {
+            elf_base,
+            segments,
+            instances: Vec::new(),
+            page,
+        };
+        // Each file-backed executable mapping anchors a separate load bias.
+        let mut biases = BTreeSet::new();
+        for map in &module.maps {
+            if !map.executable() {
+                continue;
+            }
+            for &segment in layout.segments.iter().filter(|s| s.executable) {
+                if let Some(bias) = layout.mapping_bias(map, segment) {
+                    biases.insert(bias);
+                }
+            }
+        }
+        layout.instances = biases
+            .into_iter()
+            .filter_map(|bias| {
+                let base = u64::try_from(i128::from(elf_base) + bias).ok()?;
+                Some(Instance { base, bias })
+            })
+            .collect();
+        Ok(layout)
+    }
+
+    fn mapping_bias(&self, map: &Mapping, segment: LoadSegment) -> Option<i128> {
+        let mask = self.page - 1;
+        if segment.file_size == 0 || segment.offset & mask != segment.address & mask {
+            return None;
+        }
+        let first = segment.offset & !mask;
+        let last = segment
+            .offset
+            .checked_add(segment.file_size)?
+            .checked_add(mask)?
+            & !mask;
+        let map_last = map.offset.checked_add(map.end.checked_sub(map.start)?)?;
+        if map.offset.max(first) >= map_last.min(last) {
+            return None;
+        }
+        Some(
+            i128::from(map.start) - i128::from(segment.address) - i128::from(map.offset)
+                + i128::from(segment.offset),
+        )
+    }
+
+    pub fn for_address(&self, map: &Mapping, address: u64) -> Option<(Instance, u64)> {
+        let executable = map.executable();
+        self.instances.iter().find_map(|&instance| {
+            let elf_address = instance.unrelocate(address)?;
+            self.segments
+                .iter()
+                .any(|&segment| {
+                    (!executable || segment.executable)
+                        && segment.contains(elf_address)
+                        && self.mapping_bias(map, segment) == Some(instance.bias)
+                })
+                .then_some((instance, elf_address))
+        })
+    }
+
+    pub fn runtime(
+        &self,
+        instance: Instance,
+        address: u64,
+        module: &Module,
+        anonymous: &[Mapping],
+    ) -> Option<u64> {
+        if !self
+            .segments
+            .iter()
+            .any(|segment| segment.contains(address))
+        {
+            return None;
+        }
+        let runtime = instance.relocate(address)?;
+        if let Some(map) = module.mapping_at(runtime) {
+            return (self.for_address(map, runtime)?.0.base == instance.base).then_some(runtime);
+        }
+        let map = anonymous.iter().find(|map| map.contains(runtime))?;
+        self.zerofill_address(map, runtime, module)
+            .is_some_and(|(found, _)| found.base == instance.base)
+            .then_some(runtime)
+    }
+
+    pub fn zerofill_address(
+        &self,
+        map: &Mapping,
+        address: u64,
+        module: &Module,
+    ) -> Option<(Instance, u64)> {
+        self.instances.iter().find_map(|&instance| {
+            let elf_address = instance.unrelocate(address)?;
+            self.segments
+                .iter()
+                .any(|&segment| {
+                    if !segment.contains(elf_address)
+                        || elf_address - segment.address < segment.file_size
+                    {
+                        return false;
+                    }
+                    let memory_start = segment
+                        .address
+                        .checked_add(segment.file_size)
+                        .and_then(|value| value.checked_add(self.page - 1))
+                        .map(|value| value & !(self.page - 1))
+                        .and_then(|value| instance.relocate(value));
+                    memory_start == Some(map.start)
+                        && module.maps.iter().any(|mapping| {
+                            mapping.end == map.start
+                                && self.mapping_bias(mapping, segment) == Some(instance.bias)
+                        })
+                })
+                .then_some((instance, elf_address))
+        })
+    }
+}
+
+impl ModuleInfo {
+    pub fn with_elf(
+        mut self,
+        build_id: Option<&[u8]>,
+        layout: &Layout,
+        kind: &'static str,
+    ) -> Self {
+        self.identity.build_id = build_id.map(id_hex);
+        self.load_instances = layout
+            .instances
+            .iter()
+            .map(|instance| LoadInstanceInfo {
+                base: hex(instance.base),
+                load_bias: signed_hex(instance.bias),
+            })
+            .collect();
+        if self.kind == "executable_mapping" {
+            self.kind = kind;
+        }
+        self
+    }
+}
+
+pub fn signed_hex(value: i128) -> String {
+    if value < 0 {
+        format!("-0x{:x}", value.unsigned_abs())
+    } else {
+        format!("0x{value:x}")
+    }
+}
+
+pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<crate::cpp_names::Names> {
     let s = obj
         .symbols()
         .chain(obj.dynamic_symbols())
@@ -249,10 +589,5 @@ pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<String> {
         })
         .max_by_key(|s| s.address())?;
     let name = s.name().ok()?;
-    Some(
-        cpp_demangle::Symbol::new(name.as_bytes())
-            .ok()
-            .and_then(|s| s.demangle().ok())
-            .unwrap_or_else(|| name.to_owned()),
-    )
+    Some(crate::cpp_names::names(name))
 }

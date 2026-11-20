@@ -228,7 +228,10 @@ def check_mcp(socket, snapshot_id):
             }})
             message({"method": "notifications/initialized"})
             listed = message({"id": 2, "method": "tools/list"})
-            assert {t["name"] for t in listed["tools"]} == {"snapshot", "snapshot_query"}
+            assert {t["name"] for t in listed["tools"]} == {
+        "snapshot", "snapshot_query", "breakpoint_set", "breakpoint_remove",
+        "breakpoint_events", "breakpoint_capabilities", "symbols", "resolve_address", "disassemble",
+    }
             result = message({"id": 3, "method": "tools/call", "params": {
                 "name": "snapshot_query", "arguments": {
                     "snapshot_id": snapshot_id, "fields": ["process.pid"],

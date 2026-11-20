@@ -4,11 +4,16 @@
 )))]
 compile_error!("aidbg supports Linux x86_64 and AArch64");
 
+pub mod breakpoint;
+mod cpp_names;
+pub mod disassembly;
 mod modules;
 mod procfs;
 mod regs;
 pub mod rpc;
 pub mod selection;
+mod software_breakpoint;
+pub mod symbols;
 mod trace;
 mod unwind;
 
@@ -166,77 +171,7 @@ impl Snapshot {
             self.finish_trace(&mut trace);
             return Ok(());
         }
-        let exe = fs::metadata(root.join("exe")).ok();
-        // If an exec raced the initial probe, skip register collection on a
-        // different ABI and use the executable observed at the stop.
-        let same_abi = if trace.threads.values().any(|t| t.stop.is_some()) {
-            match self.refresh_identity(&root) {
-                Ok(()) => true,
-                Err(e) => {
-                    self.issue("process", None, e);
-                    false
-                }
-            }
-        } else {
-            false
-        };
-        let maps = match modules::read(&root) {
-            Ok(v) => v,
-            Err(e) => {
-                self.issue("modules", None, e);
-                vec![]
-            }
-        };
-        if let Ok(status) = Status::read(&root) {
-            self.memory = Some(status.memory());
-        } else {
-            self.issue("memory", None, "could not refresh process status");
-        }
-        let mut images = unwind::Images::new();
-        for (&tid, captured) in &trace.threads {
-            let status = Status::read(&task_path(&root, tid));
-            let mut thread = Thread {
-                tid,
-                name: captured.before.as_ref().and_then(Status::name),
-                state_before_seize: captured.before.as_ref().and_then(Status::state),
-                state_at_capture: None,
-                stop: captured.stop.map(trace::Stop::info),
-                signals: None,
-                registers: None,
-                stack: None,
-            };
-            match status {
-                Ok(status) => {
-                    thread.name = status.name().or(thread.name);
-                    thread.state_at_capture = status.state();
-                    thread.signals = Some(status.signals());
-                }
-                Err(e) => self.issue("thread_status", Some(tid), e),
-            }
-            if same_abi && captured.stop.is_some() {
-                match regs::read(tid) {
-                    Ok(regs) => {
-                        thread.registers = Some(regs.general);
-                        if self.all_threads_stopped_during_capture {
-                            let stack = images.walk(
-                                &trace,
-                                regs.stack,
-                                &maps,
-                                &root,
-                                exe.as_ref(),
-                                deadline,
-                            );
-                            if !stack.complete {
-                                self.issue("stack", Some(tid), &stack.stop_reason);
-                            }
-                            thread.stack = Some(stack);
-                        }
-                    }
-                    Err(e) => self.issue("registers", Some(tid), e),
-                }
-            }
-            self.threads.push(thread);
-        }
+        let (maps, images, exe) = self.collect_stopped(&trace, &root, deadline, None, false);
         if !self.all_threads_stopped_during_capture {
             match procfs::task_ids(&root) {
                 Ok(ids) => {
@@ -259,8 +194,101 @@ impl Snapshot {
         } else {
             "partial"
         };
-        // The target is detached. Symbolization and module labels use only
-        // captured addresses and file data, with no remote memory accesses.
+        self.finish_symbols(Some(&root), maps, images, exe.as_ref());
+        Ok(())
+    }
+
+    fn collect_stopped(
+        &mut self,
+        trace: &trace::Trace<'_>,
+        root: &Path,
+        deadline: Instant,
+        hit: Option<i32>,
+        budgeted: bool,
+    ) -> (Vec<modules::Module>, unwind::Images, Option<fs::Metadata>) {
+        let exe = fs::metadata(root.join("exe")).ok();
+        // If an exec raced the initial probe, skip register collection on a
+        // different ABI and use the executable observed at the stop.
+        let same_abi = if trace.threads.values().any(|t| t.stop.is_some()) {
+            match self.refresh_identity(root) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.issue("process", None, e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let maps = match modules::read(root) {
+            Ok(v) => v,
+            Err(e) => {
+                self.issue("modules", None, e);
+                vec![]
+            }
+        };
+        if let Ok(status) = Status::read(root) {
+            self.process.name = status.name().or(self.process.name.take());
+            self.memory = Some(status.memory());
+        } else {
+            self.issue("memory", None, "could not refresh process status");
+        }
+        let mut images = unwind::Images::new();
+        for (&tid, captured) in &trace.threads {
+            if hit.is_some_and(|hit| hit != tid) {
+                continue;
+            }
+            if budgeted && Instant::now() >= deadline {
+                self.issue("capture", Some(tid), "snapshot deadline reached");
+                break;
+            }
+            let status = Status::read(&task_path(root, tid));
+            let mut thread = Thread {
+                tid,
+                name: captured.before.as_ref().and_then(Status::name),
+                state_before_seize: captured.before.as_ref().and_then(Status::state),
+                state_at_capture: None,
+                stop: captured.stop.map(trace::Stop::info),
+                signals: None,
+                registers: None,
+                stack: None,
+            };
+            match status {
+                Ok(status) => {
+                    thread.name = status.name().or(thread.name);
+                    thread.state_at_capture = status.state();
+                    thread.signals = Some(status.signals());
+                }
+                Err(e) => self.issue("thread_status", Some(tid), e),
+            }
+            if same_abi && captured.stop.is_some() {
+                match regs::read(tid) {
+                    Ok(regs) => {
+                        thread.registers = Some(regs.general);
+                        if self.all_threads_stopped_during_capture || hit.is_some() {
+                            let stack =
+                                images.walk(trace, regs.stack, &maps, root, exe.as_ref(), deadline);
+                            if !stack.complete {
+                                self.issue("stack", Some(tid), &stack.stop_reason);
+                            }
+                            thread.stack = Some(stack);
+                        }
+                    }
+                    Err(e) => self.issue("registers", Some(tid), e),
+                }
+            }
+            self.threads.push(thread);
+        }
+        (maps, images, exe)
+    }
+
+    fn finish_symbols(
+        &mut self,
+        root: Option<&Path>,
+        maps: Vec<modules::Module>,
+        images: unwind::Images,
+        exe: Option<&fs::Metadata>,
+    ) {
         for thread in &mut self.threads {
             if let Some(stack) = &mut thread.stack {
                 images.symbolize(stack);
@@ -269,9 +297,8 @@ impl Snapshot {
         self.modules = maps
             .iter()
             .enumerate()
-            .map(|(i, m)| m.info(i, exe.as_ref(), m.image_kind(&root)))
+            .map(|(i, m)| images.module_info(i, m, root, exe))
             .collect();
-        Ok(())
     }
 
     fn finish_trace(&mut self, trace: &mut trace::Trace<'_>) {
