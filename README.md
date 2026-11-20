@@ -2,6 +2,8 @@
 
 Linux C/C++ 进程快照工具，测试版。项目面向 x86_64 和 AArch64。Rust 服务端在目标主机运行，客户端提供命令行和 MCP stdio。两端通过 Unix socket 上的 gRPC / Protobuf 通信。
 
+后续功能、验收边界和实现顺序见 [需求与路线图](REQUIREMENTS.md)。
+
 ## 构建和运行
 
 ```sh
