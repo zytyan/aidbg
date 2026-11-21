@@ -14,3 +14,13 @@ cc -Wall -Wextra -Werror -O2 -g -fPIE -pie tests/breakpoint_fixture.c -pthread -
 cc -Wall -Wextra -Werror -O2 -g -fno-pie -no-pie tests/breakpoint_fixture.c -pthread -ldl   -o artifacts/breakpoint_fixture_nopie
 c++ -Wall -Wextra -Werror -O2 -g -fPIC -shared tests/cpp_symbols.cc -o artifacts/libcppsymbols.so
 python3 tests/breakpoints.py
+
+if command -v zstd >/dev/null; then
+  cc -Wall -Wextra -Werror -O0 -g -DBUILD_DSO -fPIC -shared tests/coredump_fixture.c \
+    -o artifacts/libcoredump_fixture.so
+  cc -Wall -Wextra -Werror -O0 -g -fPIC -pie tests/coredump_fixture.c \
+    -pthread -Lartifacts -lcoredump_fixture '-Wl,-rpath,$ORIGIN' -o artifacts/coredump_fixture
+  python3 tests/coredump.py
+else
+  echo 'SKIP coredump integration test (zstd unavailable)'
+fi

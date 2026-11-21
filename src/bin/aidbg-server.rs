@@ -2,10 +2,11 @@
 mod breakpoint_service;
 
 use aidbg::rpc::{
-    BreakpointCapabilitiesRequest, BreakpointEventsRequest, DisassembleRequest, DocumentReply,
-    FreezeMode, InstallBreakpointRequest, MAX_DOCUMENT, MAX_RPC, QuerySnapshotRequest,
-    RemoveBreakpointRequest, ResolveAddressRequest, SearchSymbolsRequest, SnapshotReply,
-    SnapshotRequest, SymbolMatch,
+    BreakpointCapabilitiesRequest, BreakpointEventsRequest, CoreMode, CoredumpChunk,
+    CoredumpRequest, DisassembleRequest, DocumentReply, FreezeMode, InstallBreakpointRequest,
+    MAX_DOCUMENT, MAX_RPC, QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest,
+    SearchSymbolsRequest, SnapshotReply, SnapshotRequest, SymbolMatch,
+    coredump_chunk::Part,
     debugger_server::{Debugger, DebuggerServer},
 };
 use aidbg::{
@@ -21,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tokio_stream::wrappers::UnixListenerStream;
+use tokio_stream::wrappers::{ReceiverStream, UnixListenerStream};
 use tonic::{Request, Response, Status, transport::Server};
 
 #[derive(Parser)]
@@ -101,11 +102,103 @@ struct Service {
     store: Arc<Store>,
     // The blocking job owns this guard until capture has finished cleanup.
     capture_lock: Arc<Mutex<()>>,
+    coredumps: Arc<tokio::sync::Semaphore>,
     breakpoints: Breakpoints,
 }
 
 #[tonic::async_trait]
 impl Debugger for Service {
+    type CoredumpStream = ReceiverStream<std::result::Result<CoredumpChunk, Status>>;
+
+    async fn coredump(
+        &self,
+        request: Request<CoredumpRequest>,
+    ) -> std::result::Result<Response<Self::CoredumpStream>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let mode = CoreMode::try_from(req.mode)
+            .map_err(|_| Status::invalid_argument("unknown coredump mode"))?;
+        let timeout = req
+            .timeout_ms
+            .unwrap_or(aidbg::coredump::DEFAULT_TIMEOUT_MS);
+        if timeout == 0 {
+            return Err(Status::invalid_argument(
+                "coredump timeout must be positive",
+            ));
+        }
+        let options =
+            aidbg::coredump::CaptureOptions::new(mode, timeout, req.buffer_mib, req.block_kib)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let lock = Arc::clone(&self.capture_lock);
+        let slots = Arc::clone(&self.coredumps);
+        let breakpoints = self.breakpoints.clone();
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
+            let permit = tokio::select! {
+                _ = sender.closed() => return,
+                permit = slots.acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
+            let guard = tokio::select! {
+                _ = sender.closed() => return,
+                guard = lock.lock_owned() => guard,
+            };
+            let chunks = sender.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if breakpoints.contains(req.pid) {
+                    return Err(Status::failed_precondition(
+                        "an active breakpoint session owns this PID",
+                    ));
+                }
+                let dump = aidbg::coredump::prepare(
+                    req.pid,
+                    mode,
+                    options,
+                    &store.0,
+                    &|| chunks.is_closed(),
+                    || drop(guard),
+                )
+                .map_err(internal)?;
+                let mut stream = io::Cursor::new(dump.header).chain(dump.payload);
+                let mut buffer = vec![0; 256 * 1024];
+                loop {
+                    let n = stream.read(&mut buffer).map_err(internal)?;
+                    if n == 0 {
+                        break;
+                    }
+                    if chunks
+                        .blocking_send(Ok(CoredumpChunk {
+                            part: Some(Part::Data(buffer[..n].to_vec())),
+                        }))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                let summary = serde_json::to_vec(&dump.summary).map_err(internal)?;
+                let _ = chunks.blocking_send(Ok(CoredumpChunk {
+                    part: Some(Part::SummaryJson(summary)),
+                }));
+                Ok(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let _ = sender.send(Err(error)).await;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(internal(error))).await;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
     async fn snapshot(
         &self,
         request: Request<SnapshotRequest>,
@@ -337,6 +430,7 @@ async fn main() -> Result<()> {
         store,
         breakpoints: breakpoints.clone(),
         capture_lock: Arc::new(Mutex::new(())),
+        coredumps: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let result = Server::builder()
         .add_service(

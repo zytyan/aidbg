@@ -36,10 +36,10 @@ impl Mapping {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Backing {
-    major: u32,
-    minor: u32,
-    inode: u64,
-    path: Vec<u8>,
+    pub(crate) major: u32,
+    pub(crate) minor: u32,
+    pub(crate) inode: u64,
+    pub(crate) path: Vec<u8>,
 }
 
 pub struct Module {
@@ -96,7 +96,7 @@ fn field<'a>(rest: &mut &'a [u8]) -> Result<&'a str> {
     Ok(answer)
 }
 
-fn map_entries(base: &Path) -> Result<Vec<(Backing, Mapping)>> {
+pub(crate) fn map_entries(base: &Path) -> Result<Vec<(Backing, Mapping)>> {
     let data = fs::read(base.join("maps"))?;
     data.split(|&b| b == b'\n')
         .filter(|l| !l.is_empty())
@@ -193,10 +193,16 @@ pub struct AddressSpace {
 }
 
 pub fn address_space(base: &Path) -> Result<AddressSpace> {
+    Ok(group_mappings(map_entries(base)?))
+}
+
+pub(crate) fn group_mappings(
+    entries: impl IntoIterator<Item = (Backing, Mapping)>,
+) -> AddressSpace {
     let mut files = BTreeMap::<Backing, Vec<Mapping>>::new();
     let mut loaded = BTreeSet::new();
     let mut anonymous = Vec::new();
-    for (backing, map) in map_entries(base)? {
+    for (backing, map) in entries {
         if backing.inode == 0 && backing.path != b"[vdso]" {
             if backing.path.is_empty() || backing.path.starts_with(b"[anon:") {
                 anonymous.push(map);
@@ -214,7 +220,7 @@ pub fn address_space(base: &Path) -> Result<AddressSpace> {
         .map(|(backing, maps)| Module { backing, maps })
         .collect();
     modules.sort_unstable_by_key(|module| module.maps[0].start);
-    Ok(AddressSpace { modules, anonymous })
+    AddressSpace { modules, anonymous }
 }
 
 pub fn read(base: &Path) -> Result<Vec<Module>> {
@@ -281,12 +287,12 @@ impl Module {
         self.maps.iter().find(|m| m.contains(pc) && m.executable())
     }
 
-    fn matches(&self, m: &fs::Metadata) -> bool {
+    pub(crate) fn matches(&self, m: &fs::Metadata) -> bool {
         let b = &self.backing;
         b.inode == m.ino() && b.major == libc::major(m.dev()) && b.minor == libc::minor(m.dev())
     }
 
-    fn open(&self, root: &Path, is_main: bool) -> Result<File> {
+    pub(crate) fn open(&self, root: &Path, is_main: bool) -> Result<File> {
         let b = &self.backing;
         if b.inode == 0 {
             return Err(error("no on-disk image for this mapping"));
@@ -350,7 +356,7 @@ impl Module {
     }
 }
 
-pub fn is_executable_module(obj: &object::File<'_>) -> bool {
+pub fn is_executable_module<'data>(obj: &object::File<'data, impl object::ReadRef<'data>>) -> bool {
     obj.format() == object::BinaryFormat::Elf
         && obj.is_64()
         && obj.is_little_endian()
@@ -366,7 +372,9 @@ pub struct LoadSegment {
     pub executable: bool,
 }
 
-pub fn load_segments(obj: &object::File<'_>) -> impl Iterator<Item = LoadSegment> {
+pub fn load_segments<'data, R: object::ReadRef<'data>>(
+    obj: &object::File<'data, R>,
+) -> impl Iterator<Item = LoadSegment> {
     // The ELF ObjectSegment iterator yields only PT_LOAD program headers.
     obj.segments().map(|segment| {
         let (offset, file_size) = segment.file_range();
@@ -414,12 +422,22 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(obj: &object::File<'_>, module: &Module) -> Result<Self> {
+    pub fn new<'data>(
+        obj: &object::File<'data, impl object::ReadRef<'data>>,
+        module: &Module,
+    ) -> Result<Self> {
         let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
         if page == 0 || !page.is_power_of_two() {
             return Err(error("invalid system page size"));
         }
-        let segments: Vec<_> = load_segments(obj).collect();
+        Self::from_segments(load_segments(obj).collect(), module, page)
+    }
+
+    pub(crate) fn from_segments(
+        segments: Vec<LoadSegment>,
+        module: &Module,
+        page: u64,
+    ) -> Result<Self> {
         let elf_base = segments
             .iter()
             .map(|s| s.address & !(page - 1))

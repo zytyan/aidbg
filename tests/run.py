@@ -50,7 +50,7 @@ def server(socket, state):
                 raise RuntimeError("aidbg-server did not become ready")
             time.sleep(0.01)
         assert socket.stat().st_mode & 0o777 == 0o600
-        yield
+        yield p
     finally:
         if p.poll() is None:
             p.terminate()
@@ -229,7 +229,7 @@ def check_mcp(socket, snapshot_id):
             message({"method": "notifications/initialized"})
             listed = message({"id": 2, "method": "tools/list"})
             assert {t["name"] for t in listed["tools"]} == {
-        "snapshot", "snapshot_query", "breakpoint_set", "breakpoint_remove",
+        "snapshot", "snapshot_query", "coredump", "breakpoint_set", "breakpoint_remove",
         "breakpoint_events", "breakpoint_capabilities", "symbols", "resolve_address", "disassemble",
     }
             result = message({"id": 3, "method": "tools/call", "params": {

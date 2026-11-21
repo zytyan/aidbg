@@ -5,6 +5,7 @@
 compile_error!("aidbg supports Linux x86_64 and AArch64");
 
 pub mod breakpoint;
+pub mod coredump;
 mod cpp_names;
 pub mod disassembly;
 mod modules;

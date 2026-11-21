@@ -1,8 +1,9 @@
 use aidbg::rpc::{
     self, BreakpointCapabilitiesRequest, BreakpointEventsRequest, BreakpointKind, CaptureScope,
-    Client, DisassembleRequest, DocumentReply, FreezeMode, InstallBreakpointRequest,
-    QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest, SearchSymbolsRequest,
-    SnapshotReply, SnapshotRequest, SymbolLocation, SymbolMatch, install_breakpoint_request,
+    Client, CoreMode, CoredumpRequest, DisassembleRequest, DocumentReply, FreezeMode,
+    InstallBreakpointRequest, QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest,
+    SearchSymbolsRequest, SnapshotReply, SnapshotRequest, SymbolLocation, SymbolMatch,
+    coredump_chunk::Part, install_breakpoint_request,
 };
 use aidbg::{Result as AidbgResult, selection::requested};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -16,6 +17,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tonic::Request;
 
 #[derive(Parser)]
@@ -31,6 +33,8 @@ struct Cli {
 enum Command {
     /// Capture a live snapshot or look up a saved snapshot.
     Snapshot(SnapshotArgs),
+    /// Save a compressed Linux ELF core from a live process.
+    Coredump(CoredumpArgs),
     /// Manage execution breakpoints, hardware watchpoints and their hit events.
     #[command(subcommand)]
     Breakpoint(BreakpointCommand),
@@ -42,6 +46,111 @@ enum Command {
     Disassemble(DisassembleArgs),
     /// Expose debugger tools over MCP stdio.
     Mcp,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, JsonSchema, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum DumpMode {
+    Lite,
+    #[serde(rename = "stack-4k", alias = "lite-stack")]
+    #[value(name = "stack-4k", alias = "lite-stack")]
+    Stack4k,
+    #[default]
+    Stack,
+    Standard,
+    #[serde(alias = "extend")]
+    #[value(alias = "extend")]
+    Extended,
+    Full,
+}
+
+impl From<DumpMode> for CoreMode {
+    fn from(mode: DumpMode) -> Self {
+        match mode {
+            DumpMode::Lite => Self::CoreLite,
+            DumpMode::Stack4k => Self::CoreStack4k,
+            DumpMode::Stack => Self::CoreStack,
+            DumpMode::Standard => Self::CoreStandard,
+            DumpMode::Extended => Self::CoreExtended,
+            DumpMode::Full => Self::CoreFull,
+        }
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct CoredumpArgs {
+    #[arg(long)]
+    pid: i32,
+    /// Memory coverage of the dump.
+    #[arg(long, value_enum, default_value = "stack")]
+    #[serde(default)]
+    mode: DumpMode,
+    /// New client-side .core.zst path.
+    #[arg(long)]
+    output: PathBuf,
+    /// Time limit for freezing the target and reading its memory, in milliseconds.
+    #[arg(long)]
+    timeout_ms: Option<u32>,
+    /// Server capture-buffer budget in MiB. Zero uses file staging.
+    #[arg(long)]
+    buffer_mib: Option<u32>,
+    /// Server memory-read block size in KiB.
+    #[arg(long)]
+    block_kib: Option<u32>,
+}
+
+async fn save_coredump(mut client: Client, args: CoredumpArgs) -> AidbgResult<Value> {
+    if std::fs::symlink_metadata(&args.output).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "coredump output already exists",
+        )
+        .into());
+    }
+    let parent = args
+        .output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file = tempfile::NamedTempFile::new_in(parent)?;
+    let mut writer = tokio::fs::File::from_std(file.reopen()?);
+    let mut stream = client
+        .coredump(Request::new(CoredumpRequest {
+            pid: args.pid,
+            mode: CoreMode::from(args.mode) as i32,
+            timeout_ms: args.timeout_ms,
+            buffer_mib: args.buffer_mib,
+            block_kib: args.block_kib,
+        }))
+        .await?
+        .into_inner();
+    let mut summary = None;
+    let mut size = 0_u64;
+    while let Some(chunk) = stream.message().await? {
+        match chunk.part {
+            Some(Part::Data(data)) if summary.is_none() => {
+                writer.write_all(&data).await?;
+                size += data.len() as u64;
+            }
+            Some(Part::SummaryJson(json)) if summary.is_none() => {
+                summary = Some(serde_json::from_slice::<Value>(&json)?);
+            }
+            _ => return Err(io::Error::other("invalid coredump stream").into()),
+        }
+    }
+    let mut summary = summary
+        .filter(|doc| {
+            size > 0
+                && doc["compressed_bytes"].as_u64() == Some(size)
+                && matches!(doc["status"].as_str(), Some("complete" | "partial"))
+        })
+        .ok_or_else(|| io::Error::other("coredump stream ended without a valid summary"))?;
+    writer.flush().await?;
+    writer.sync_all().await?;
+    drop(writer);
+    file.persist_noclobber(&args.output)?;
+    summary["path"] = Value::String(args.output.to_string_lossy().into_owned());
+    Ok(summary)
 }
 
 #[derive(Subcommand)]
@@ -413,6 +522,16 @@ fn argument_error(error: impl ToString) -> CallToolResult {
 #[tool_router(server_handler)]
 impl Mcp {
     #[tool(
+        description = "Save a compressed Linux ELF core to a new client-side path. Modes are lite, stack-4k, stack, standard, extended, and full. Returns coverage and output metadata."
+    )]
+    async fn coredump(&self, Parameters(args): Parameters<CoredumpArgs>) -> CallToolResult {
+        match save_coredump(self.client.clone(), args).await {
+            Ok(summary) => CallToolResult::structured(summary),
+            Err(error) => argument_error(error),
+        }
+    }
+
+    #[tool(
         description = "Capture and save a process snapshot. Optional dotted fields, tid, and frames filter the response."
     )]
     async fn snapshot(&self, Parameters(args): Parameters<CaptureTool>) -> CallToolResult {
@@ -538,6 +657,23 @@ async fn main() -> AidbgResult<ExitCode> {
     let mut client = rpc::connect(&cli.socket).await?;
     let reply = match cli.command {
         Command::Snapshot(args) => return snapshot_cli(client, args).await,
+        Command::Coredump(args) => {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let summary = tokio::select! {
+                result = save_coredump(client, args) => result?,
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    return Ok(ExitCode::from(130));
+                }
+                _ = terminate.recv() => return Ok(ExitCode::from(143)),
+            };
+            let mut out = io::stdout().lock();
+            serde_json::to_writer(&mut out, &summary)?;
+            writeln!(out)?;
+            out.flush()?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Breakpoint(command) => match command {
             BreakpointCommand::Set(args) => {
                 client.install_breakpoint(request(args.message()?)).await?

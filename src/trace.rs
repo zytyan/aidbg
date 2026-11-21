@@ -158,7 +158,16 @@ impl<'a> Trace<'a> {
     }
 
     pub fn freeze(&mut self, deadline: Instant) -> Result<()> {
+        self.freeze_checked(deadline, &|| Ok(()))
+    }
+
+    pub(crate) fn freeze_checked(
+        &mut self,
+        deadline: Instant,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
         for _ in 0..8 {
+            check()?;
             if Instant::now() >= deadline {
                 return Err(error("thread freeze deadline"));
             }
@@ -167,6 +176,7 @@ impl<'a> Trace<'a> {
             }
             let ids = task_ids(self.root)?;
             for tid in ids {
+                check()?;
                 if self.threads.contains_key(&tid) {
                     continue;
                 }
@@ -217,7 +227,7 @@ impl<'a> Trace<'a> {
                 }
             }
             self.request_stops()?;
-            self.wait_for_stops(deadline)?;
+            self.wait_for_stops_checked(deadline, check)?;
             let after = task_ids(self.root)?;
             if !after.is_empty()
                 && after.len() == self.threads.len()
@@ -251,7 +261,16 @@ impl<'a> Trace<'a> {
     }
 
     fn wait_for_stops(&mut self, deadline: Instant) -> Result<()> {
+        self.wait_for_stops_checked(deadline, &|| Ok(()))
+    }
+
+    fn wait_for_stops_checked(
+        &mut self,
+        deadline: Instant,
+        check: &impl Fn() -> Result<()>,
+    ) -> Result<()> {
         loop {
+            check()?;
             self.poll()?;
             self.detach_foreign_children()?;
             let pending = self.threads.values().any(|thread| thread.stop.is_none());
@@ -540,11 +559,20 @@ impl<'a> Trace<'a> {
     }
 
     pub fn read_word(&self, addr: u64, size: usize) -> Result<u64> {
-        if !(1..=8).contains(&size) || addr.checked_add(size as u64).is_none() {
+        if !(1..=8).contains(&size) {
             return Err(error("invalid remote read range"));
         }
         let mut buf = [0_u8; 8];
-        let local = &mut [IoSliceMut::new(&mut buf[..size])];
+        self.read_memory(addr, &mut buf[..size])?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    pub fn read_memory(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        let size = buf.len();
+        if addr.checked_add(size as u64).is_none() {
+            return Err(error("invalid remote read range"));
+        }
+        let local = &mut [IoSliceMut::new(buf)];
         let remote = [uio::RemoteIoVec {
             base: usize::try_from(addr)?,
             len: size,
@@ -553,7 +581,7 @@ impl<'a> Trace<'a> {
         if got != size {
             return Err(error(format!("short remote read: {got}/{size}")));
         }
-        Ok(u64::from_le_bytes(buf))
+        Ok(())
     }
 
     pub fn close(&mut self) -> Cleanup {

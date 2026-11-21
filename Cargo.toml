@@ -21,10 +21,11 @@ prost = "0.14"
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tonic-prost = "0.14"
+zstd = { version = "=0.13.3", default-features = false }
 
 [build-dependencies]
 prost-build = "0.14"

@@ -43,6 +43,38 @@ printf '%s\n' "$AIDBG_SOCKET"
 
 服务端在指定状态目录为每次采集保存一份完整 JSON，并返回 `snapshot_id`。筛选只改变响应。CLI 的 `--save` 也导出完整 JSON，`--from` 通过 ID 查询服务端文件。只要状态目录保留，目标退出或 server 重启后都能查询。支持点分字段路径、按 TID 筛选及限制每线程返回的帧数。输出保留采集状态和快照 ID。
 
+## Linux core 转储
+
+```bash
+aidbg --socket "$AIDBG_SOCKET" coredump --pid "$TARGET_PID" --output case.core.zst
+aidbg --socket "$AIDBG_SOCKET" coredump --pid "$TARGET_PID" --mode extended --output ipc.core.zst
+zstd -d case.core.zst
+gdb /path/to/executable case.core
+```
+
+| 模式 | 采集范围 |
+|---|---|
+| `lite` | 全部线程、寄存器和地址映射，记录可取得的模块 build ID |
+| `stack-4k` | `lite` 加 `[vdso]`、模块 ELF 头和动态链接器的回溯记录。每线程从 SP 到高地址采集最多 4 KiB，在映射末尾截断 |
+| `stack`（默认） | 将 4 KiB 扩大为每线程 SP 所在的整段映射，并包含可识别的主线程栈 |
+| `standard` | `stack` 加主程序和共享库的 ELF 可写加载段、私有文件映射的 COW 和换出页，以及需要保留的普通文件映射范围 |
+| `extended` | `standard` 加堆、匿名私有可写区及可读的 IPC 共享内存，包括匿名共享区、POSIX/SysV 共享内存和 `memfd` |
+| `full` | 尝试采集全部映射 |
+
+普通共享文件映射有脏页或无法确定状态时，`standard` 及以上会保守采集整段。转储只冻结目标进程，其他进程仍可能改写共享内存。解压后可检查 ELF 的 `AIDBG` note，拿到原始地址映射、模块身份和缺失范围。
+
+CLI 和 MCP 的 `coredump` 把 Zstd level 1 压缩的 core 保存到显式指定的新文件，并返回采集、暂存和压缩大小、暂停时间及覆盖状态。`--timeout-ms` 默认 60000。目标有活动断点会话时先结束该会话。线程冻结、通用寄存器采集或清理失败时，命令失败。部分内存无法采集时，产物仍会发布，摘要标记为 `partial`。可用至少两核时，服务端并行采集与压缩。压缩队列满时，服务端把剩余内存写入临时文件，恢复目标后继续压缩。目标设备无需安装 Zstd 命令或 GDB。离线调试按需提供匹配的可执行文件和共享库。
+
+连接在采集或传输期间中断时，服务端结束采集并解除跟踪，客户端清理未完成的文件。重连后可以用同一输出路径发起一次新的采集。集成测试用 Unix socket 代理分别在目标暂停时和传输途中断开连接，并校验重连后产物完整。
+
+`tests/run.sh` 用随机数据压力夹具和业务型合成夹具各验证六种模式。业务型夹具混合堆对象、日志、稀疏内存和少量随机数据。构建夹具后，可运行 `python3 tests/coredump.py --benchmark`，用同一份解压后的 ELF 比较 Zstd level 1、3 和 5。输出耗时包含启动本地压缩工具和管道传输。
+
+采集使用冻结前预分配的缓冲池。CLI 可用 `--buffer-mib` 和 `--block-kib` 调节，MCP 参数为 `buffer_mib` 和 `block_kib`。默认块大小是 1024 KiB，`stack-4k` 默认缓冲 2 MiB，其余含内存档默认 16 MiB。缓冲预算为 0 时，内存写入临时文件，目标恢复后压缩。单核或预算不足两个读块时使用同一路径。
+
+模块 ELF 在冻结前解析，以冻结后读取的映射和文件身份校验缓存。需要模块内容来确定采集范围的档位会重新解析变动的模块。
+
+摘要的 `pause_us` 从首次附加算到分离结束，`timing_us` 细分冻结、映射、寄存器、ELF、`smaps`、选区、读取、缓冲和分离，其中 `staging` 计入 `buffering`，`preflight` 在暂停窗口之外。可在构建后用 `python3 tests/coredump.py --pause-sweep` 比较缓冲预算、读块大小、暂停耗时、文件就绪耗时和服务端进程 RSS 峰值。可用 `--baseline-bin-dir` 指定旧版二进制目录做对照。
+
 ## 冻结模式
 
 | 参数 | 采集方式 |
@@ -112,6 +144,7 @@ C++ 符号保留原始名称、完整解修饰名和简写显示名。libstdc++�
 
 - `snapshot`，接受 `pid`、`freeze` 和可选的 `fields`、`tid`、`frames`。
 - `snapshot_query`，接受 `snapshot_id` 或断点 `event_id` 及相同的筛选项。
+- `coredump`，接受 `pid`、`output`、可选的 `mode` 和 `timeout_ms`，返回 ELF core 的输出路径和采集摘要。
 - `breakpoint_set`、`breakpoint_remove`、`breakpoint_events`，接受对应命令的参数。
 - `breakpoint_capabilities`，查询观察类型、宽度、对齐和槽位。
 - `symbols`、`resolve_address`、`disassemble`，查询 ELF 符号、运行时地址和反汇编窗口。
