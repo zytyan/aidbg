@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 
-from run import ARTIFACTS, BIN, server, status
+from run import ARCH, ARTIFACTS, BIN, server, status
 
 
 def read_line(process):
@@ -30,13 +30,25 @@ def fixture(binary, normal, stripped):
                 process.kill()
 
 
+def check_aarch64(invoke, pid, address):
+    window = invoke("disassemble", "--pid", pid, "--address", address, "--after", "1")
+    assert window["boundary"] == "architecture_alignment" and window["address_is_instruction_start"], window
+    start = int(address, 16)
+    assert [(int(i["address"], 16), i["bytes"], i["mnemonic"]) for i in window["instructions"]] == [
+        (start, "1f2003d5", "nop"), (start + 4, "c0035fd6", "ret"),
+    ], window
+    unaligned = invoke("disassemble", "--pid", pid, "--address", hex(start + 1), "--after", "1")
+    assert not unaligned["address_is_instruction_start"], unaligned
+    assert unaligned["instructions"] == window["instructions"], unaligned
+    print("PASS AArch64 live instruction bytes and four-byte alignment")
+
+
 def check(socket, root, state, binary):
     normal = ARTIFACTS / "libfixture.so"
     stripped = root / "libstripped.so"
     debug = root / "libstripped.so.debug"
-    shutil.copyfile(normal, stripped)
-    subprocess.run(["objcopy", "--only-keep-debug", stripped, debug], check=True)
-    subprocess.run(["objcopy", "--strip-all", f"--add-gnu-debuglink={debug}", stripped], check=True)
+    shutil.copyfile(ARTIFACTS / stripped.name, stripped)
+    shutil.copyfile(ARTIFACTS / debug.name, debug)
     debug_bytes = debug.read_bytes()
 
     def invoke(*args, error=None):
@@ -93,6 +105,16 @@ def check(socket, root, state, binary):
         assert lookup("library_wait", "--module", local["module"]["build_id"]) == hits
         print("PASS PIE and SO symbols, multiple load instances, debuglink CRC and external DWARF")
 
+        capabilities = invoke("breakpoint", "capabilities", "--pid", pid)
+        assert capabilities["architecture"] == ARCH and capabilities["hardware_execution"], capabilities
+        assert capabilities["software_execution"] and capabilities["watch_lengths"] == [1, 2, 4, 8]
+        assert capabilities["execution_slots"] > 0 and capabilities["watch_slots"] > 0, capabilities
+        if ARCH == "aarch64":
+            assert capabilities["shared_execution_and_watch_slots"] == 0, capabilities
+            print(f"PASS AArch64 reports {capabilities['execution_slots']} execution slots and {capabilities['watch_slots']} watchpoint slots")
+            check_aarch64(invoke, pid, anonymous)
+        pc_register = "rip" if ARCH == "x86_64" else "pc"
+
         def install(*args, error=None):
             budget = () if "--timeout-ms" in args else ("--timeout-ms", "500")
             return invoke("breakpoint", "set", "--pid", pid, *args, *budget, error=error)
@@ -125,10 +147,21 @@ def check(socket, root, state, binary):
         assert remove(unique)["status"] == "detached"
 
         absolute = install("--address", hit)
-        spare = [install("--address", address) for address in slots[:3]]
-        install("--address", slots[3], error="ResourceExhausted")
+        count = capabilities["execution_slots"]
+        if ARCH == "aarch64":
+            slots = [hex(int(hit, 16) + 4 * n) for n in range(1, count + 1)]
+        spare = [install("--address", address) for address in slots[:count - 1]]
+        install("--address", slots[count - 1], error="ResourceExhausted")
+        if ARCH == "aarch64":
+            watch_addresses = [hex(int(bss, 16) + 8 * n) for n in range(capabilities["watch_slots"] + 1)]
+            watch_slots = [install("--kind", "write", "--length", "1", "--address", address)
+                           for address in watch_addresses[:-1]]
+            install("--kind", "write", "--length", "1", "--address", watch_addresses[-1],
+                    error="ResourceExhausted")
+            for rule in watch_slots:
+                assert remove(rule)["status"] == "removed"
         assert remove(spare.pop())["status"] == "removed"
-        spare.append(install("--address", slots[3]))
+        spare.append(install("--address", slots[count - 1]))
         for rule in spare:
             assert remove(rule)["status"] == "removed"
         run_batch(1)
@@ -139,7 +172,7 @@ def check(socket, root, state, binary):
         assert invoke("snapshot", "--event", str(rows[0]["event_id"])) == snapshot
         assert len(snapshot["threads"]) == 1
         assert snapshot["threads"][0]["tid"] == rows[0]["tid"]
-        assert snapshot["threads"][0]["registers"]["rip"] == hit
+        assert snapshot["threads"][0]["registers"][pc_register] == hit
         assert (state / (rows[0]["snapshot_id"] + ".json")).is_file()
         assert remove(absolute)["status"] == "detached"
         assert status(p.pid)["TracerPid"] == "0"
@@ -185,7 +218,7 @@ def check(socket, root, state, binary):
         assert [e["watch"]["value_changed"] for e in rows] == [False, True], rows
         assert [e["watch"]["value_after"] for e in rows] == ["0x7", "0x9"], rows
         assert remove(rule)["status"] == "detached"
-        print("PASS x86_64 write watchpoints distinguish same-value and changed writes on a new thread")
+        print(f"PASS {ARCH} write watchpoints distinguish same-value and changed writes on a new thread")
 
         rule = install("--kind", "read-write", "--length", "8", "--address", watched)
         p.stdin.write(b"r")
@@ -197,7 +230,13 @@ def check(socket, root, state, binary):
         assert remove(rule)["status"] == "detached"
 
         writer, = lookup("force_watch", "--module", binary.name)
-        soft_writer = install("--kind", "software", "--address", writer["runtime_address"])
+        writer_address = writer["runtime_address"]
+        if ARCH == "aarch64":
+            decoded = invoke("disassemble", "--pid", pid, "--address", writer_address,
+                             "--before", "0", "--after", str(writer["size"] // 4 - 1))
+            store, = [item for item in decoded["instructions"] if item["mnemonic"] == "str"]
+            writer_address = store["address"]
+        soft_writer = install("--kind", "software", "--address", writer_address)
         watch_writer = install("--kind", "write", "--length", "8", "--address", watched)
         p.stdin.write(b"w")
         p.stdin.flush()
@@ -206,6 +245,7 @@ def check(socket, root, state, binary):
         assert [e["watch"]["value_after"] for e in saved_events(watch_writer, 2)] == ["0x7", "0x9"]
         assert remove(soft_writer)["status"] == "removed"
         assert remove(watch_writer)["status"] == "detached"
+        print(f"PASS {ARCH} software breakpoint and watchpoint on the same execution path")
 
         soft = install("--kind", "software", "--address", hit)
         run_batch(6)
@@ -213,7 +253,7 @@ def check(socket, root, state, binary):
         assert len({e["tid"] for e in rows}) == 2
         assert all(e["resume_status"] == "resumed" and e["kind"] == "software_execution" for e in rows)
         snapshot = invoke("snapshot", "--event", str(rows[0]["event_id"]))
-        assert snapshot["threads"][0]["registers"]["rip"] == hit
+        assert snapshot["threads"][0]["registers"][pc_register] == hit
         assert remove(soft)["status"] == "detached"
         run_batch(7)
         assert len(events(soft)) == 6
@@ -225,21 +265,22 @@ def check(socket, root, state, binary):
         assert status(p.pid)["TracerPid"] == "0"
         print("PASS concurrent software hits, original instructions, rearming, removal and fork cleanup")
 
-        def disassemble(address, *args):
-            return invoke("disassemble", "--pid", pid, "--address", address, *args)
+        if ARCH == "x86_64":
+            def disassemble(address, *args):
+                return invoke("disassemble", "--pid", pid, "--address", address, *args)
 
-        window = disassemble(hit, "--before", "0", "--after", "3")
-        assert window["boundary"] == "function_entry" and window["address_is_instruction_start"], window
-        assert len(window["instructions"]) == 4 and window["instructions"][0]["address"] == hit, window
-        middle = window["instructions"][1]["address"]
-        context = disassemble(middle, "--before", "1", "--after", "1")
-        assert len(context["instructions"]) == 3 and context["instructions"][0]["address"] == hit, context
-        unknown = disassemble(anonymous, "--after", "1")
-        assert unknown["boundary"] == "uncertain" and unknown["truncated_before"], unknown
-        assert [i["bytes"] for i in unknown["instructions"]] == ["90", "c3"], unknown
-        known = disassemble(anonymous, "--start", anonymous, "--after", "1")
-        assert known["boundary"] == "explicit_start" and known["address_is_instruction_start"], known
-        print("PASS x86_64 disassembly with symbol, explicit and uncertain instruction boundaries")
+            window = disassemble(hit, "--before", "0", "--after", "3")
+            assert window["boundary"] == "function_entry" and window["address_is_instruction_start"], window
+            assert len(window["instructions"]) == 4 and window["instructions"][0]["address"] == hit, window
+            middle = window["instructions"][1]["address"]
+            context = disassemble(middle, "--before", "1", "--after", "1")
+            assert len(context["instructions"]) == 3 and context["instructions"][0]["address"] == hit, context
+            unknown = disassemble(anonymous, "--after", "1")
+            assert unknown["boundary"] == "uncertain" and unknown["truncated_before"], unknown
+            assert [i["bytes"] for i in unknown["instructions"]] == ["90", "c3"], unknown
+            known = disassemble(anonymous, "--start", anonymous, "--after", "1")
+            assert known["boundary"] == "explicit_start" and known["address_is_instruction_start"], known
+            print("PASS x86_64 disassembly with symbol, explicit and uncertain instruction boundaries")
 
         p.stdin.write(b"q")
         p.stdin.flush()

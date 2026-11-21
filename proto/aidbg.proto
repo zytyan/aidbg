@@ -6,6 +6,9 @@ service Debugger {
   rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
   rpc QuerySnapshot (QuerySnapshotRequest) returns (SnapshotReply);
   rpc Coredump (CoredumpRequest) returns (stream CoredumpChunk);
+  rpc StartCoredump (StartCoredumpRequest) returns (CoredumpJob);
+  rpc GetCoredump (GetCoredumpRequest) returns (CoredumpJob);
+  rpc DownloadCoredump (DownloadCoredumpRequest) returns (stream CoredumpChunk);
   rpc InstallBreakpoint (InstallBreakpointRequest) returns (DocumentReply);
   rpc RemoveBreakpoint (RemoveBreakpointRequest) returns (DocumentReply);
   rpc BreakpointEvents (BreakpointEventsRequest) returns (DocumentReply);
@@ -13,6 +16,40 @@ service Debugger {
   rpc ResolveAddress (ResolveAddressRequest) returns (DocumentReply);
   rpc Disassemble (DisassembleRequest) returns (DocumentReply);
   rpc BreakpointCapabilities (BreakpointCapabilitiesRequest) returns (DocumentReply);
+  rpc Profile (ProfileRequest) returns (DocumentReply);
+  rpc SymbolOverride (SymbolOverrideRequest) returns (DocumentReply);
+  rpc Inspect (InspectRequest) returns (DocumentReply);
+  rpc Assemble (AssembleRequest) returns (DocumentReply);
+  rpc PlanPatch (PatchRequest) returns (DocumentReply);
+  rpc Emulate (EmulateRequest) returns (DocumentReply);
+  rpc StepWatch (StepWatchRequest) returns (DocumentReply);
+  rpc TargetCall (TargetCallRequest) returns (DocumentReply);
+}
+
+message StepWatchRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  uint64 address = 3;
+  uint32 length = 4;
+  uint64 pc_start = 5;
+  uint64 pc_end = 6;
+  optional uint32 max_steps = 7;
+  optional uint32 timeout_ms = 8;
+}
+
+message TargetCallRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  string module = 3;
+  string symbol = 4;
+  optional uint64 instance = 5;
+  repeated string arguments = 6;
+  string return_type = 7;
+  uint64 scratch_address = 8;
+  uint32 scratch_length = 9;
+  optional uint32 max_steps = 10;
+  optional uint32 timeout_ms = 11;
+  bool allow_side_effects = 12;
 }
 
 enum FreezeMode {
@@ -67,6 +104,37 @@ message CoredumpChunk {
     bytes data = 1;
     bytes summary_json = 2;
   }
+}
+
+message StartCoredumpRequest {
+  // A client-generated ID makes StartCoredump retries idempotent during retention.
+  string dump_id = 1;
+  CoredumpRequest capture = 2;
+}
+
+message GetCoredumpRequest {
+  string dump_id = 1;
+}
+
+enum CoredumpJobState {
+  COREDUMP_PENDING = 0;
+  COREDUMP_READY = 1;
+  COREDUMP_FAILED = 2;
+}
+
+message CoredumpJob {
+  string dump_id = 1;
+  CoredumpJobState state = 2;
+  uint64 compressed_bytes = 3;
+  bytes sha256 = 4;
+  bytes summary_json = 5;
+  uint64 expires_unix_secs = 6;
+  string error = 7;
+}
+
+message DownloadCoredumpRequest {
+  string dump_id = 1;
+  uint64 offset = 2;
 }
 
 message DocumentReply {
@@ -140,4 +208,77 @@ message DisassembleRequest {
   optional uint64 start = 5;
 }
 
-message BreakpointCapabilitiesRequest {}
+message BreakpointCapabilitiesRequest { optional int32 pid = 1; }
+
+message ProfileRequest {
+  int32 pid = 1;
+  bool stack = 2;
+  optional uint32 duration_ms = 3;
+  optional uint32 frequency_hz = 4;
+  optional int32 tid = 5;
+}
+
+message SymbolOverrideRequest {
+  oneof action {
+    SetSymbolOverride set = 1;
+    string remove_id = 2;
+    bool list = 3;
+  }
+}
+
+message SetSymbolOverride {
+  int32 pid = 1;
+  uint64 address = 2;
+  uint64 length = 3;
+  string name = 4;
+}
+
+message InspectRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  string expression = 3;
+  optional string module = 4;
+  optional uint64 instance = 5;
+}
+
+message AssembleRequest {
+  uint64 address = 1;
+  string source = 2;
+}
+
+message AddressRange {
+  uint64 address = 1;
+  uint64 length = 2;
+}
+
+message PatchRequest {
+  uint64 base = 1;
+  uint64 address = 2;
+  bytes original = 3;
+  string source = 4;
+  repeated AddressRange existing = 5;
+}
+
+message MemoryCopy {
+  uint64 address = 1;
+  bytes contents = 2;
+  bool writable = 3;
+}
+
+message ObjectProbe {
+  uint64 address = 1;
+  uint64 length = 2;
+  string name = 3;
+  uint32 guard_bytes = 4;
+}
+
+message EmulateRequest {
+  uint64 address = 1;
+  bytes code = 2;
+  map<string, uint64> registers = 3;
+  repeated MemoryCopy memory = 4;
+  repeated AddressRange watch = 5;
+  repeated ObjectProbe objects = 6;
+  optional uint32 instruction_limit = 7;
+  optional uint32 timeout_ms = 8;
+}

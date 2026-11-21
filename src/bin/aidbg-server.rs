@@ -1,13 +1,19 @@
 #[path = "aidbg-server/breakpoint_service.rs"]
 mod breakpoint_service;
+#[path = "aidbg-server/coredump_store.rs"]
+mod coredump_store;
 
 use aidbg::rpc::{
-    BreakpointCapabilitiesRequest, BreakpointEventsRequest, CoreMode, CoredumpChunk,
-    CoredumpRequest, DisassembleRequest, DocumentReply, FreezeMode, InstallBreakpointRequest,
-    MAX_DOCUMENT, MAX_RPC, QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest,
-    SearchSymbolsRequest, SnapshotReply, SnapshotRequest, SymbolMatch,
+    AssembleRequest, BreakpointCapabilitiesRequest, BreakpointEventsRequest, CoreMode,
+    CoredumpChunk, CoredumpJob, CoredumpRequest, DisassembleRequest, DocumentReply,
+    DownloadCoredumpRequest, EmulateRequest, FreezeMode, GetCoredumpRequest, InspectRequest,
+    InstallBreakpointRequest, MAX_DOCUMENT, MAX_RPC, PatchRequest, ProfileRequest,
+    QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest, SearchSymbolsRequest,
+    SnapshotReply, SnapshotRequest, StartCoredumpRequest, StepWatchRequest, SymbolMatch,
+    SymbolOverrideRequest, TargetCallRequest,
     coredump_chunk::Part,
     debugger_server::{Debugger, DebuggerServer},
+    symbol_override_request::Action,
 };
 use aidbg::{
     Result, Snapshot,
@@ -15,6 +21,8 @@ use aidbg::{
 };
 use breakpoint_service::Breakpoints;
 use clap::Parser;
+use coredump_store::DumpStore;
+use prost::Message;
 use std::fs::{self, File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -34,6 +42,12 @@ struct Args {
     /// Private directory for complete JSON snapshots.
     #[arg(long)]
     state_dir: PathBuf,
+    /// Seconds to retain completed coredumps and failed job statuses.
+    #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..))]
+    coredump_retention_secs: u64,
+    /// Total quota in MiB for retained compressed coredumps.
+    #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..))]
+    coredump_max_mib: u32,
 }
 
 struct Store(PathBuf);
@@ -98,37 +112,163 @@ fn internal(e: impl ToString) -> Status {
     Status::internal(e.to_string())
 }
 
+fn validate_capture(
+    req: &CoredumpRequest,
+) -> std::result::Result<(CoreMode, aidbg::coredump::CaptureOptions), Status> {
+    validate_pid(req.pid)?;
+    let mode = CoreMode::try_from(req.mode)
+        .map_err(|_| Status::invalid_argument("unknown coredump mode"))?;
+    let timeout = req
+        .timeout_ms
+        .unwrap_or(aidbg::coredump::DEFAULT_TIMEOUT_MS);
+    if timeout == 0 {
+        return Err(Status::invalid_argument(
+            "coredump timeout must be positive",
+        ));
+    }
+    let options =
+        aidbg::coredump::CaptureOptions::new(mode, timeout, req.buffer_mib, req.block_kib)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+    Ok((mode, options))
+}
+
 struct Service {
     store: Arc<Store>,
     // The blocking job owns this guard until capture has finished cleanup.
     capture_lock: Arc<Mutex<()>>,
+    profiler: Arc<tokio::sync::Semaphore>,
+    overrides: Arc<aidbg::symbols::Overrides>,
+    code_engine: Arc<tokio::sync::Semaphore>,
     coredumps: Arc<tokio::sync::Semaphore>,
+    dump_store: Arc<DumpStore>,
     breakpoints: Breakpoints,
 }
 
 #[tonic::async_trait]
 impl Debugger for Service {
     type CoredumpStream = ReceiverStream<std::result::Result<CoredumpChunk, Status>>;
+    type DownloadCoredumpStream = Self::CoredumpStream;
+
+    async fn start_coredump(
+        &self,
+        request: Request<StartCoredumpRequest>,
+    ) -> std::result::Result<Response<CoredumpJob>, Status> {
+        let StartCoredumpRequest { dump_id, capture } = request.into_inner();
+        let req = capture.ok_or_else(|| Status::invalid_argument("capture request is missing"))?;
+        let (mode, options) = validate_capture(&req)?;
+        let store = Arc::clone(&self.dump_store);
+        let slots = Arc::clone(&self.coredumps);
+        let lock = Arc::clone(&self.capture_lock);
+        let breakpoints = self.breakpoints.clone();
+        // Once reserved, the job outlives the RPC, including cancellation
+        // before the Start response arrives at the client.
+        let job = tokio::spawn(async move {
+            let reserve = Arc::clone(&store);
+            let id = dump_id.clone();
+            let pid = req.pid;
+            let (job, worker) = tokio::task::spawn_blocking(move || {
+                let identity = aidbg::coredump::target_identity(pid);
+                let (job, worker) = reserve.reserve(&id, req.encode_to_vec())?;
+                let worker = worker.map(|guard| (guard, identity));
+                Ok::<_, Status>((job, worker))
+            })
+            .await
+            .map_err(internal)??;
+            if let Some((worker, identity)) = worker {
+                tokio::spawn(async move {
+                    let _worker = worker;
+                    let result = async {
+                        let options = options.for_process(identity?);
+                        let permit = slots.acquire_owned().await?;
+                        let guard = lock.lock_owned().await;
+                        let worker_store = Arc::clone(&store);
+                        let id = dump_id.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let _permit = permit;
+                            if breakpoints.contains(pid) {
+                                return Err(io::Error::other(
+                                    "an active breakpoint session owns this PID",
+                                )
+                                .into());
+                            }
+                            let dump = aidbg::coredump::prepare(
+                                pid,
+                                mode,
+                                options,
+                                &worker_store.path(&id),
+                                &|| false,
+                                || drop(guard),
+                            )?;
+                            worker_store.finish(&id, dump)
+                        })
+                        .await?
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(error) = store.fail(&dump_id, error.to_string()) {
+                                eprintln!("Could not save failed coredump status: {error}");
+                            }
+                        })
+                        .await;
+                    }
+                });
+            }
+            Ok::<_, Status>(job)
+        })
+        .await
+        .map_err(internal)??;
+        Ok(Response::new(job))
+    }
+
+    async fn get_coredump(
+        &self,
+        request: Request<GetCoredumpRequest>,
+    ) -> std::result::Result<Response<CoredumpJob>, Status> {
+        let request = request.into_inner();
+        let store = Arc::clone(&self.dump_store);
+        let job = tokio::task::spawn_blocking(move || store.get(&request.dump_id))
+            .await
+            .map_err(internal)??;
+        Ok(Response::new(job))
+    }
+
+    async fn download_coredump(
+        &self,
+        request: Request<DownloadCoredumpRequest>,
+    ) -> std::result::Result<Response<Self::DownloadCoredumpStream>, Status> {
+        let req = request.into_inner();
+        let store = Arc::clone(&self.dump_store);
+        let mut download =
+            tokio::task::spawn_blocking(move || store.download(&req.dump_id, req.offset))
+                .await
+                .map_err(internal)??;
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        tokio::task::spawn_blocking(move || {
+            let mut buffer = vec![0; 64 * 1024];
+            while !sender.is_closed() && download.reader.limit() != 0 {
+                let chunk = match download.reader.read(&mut buffer) {
+                    Ok(0) => Err(Status::data_loss("saved coredump ended prematurely")),
+                    Ok(n) => Ok(CoredumpChunk {
+                        part: Some(Part::Data(buffer[..n].to_vec())),
+                    }),
+                    Err(error) => Err(internal(error)),
+                };
+                let failed = chunk.is_err();
+                if sender.blocking_send(chunk).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
 
     async fn coredump(
         &self,
         request: Request<CoredumpRequest>,
     ) -> std::result::Result<Response<Self::CoredumpStream>, Status> {
         let req = request.into_inner();
-        validate_pid(req.pid)?;
-        let mode = CoreMode::try_from(req.mode)
-            .map_err(|_| Status::invalid_argument("unknown coredump mode"))?;
-        let timeout = req
-            .timeout_ms
-            .unwrap_or(aidbg::coredump::DEFAULT_TIMEOUT_MS);
-        if timeout == 0 {
-            return Err(Status::invalid_argument(
-                "coredump timeout must be positive",
-            ));
-        }
-        let options =
-            aidbg::coredump::CaptureOptions::new(mode, timeout, req.buffer_mib, req.block_kib)
-                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let (mode, options) = validate_capture(&req)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let lock = Arc::clone(&self.capture_lock);
         let slots = Arc::clone(&self.coredumps);
@@ -197,6 +337,54 @@ impl Debugger for Service {
             }
         });
         Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
+    async fn target_call(
+        &self,
+        request: Request<TargetCallRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            if breakpoints.contains(req.pid) {
+                return Err(Status::failed_precondition(
+                    "an active breakpoint session owns this PID",
+                ));
+            }
+            document(
+                aidbg::target_call::run(req)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?,
+            )
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn step_watch(
+        &self,
+        request: Request<StepWatchRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            if breakpoints.contains(req.pid) {
+                return Err(Status::failed_precondition(
+                    "an active breakpoint session owns this PID",
+                ));
+            }
+            document(
+                aidbg::watch_step::run(req)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?,
+            )
+        })
+        .await
+        .map_err(internal)?
     }
 
     async fn snapshot(
@@ -299,6 +487,7 @@ impl Debugger for Service {
         validate_pid(req.pid)?;
         let mode = SymbolMatch::try_from(req.match_mode)
             .map_err(|_| Status::invalid_argument("unknown symbol match mode"))?;
+        let overrides = Arc::clone(&self.overrides);
         tokio::task::spawn_blocking(move || {
             let result = aidbg::symbols::search(
                 req.pid,
@@ -306,6 +495,7 @@ impl Debugger for Service {
                 mode,
                 req.module.as_deref(),
                 req.limit.unwrap_or(256),
+                &overrides.list().map_err(internal)?,
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
             document(result)
@@ -320,9 +510,11 @@ impl Debugger for Service {
     ) -> std::result::Result<Response<DocumentReply>, Status> {
         let req = request.into_inner();
         validate_pid(req.pid)?;
+        let overrides = Arc::clone(&self.overrides);
         tokio::task::spawn_blocking(move || {
-            let result = aidbg::symbols::resolve(req.pid, req.address)
-                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            let result =
+                aidbg::symbols::resolve(req.pid, req.address, &overrides.list().map_err(internal)?)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
             document(result)
         })
         .await
@@ -351,9 +543,162 @@ impl Debugger for Service {
 
     async fn breakpoint_capabilities(
         &self,
-        _: Request<BreakpointCapabilitiesRequest>,
+        request: Request<BreakpointCapabilitiesRequest>,
     ) -> std::result::Result<Response<DocumentReply>, Status> {
-        document(aidbg::breakpoint::capabilities())
+        let Some(pid) = request.into_inner().pid else {
+            return document(aidbg::breakpoint::capabilities());
+        };
+        validate_pid(pid)?;
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            if breakpoints.contains(pid) {
+                return Err(Status::failed_precondition(
+                    "an active breakpoint session owns this PID",
+                ));
+            }
+            document(
+                aidbg::breakpoint::capabilities_for(pid)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?,
+            )
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn profile(
+        &self,
+        request: Request<ProfileRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        let duration = req.duration_ms.unwrap_or(1000);
+        let frequency = req.frequency_hz.unwrap_or(99);
+        if !(10..=10_000).contains(&duration)
+            || !(1..=1000).contains(&frequency)
+            || req.tid.is_some_and(|tid| tid <= 0)
+        {
+            return Err(Status::invalid_argument(
+                "expected duration 10–10000 ms, frequency 1–1000 Hz and a positive TID",
+            ));
+        }
+        let permit = Arc::clone(&self.profiler)
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("a perf collection is already running"))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = aidbg::perf::run(req.pid, req.stack, duration, frequency, req.tid)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            document(result)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn symbol_override(
+        &self,
+        request: Request<SymbolOverrideRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let overrides = Arc::clone(&self.overrides);
+        tokio::task::spawn_blocking(move || {
+            let failed = |e: Box<dyn std::error::Error + Send + Sync>| {
+                Status::failed_precondition(e.to_string())
+            };
+            match request.into_inner().action {
+                Some(Action::Set(args)) => {
+                    validate_pid(args.pid)?;
+                    document(
+                        overrides
+                            .set(args.pid, args.address, args.length, args.name)
+                            .map_err(failed)?,
+                    )
+                }
+                Some(Action::RemoveId(id)) => document(overrides.remove(&id).map_err(failed)?),
+                Some(Action::List(true)) => document(overrides.list().map_err(internal)?),
+                _ => Err(Status::invalid_argument(
+                    "select a symbol override operation",
+                )),
+            }
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn inspect(
+        &self,
+        request: Request<InspectRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        validate_pid(req.pid)?;
+        if req.tid.is_some_and(|tid| tid <= 0) {
+            return Err(Status::invalid_argument("expected a positive TID"));
+        }
+        let guard = Arc::clone(&self.capture_lock).lock_owned().await;
+        let breakpoints = self.breakpoints.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            if breakpoints.contains(req.pid) {
+                return Err(Status::failed_precondition(
+                    "an active breakpoint session owns this PID",
+                ));
+            }
+            let report = aidbg::symbols::inspect(
+                req.pid,
+                req.tid,
+                req.expression,
+                req.module.as_deref(),
+                req.instance,
+            )
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            document(report)
+        })
+        .await
+        .map_err(internal)?
+    }
+
+    async fn assemble(
+        &self,
+        request: Request<AssembleRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let req = request.into_inner();
+        self.run_code_job(move || aidbg::code::assemble(req.address, &req.source))
+            .await
+    }
+
+    async fn plan_patch(
+        &self,
+        request: Request<PatchRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        self.run_code_job(move || aidbg::code::patch(request.into_inner()))
+            .await
+    }
+
+    async fn emulate(
+        &self,
+        request: Request<EmulateRequest>,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        self.run_code_job(move || aidbg::code::emulate(request.into_inner()))
+            .await
+    }
+}
+
+impl Service {
+    async fn run_code_job<T: serde::Serialize + Send + 'static>(
+        &self,
+        job: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> std::result::Result<Response<DocumentReply>, Status> {
+        let permit = Arc::clone(&self.code_engine)
+            .try_acquire_owned()
+            .map_err(|_| {
+                Status::resource_exhausted("an offline code operation is already running")
+            })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            document(job().map_err(|e| Status::failed_precondition(e.to_string()))?)
+        })
+        .await
+        .map_err(internal)?
     }
 }
 
@@ -424,13 +769,34 @@ async fn main() -> Result<()> {
     };
     fs::set_permissions(&socket.path, Permissions::from_mode(0o600))?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let overrides = Arc::new(aidbg::symbols::Overrides::open(&args.state_dir)?);
+    let dump_store = Arc::new(DumpStore::open(
+        &args.state_dir,
+        args.coredump_retention_secs,
+        u64::from(args.coredump_max_mib) * 1024 * 1024,
+    )?);
+    let janitor = Arc::downgrade(&dump_store);
+    let cleanup_interval = std::time::Duration::from_secs(args.coredump_retention_secs.min(60));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(cleanup_interval).await;
+            let Some(store) = janitor.upgrade() else {
+                break;
+            };
+            let _ = tokio::task::spawn_blocking(move || store.prune()).await;
+        }
+    });
     let store = Arc::new(Store(args.state_dir));
     let (breakpoints, saver) = Breakpoints::new(Arc::clone(&store))?;
     let service = Service {
         store,
         breakpoints: breakpoints.clone(),
         capture_lock: Arc::new(Mutex::new(())),
+        profiler: Arc::new(tokio::sync::Semaphore::new(1)),
+        overrides,
+        code_engine: Arc::new(tokio::sync::Semaphore::new(1)),
         coredumps: Arc::new(tokio::sync::Semaphore::new(1)),
+        dump_store,
     };
     let result = Server::builder()
         .add_service(

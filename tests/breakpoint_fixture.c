@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -39,7 +41,11 @@ static void *work(void *arg)
 
 MARK static void force_watch(void)
 {
+#if defined(__x86_64__)
     __asm__ volatile("movq $7, %0" : "=m"(watched) : : "memory");
+#else
+    watched = 7;
+#endif
 }
 
 static void *write_values(void *arg)
@@ -59,7 +65,9 @@ static void *load(const char *library, Lmid_t namespace)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3 || prctl(PR_SET_PTRACER, getppid(), 0, 0, 0) != 0)
+    if (argc != 3)
+        return 3;
+    if (prctl(PR_SET_PTRACER, getppid(), 0, 0, 0) != 0 && errno != EINVAL)
         return 3;
     struct sigaction action = {.sa_handler = handle_trap};
     sigemptyset(&action.sa_mask);
@@ -74,8 +82,15 @@ int main(int argc, char **argv)
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (anonymous == MAP_FAILED)
         return 3;
-    anonymous[0] = 0x90; /* nop */
-    anonymous[1] = 0xc3; /* ret */
+#if defined(__aarch64__)
+    static const unsigned char instructions[] = {
+        0x1f, 0x20, 0x03, 0xd5, /* nop */
+        0xc0, 0x03, 0x5f, 0xd6, /* ret */
+    };
+#elif defined(__x86_64__)
+    static const unsigned char instructions[] = {0x90, 0xc3}; /* nop, ret */
+#endif
+    memcpy(anonymous, instructions, sizeof instructions);
     if (mprotect(anonymous, 4096, PROT_READ | PROT_EXEC) != 0)
         return 3;
     printf("READY %p %p %p %p %p %p %p %p %p %p %p\n", (void *)hit,

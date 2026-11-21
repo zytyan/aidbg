@@ -6,7 +6,7 @@ use gimli::{ColumnType, DwarfSections, EndianSlice, LittleEndian};
 use nix::libc;
 use object::{Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -14,6 +14,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+mod inspect;
+mod overrides;
+pub use inspect::inspect;
+pub use overrides::{Overrides, Rule as OverrideRule};
 
 const IMAGE_LIMIT: u64 = 128 * 1024 * 1024;
 const DEBUG_LIMIT: u64 = 256 * 1024 * 1024;
@@ -193,6 +198,8 @@ struct Match {
     load_bias: String,
     runtime_address: String,
     module_offset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_override: Option<OverrideRule>,
     #[serde(flatten)]
     symbol: Symbol,
 }
@@ -342,12 +349,14 @@ pub fn search(
     mode: SymbolMatch,
     filter: Option<&str>,
     limit: u32,
+    overrides: &[OverrideRule],
 ) -> Result<Search> {
     if !(1..=MAX_RESULTS).contains(&limit) {
         return Err(error("symbol result limit must be in 1..=4096"));
     }
     let matcher = Matcher::new(mode, pattern)?;
     let process = Process::open(pid)?;
+    let start_ticks = crate::procfs::start_ticks(&process.root).ok();
     let mut results = Search {
         matches: Vec::new(),
         truncated: false,
@@ -397,6 +406,31 @@ pub fn search(
         );
         results.truncated |= truncated;
         for instance in &layout.instances {
+            for rule in overrides.iter().filter(|rule| {
+                matcher.matches(rule.name())
+                    && rule.matches(pid, start_ticks, &identity, instance.base)
+            }) {
+                let Some(link) = layout.elf_base.checked_add(rule.offset()) else {
+                    continue;
+                };
+                let Some(runtime) = layout.runtime(*instance, link, module, &process.anonymous)
+                else {
+                    continue;
+                };
+                if results.matches.len() == limit as usize {
+                    results.truncated = true;
+                    return Ok(results);
+                }
+                results.matches.push(Match {
+                    module: identity.clone(),
+                    instance: hex(instance.base),
+                    load_bias: signed_hex(instance.bias),
+                    runtime_address: hex(runtime),
+                    module_offset: hex(rule.offset()),
+                    symbol: rule.symbol(link, module.executable_at(runtime).is_some()),
+                    symbol_override: Some(rule.clone()),
+                });
+            }
             for ((elf_address, _, _), symbol) in &symbols {
                 let Some(runtime) =
                     layout.runtime(*instance, *elf_address, module, &process.anonymous)
@@ -414,6 +448,7 @@ pub fn search(
                     runtime_address: hex(runtime),
                     module_offset: hex(elf_address - layout.elf_base),
                     symbol: symbol.clone(),
+                    symbol_override: None,
                 });
             }
         }
@@ -423,6 +458,7 @@ pub fn search(
 
 pub(crate) struct BreakpointSite {
     pub address: u64,
+    pub size: u64,
     backing: Backing,
     file_offset: u64,
 }
@@ -444,7 +480,19 @@ pub(crate) fn breakpoint_site(
     name: &str,
     base: Option<u64>,
 ) -> Result<BreakpointSite> {
-    if filter.len() > 4096 || name.len() > 1024 {
+    if name.len() > 1024 {
+        return Err(error("symbol name exceeds length limit"));
+    }
+    breakpoint_site_matching(root, filter, base, |symbol| symbol == name)
+}
+
+pub(crate) fn breakpoint_site_matching(
+    root: &Path,
+    filter: &str,
+    base: Option<u64>,
+    matches: impl Fn(&str) -> bool,
+) -> Result<BreakpointSite> {
+    if filter.len() > 4096 {
         return Err(error("module or symbol name exceeds length limit"));
     }
     let exe = fs::metadata(root.join("exe")).ok();
@@ -469,18 +517,22 @@ pub(crate) fn breakpoint_site(
         let layout = Layout::new(&image, &module)?;
         let debug = DebugFile::discover(root, &module, &image);
         let parsed = debug.as_ref().and_then(DebugFile::parse);
-        let addresses: BTreeSet<_> = symbol_entries(&image, parsed.as_ref())
-            .filter(|(s, _, _)| {
-                s.kind() == SymbolKind::Text && has_elf_address(s) && s.name().ok() == Some(name)
-            })
-            .map(|(s, _, _)| s.address())
-            .collect();
+        let mut addresses = BTreeMap::<u64, u64>::new();
+        for (symbol, _, _) in symbol_entries(&image, parsed.as_ref()) {
+            if symbol.kind() == SymbolKind::Text
+                && has_elf_address(&symbol)
+                && symbol.name().is_ok_and(&matches)
+            {
+                let size = addresses.entry(symbol.address()).or_default();
+                *size = (*size).max(symbol.size());
+            }
+        }
         for &instance in layout
             .instances
             .iter()
             .filter(|i| base.is_none_or(|base| i.base == base))
         {
-            for &elf_address in &addresses {
+            for (&elf_address, &size) in &addresses {
                 let Some(address) = layout.runtime(instance, elf_address, &module, &[]) else {
                     continue;
                 };
@@ -497,6 +549,7 @@ pub(crate) fn breakpoint_site(
                 }
                 found = Some(BreakpointSite {
                     address,
+                    size,
                     backing: module.backing.clone(),
                     file_offset,
                 });
@@ -599,11 +652,15 @@ pub struct ResolvedAddress {
     file_offset: Option<String>,
     display: Option<String>,
     symbol: Option<Symbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol_override: Option<OverrideRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_symbol: Option<Symbol>,
     source_line: Option<Line>,
     issues: Vec<String>,
 }
 
-pub fn resolve(pid: i32, address: u64) -> Result<ResolvedAddress> {
+pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<ResolvedAddress> {
     let process = Process::open(pid)?;
     let mut result = ResolvedAddress {
         runtime_address: hex(address),
@@ -614,6 +671,8 @@ pub fn resolve(pid: i32, address: u64) -> Result<ResolvedAddress> {
         file_offset: None,
         display: None,
         symbol: None,
+        symbol_override: None,
+        original_symbol: None,
         source_line: None,
         issues: Vec::new(),
     };
@@ -728,6 +787,24 @@ pub fn resolve(pid: i32, address: u64) -> Result<ResolvedAddress> {
         match dwarf_line(&image, link) {
             Ok(line) => result.source_line = line,
             Err(e) => result.issues.push(e.to_string()),
+        }
+    }
+    if !overrides.is_empty() {
+        let offset = link - layout.elf_base;
+        let identity = result.module.as_ref().expect("resolved module identity");
+        let start_ticks = crate::procfs::start_ticks(&process.root).ok();
+        if let Some(rule) = overrides.iter().find(|rule| {
+            rule.covers(offset) && rule.matches(pid, start_ticks, identity, instance.base)
+        }) {
+            let delta = offset - rule.offset();
+            result.original_symbol = result.symbol.take();
+            result.symbol = Some(rule.symbol(link - delta, is_exec));
+            result.symbol_override = Some(rule.clone());
+            result.display = Some(if delta == 0 {
+                rule.name().into()
+            } else {
+                format!("{}+{}", rule.name(), hex(delta))
+            });
         }
     }
     Ok(result)

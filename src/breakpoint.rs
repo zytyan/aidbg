@@ -12,7 +12,10 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(target_arch = "x86_64")]
 const SLOTS: usize = 4;
+#[cfg(target_arch = "aarch64")]
+const SLOTS: usize = 32;
 const CONTROL_BUDGET: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -184,19 +187,63 @@ struct WatchObservation {
     value_before: Option<String>,
     value_after: Option<String>,
     value_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attribution: Option<&'static str>,
 }
 
 pub fn capabilities() -> serde_json::Value {
     let x86 = cfg!(target_arch = "x86_64");
     serde_json::json!({
         "architecture": regs::ARCH,
-        "hardware_execution": x86,
-        "software_execution": x86,
+        "hardware_execution": true,
+        "software_execution": true,
         "shared_execution_and_watch_slots": if x86 { SLOTS } else { 0 },
-        "watch_access": if x86 { vec!["write", "read_write"] } else { Vec::<&str>::new() },
-        "watch_lengths": if x86 { vec![1, 2, 4, 8] } else { Vec::<usize>::new() },
-        "watch_alignment": if x86 { Some("address must be aligned to length") } else { None },
+        "watch_access": ["write", "read_write"],
+        "watch_lengths": [1, 2, 4, 8],
+        "watch_alignment": "address must be aligned to length",
+        "execution_alignment": if x86 { 1 } else { 4 },
+        "execution_slots": if x86 { Some(SLOTS) } else { None },
+        "watch_slots": if x86 { Some(SLOTS) } else { None },
+        "software_value_change": true,
     })
+}
+
+pub fn capabilities_for(pid: i32) -> Result<serde_json::Value> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = pid;
+        Ok(capabilities())
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let dir = File::open(format!("/proc/{pid}"))?;
+        let root = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        if Status::read(&root)?.field("Tgid") != Some(&pid.to_string())
+            || machine(&root)? != regs::ARCH
+        {
+            return Err(error("expected a native process leader"));
+        }
+        let mut trace = Trace::new(pid, &root, start_ticks(&root)?);
+        let counts = trace
+            .freeze(Instant::now() + CONTROL_BUDGET)
+            .and_then(|()| hardware::counts(pid));
+        let cleanup = trace.close();
+        if !cleanup.ok() {
+            return Err(error("could not detach capability probe cleanly"));
+        }
+        let (exec, watch) = counts?;
+        let mut result = capabilities();
+        result["execution_slots"] = exec.into();
+        result["watch_slots"] = watch.into();
+        result["hardware_execution"] = (exec > 0).into();
+        if watch == 0 {
+            result["watch_access"] = serde_json::json!([]);
+            result["watch_lengths"] = serde_json::json!([]);
+        }
+        Ok(result)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -270,11 +317,6 @@ pub struct Worker {
 
 impl Worker {
     pub fn start(pid: i32, publish: Publish) -> Result<Self> {
-        if !cfg!(target_arch = "x86_64") {
-            return Err(error(
-                "hardware execution breakpoints currently require x86_64",
-            ));
-        }
         let (tx, rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name(format!("aidbg-trace-{pid}"))
@@ -490,10 +532,11 @@ impl Session<'_> {
                 self.slots
                     .iter()
                     .position(Option::is_none)
-                    .ok_or_else(|| error("hardware breakpoint slots exhausted (4 shared slots)"))?,
+                    .ok_or_else(|| error("hardware breakpoint slots exhausted"))?,
             )
         };
         self.control(|session| {
+            let mut initial_watch_value = None;
             match kind {
                 Kind::Hardware if !location.valid(session.root)? => {
                     return Err(error(
@@ -514,9 +557,7 @@ impl Session<'_> {
                     modules::mapping_at(session.root, address)?
                         .filter(|m| m.contains(end))
                         .ok_or_else(|| error("watchpoint range is outside a mapped region"))?;
-                    session
-                        .watch_values
-                        .insert(id, session.trace.read_word(address, length).ok());
+                    initial_watch_value = Some(session.trace.read_word(address, length).ok());
                 }
                 _ => (),
             }
@@ -524,6 +565,9 @@ impl Session<'_> {
                 let mut proposed = session.slots;
                 proposed[slot] = Some(rule);
                 session.replace_hardware(proposed)?;
+            }
+            if let Some(value) = initial_watch_value {
+                session.watch_values.insert(id, value);
             }
             Ok(())
         })?;
@@ -595,7 +639,9 @@ impl Session<'_> {
         let mut hits = self.hits()?;
         self.observe_writes(&mut hits);
         let mut captured = self.capture_hits(hits, frozen.is_ok());
-        let stepping = self.step_software_stops(frozen.is_ok(), &mut captured);
+        let stepping = self
+            .step_arm_hardware_stops(frozen.is_ok(), &mut captured)
+            .and_then(|()| self.step_software_stops(frozen.is_ok(), &mut captured));
         let result = if stepping.is_ok() {
             frozen.and_then(|()| update(self))
         } else {
@@ -653,14 +699,37 @@ impl Session<'_> {
                 }
                 Some(Stop::Breakpoint {
                     slots,
+                    address,
                     observed,
                     unix_ms,
                 }) => {
                     let pc = regs::read(tid)?.stack.get(regs::PC)?;
+                    let arm_distance = |rule: &Rule| match (rule.kind, address) {
+                        (Kind::Hardware, Some(address)) if address == pc && rule.address == pc => {
+                            Some(0)
+                        }
+                        (Kind::Watch { length, .. }, Some(address)) if address != pc => {
+                            let offset = address.saturating_sub(rule.address);
+                            Some(if address < rule.address {
+                                rule.address - address
+                            } else {
+                                offset.saturating_sub(length as u64 - 1)
+                            })
+                        }
+                        _ => None,
+                    };
+                    let nearest = if cfg!(target_arch = "aarch64") {
+                        self.slots.iter().flatten().filter_map(arm_distance).min()
+                    } else {
+                        None
+                    };
                     for (slot, rule) in self.slots.iter().enumerate() {
                         let Some(rule) = *rule else { continue };
-                        if slots & (1 << slot) != 0
-                            && (rule.kind != Kind::Hardware || rule.address == pc)
+                        if (cfg!(target_arch = "aarch64")
+                            && nearest.is_some()
+                            && arm_distance(&rule) == nearest)
+                            || (slots & (1 << slot) != 0
+                                && (rule.kind != Kind::Hardware || rule.address == pc))
                         {
                             hits.push(Hit {
                                 tid,
@@ -679,6 +748,9 @@ impl Session<'_> {
     }
 
     fn observe_writes(&mut self, hits: &mut [Hit]) {
+        if cfg!(target_arch = "aarch64") {
+            return;
+        }
         let mut counts = BTreeMap::new();
         for hit in hits.iter() {
             *counts.entry(hit.rule.id).or_insert(0) += 1;
@@ -704,8 +776,78 @@ impl Session<'_> {
                 } else {
                     None
                 },
+                reported_address: None,
+                attribution: None,
             });
         }
+    }
+
+    fn step_arm_hardware_stops(
+        &mut self,
+        frozen: bool,
+        captured: &mut [(Hit, Capture)],
+    ) -> Result<()> {
+        if !cfg!(target_arch = "aarch64") {
+            return Ok(());
+        }
+        let pending: Vec<_> = self
+            .trace
+            .threads
+            .iter()
+            .filter_map(|(&tid, thread)| {
+                if let Some(Stop::Breakpoint { address, .. }) = thread.stop {
+                    Some((tid, address))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !pending.is_empty() && !frozen {
+            return Err(error(
+                "could not freeze peer threads for hardware single-step",
+            ));
+        }
+        for (tid, reported) in pending {
+            let mut watches = Vec::new();
+            for (hit, _) in captured.iter_mut().filter(|(hit, _)| hit.tid == tid) {
+                if let Kind::Watch { length, read_write } = hit.rule.kind {
+                    let before = self.trace.read_word(hit.rule.address, length).ok();
+                    watches.push((hit, length, read_write, before));
+                }
+            }
+            let unambiguous = watches.len() == 1;
+            disarm(tid)?;
+            let stop = self.trace.step_one(tid, Instant::now() + CONTROL_BUDGET)?;
+            if self.trace.exec_observed() || self.trace.foreign_software {
+                return Err(error(
+                    "target address space changed during hardware single-step",
+                ));
+            }
+            if stop.is_some() {
+                hardware::program(tid, &self.slots)?;
+            }
+            for (hit, length, read_write, before) in watches {
+                let exact = unambiguous
+                    && reported.is_some_and(|a| {
+                        a.checked_sub(hit.rule.address)
+                            .is_some_and(|offset| offset < length as u64)
+                    });
+                let after = matches!(stop, Some(Stop::Step))
+                    .then(|| self.trace.read_word(hit.rule.address, length).ok())
+                    .flatten();
+                hit.watch = Some(WatchObservation {
+                    length,
+                    access: if read_write { "read_write" } else { "write" },
+                    write_observed: (!read_write && exact && after.is_some()).then_some(true),
+                    value_before: before.map(hex),
+                    value_after: after.map(hex),
+                    value_changed: before.zip(after).map(|(a, b)| a != b),
+                    reported_address: reported.map(hex),
+                    attribution: Some(if exact { "exact" } else { "approximate" }),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn step_software_stops(
@@ -731,8 +873,9 @@ impl Session<'_> {
             ));
         }
         for (tid, address) in stops {
-            self.trace
-                .step_software(tid, address, Instant::now() + CONTROL_BUDGET)?;
+            let pending_rearm =
+                self.trace
+                    .step_software(tid, address, Instant::now() + CONTROL_BUDGET)?;
             if self
                 .trace
                 .threads
@@ -745,7 +888,12 @@ impl Session<'_> {
                     .filter(|hit| hit.tid == tid)
                     .collect();
                 self.observe_writes(&mut hits);
-                captured.extend(self.capture_hits(hits, true));
+                let mut after = self.capture_hits(hits, true);
+                self.step_arm_hardware_stops(true, &mut after)?;
+                if pending_rearm {
+                    self.trace.rearm_software(address)?;
+                }
+                captured.extend(after);
             }
         }
         Ok(())
@@ -802,11 +950,11 @@ impl Session<'_> {
         if self.stopped().is_empty() {
             return Ok(());
         }
-        let needs_software_freeze = self
-            .trace
-            .threads
-            .values()
-            .any(|thread| matches!(thread.stop, Some(Stop::Software { .. })));
+        let needs_software_freeze = self.trace.threads.values().any(|thread| {
+            matches!(thread.stop, Some(Stop::Software { .. }))
+                || cfg!(target_arch = "aarch64")
+                    && matches!(thread.stop, Some(Stop::Breakpoint { .. }))
+        });
         let initial = self.hits()?;
         let capture_deadline = initial
             .iter()
@@ -836,7 +984,8 @@ impl Session<'_> {
         self.observe_writes(&mut hits);
         let mut captured = self.capture_hits(hits, frozen);
         let resume = self
-            .step_software_stops(frozen, &mut captured)
+            .step_arm_hardware_stops(frozen, &mut captured)
+            .and_then(|()| self.step_software_stops(frozen, &mut captured))
             .and_then(|()| self.resume_stopped());
         self.finish_hits(captured, resume.as_ref().err().map(|error| error.as_ref()));
         resume
@@ -952,24 +1101,6 @@ mod hardware {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-mod hardware {
-    use super::Slots;
-    use crate::{Result, error};
-
-    pub(super) fn program(_: i32, _: &Slots) -> Result<()> {
-        Err(error(
-            "hardware execution breakpoints currently require x86_64",
-        ))
-    }
-
-    pub(super) fn triggered(_: i32) -> Result<u64> {
-        Err(error("hardware breakpoints require x86_64"))
-    }
-
-    pub(super) fn prepare_resume(_: i32, _: bool) -> Result<()> {
-        Err(error(
-            "hardware execution breakpoints currently require x86_64",
-        ))
-    }
-}
+#[cfg(target_arch = "aarch64")]
+#[path = "breakpoint/arm64.rs"]
+mod hardware;

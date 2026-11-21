@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -47,8 +48,8 @@ static void *churn(void *unused)
 
 int main(int argc, char **argv)
 {
-    /* Restrict this test opt-in to the runner and its descendants under Yama. */
-    if (prctl(PR_SET_PTRACER, getppid(), 0, 0, 0) != 0)
+    /* Restrict the opt-in to the runner and its descendants when Yama is present. */
+    if (prctl(PR_SET_PTRACER, getppid(), 0, 0, 0) != 0 && errno != EINVAL)
         return 3;
     sigset_t set;
     sigemptyset(&set);

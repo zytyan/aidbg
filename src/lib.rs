@@ -5,18 +5,22 @@
 compile_error!("aidbg supports Linux x86_64 and AArch64");
 
 pub mod breakpoint;
+pub mod code;
 pub mod coredump;
 mod cpp_names;
 pub mod disassembly;
 mod modules;
+pub mod perf;
 mod procfs;
 mod regs;
 pub mod rpc;
 pub mod selection;
 mod software_breakpoint;
 pub mod symbols;
+pub mod target_call;
 mod trace;
 mod unwind;
+pub mod watch_step;
 
 use procfs::{Memory, Signals, Status, epoch_ms, start_ticks, task_path};
 use serde::Serialize;

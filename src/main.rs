@@ -1,23 +1,29 @@
+#[path = "coredump/client.rs"]
+mod coredump_client;
+
 use aidbg::rpc::{
-    self, BreakpointCapabilitiesRequest, BreakpointEventsRequest, BreakpointKind, CaptureScope,
-    Client, CoreMode, CoredumpRequest, DisassembleRequest, DocumentReply, FreezeMode,
-    InstallBreakpointRequest, QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest,
-    SearchSymbolsRequest, SnapshotReply, SnapshotRequest, SymbolLocation, SymbolMatch,
-    coredump_chunk::Part, install_breakpoint_request,
+    self, AddressRange, AssembleRequest, BreakpointCapabilitiesRequest, BreakpointEventsRequest,
+    BreakpointKind, CaptureScope, Client, DisassembleRequest, DocumentReply, EmulateRequest,
+    FreezeMode, InspectRequest, InstallBreakpointRequest, MemoryCopy, ObjectProbe, PatchRequest,
+    ProfileRequest, QuerySnapshotRequest, RemoveBreakpointRequest, ResolveAddressRequest,
+    SearchSymbolsRequest, SetSymbolOverride, SnapshotReply, SnapshotRequest, StepWatchRequest,
+    SymbolLocation, SymbolMatch, SymbolOverrideRequest, TargetCallRequest,
+    install_breakpoint_request, symbol_override_request::Action as OverrideAction,
 };
 use aidbg::{Result as AidbgResult, selection::requested};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use coredump_client::{CoredumpArgs, save_coredump};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tonic::Request;
 
 #[derive(Parser)]
@@ -31,6 +37,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Track value changes within a bounded single-step window.
+    WatchStep(WatchStepArgs),
+    /// Invoke a native scalar function using an explicit scratch stack and step budget.
+    TargetCall(TargetCallArgs),
     /// Capture a live snapshot or look up a saved snapshot.
     Snapshot(SnapshotArgs),
     /// Save a compressed Linux ELF core from a live process.
@@ -44,113 +54,106 @@ enum Command {
     Resolve(ResolveArgs),
     /// Decode instructions around a runtime address.
     Disassemble(DisassembleArgs),
+    /// Sample user-space PCs or recover a call tree from sampled stacks.
+    Perf(PerfArgs),
+    /// Manage debugger-local symbol names and ranges.
+    #[command(subcommand)]
+    SymbolOverride(SymbolOverrideCommand),
+    /// Read a C/C++ variable, member, subscript or dereference from DWARF.
+    Inspect(InspectArgs),
+    /// Assemble instructions for the architecture running the server.
+    #[command(name = "asm")]
+    Assemble(AssembleArgs),
+    /// Create an offline patch within an original instruction window.
+    Patch(PatchArgs),
+    /// Emulate an offline code and memory copy from a JSON file.
+    Emulate(EmulateFile),
     /// Expose debugger tools over MCP stdio.
     Mcp,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, JsonSchema, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum DumpMode {
-    Lite,
-    #[serde(rename = "stack-4k", alias = "lite-stack")]
-    #[value(name = "stack-4k", alias = "lite-stack")]
-    Stack4k,
-    #[default]
-    Stack,
-    Standard,
-    #[serde(alias = "extend")]
-    #[value(alias = "extend")]
-    Extended,
-    Full,
+#[derive(Args, Deserialize, JsonSchema)]
+struct WatchStepArgs {
+    #[arg(long)]
+    pid: i32,
+    #[arg(long)]
+    tid: Option<i32>,
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    length: u32,
+    #[arg(long)]
+    pc_start: String,
+    #[arg(long)]
+    pc_end: String,
+    #[arg(long)]
+    max_steps: Option<u32>,
+    #[arg(long)]
+    timeout_ms: Option<u32>,
 }
 
-impl From<DumpMode> for CoreMode {
-    fn from(mode: DumpMode) -> Self {
-        match mode {
-            DumpMode::Lite => Self::CoreLite,
-            DumpMode::Stack4k => Self::CoreStack4k,
-            DumpMode::Stack => Self::CoreStack,
-            DumpMode::Standard => Self::CoreStandard,
-            DumpMode::Extended => Self::CoreExtended,
-            DumpMode::Full => Self::CoreFull,
-        }
+impl WatchStepArgs {
+    fn message(self) -> AidbgResult<StepWatchRequest> {
+        Ok(StepWatchRequest {
+            pid: self.pid,
+            tid: self.tid,
+            length: self.length,
+            max_steps: self.max_steps,
+            timeout_ms: self.timeout_ms,
+            address: parse_address(&self.address)?,
+            pc_start: parse_address(&self.pc_start)?,
+            pc_end: parse_address(&self.pc_end)?,
+        })
     }
 }
 
 #[derive(Args, Deserialize, JsonSchema)]
-struct CoredumpArgs {
+struct TargetCallArgs {
     #[arg(long)]
     pid: i32,
-    /// Memory coverage of the dump.
-    #[arg(long, value_enum, default_value = "stack")]
-    #[serde(default)]
-    mode: DumpMode,
-    /// New client-side .core.zst path.
     #[arg(long)]
-    output: PathBuf,
-    /// Time limit for freezing the target and reading its memory, in milliseconds.
+    tid: Option<i32>,
+    #[arg(long)]
+    module: String,
+    #[arg(long)]
+    symbol: String,
+    #[arg(long)]
+    instance: Option<String>,
+    #[arg(long = "arg")]
+    #[serde(default)]
+    arguments: Vec<String>,
+    #[arg(long)]
+    return_type: String,
+    #[arg(long)]
+    scratch_address: String,
+    #[arg(long)]
+    scratch_length: u32,
+    #[arg(long)]
+    max_steps: Option<u32>,
     #[arg(long)]
     timeout_ms: Option<u32>,
-    /// Server capture-buffer budget in MiB. Zero uses file staging.
     #[arg(long)]
-    buffer_mib: Option<u32>,
-    /// Server memory-read block size in KiB.
-    #[arg(long)]
-    block_kib: Option<u32>,
+    #[serde(default)]
+    allow_side_effects: bool,
 }
 
-async fn save_coredump(mut client: Client, args: CoredumpArgs) -> AidbgResult<Value> {
-    if std::fs::symlink_metadata(&args.output).is_ok() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "coredump output already exists",
-        )
-        .into());
-    }
-    let parent = args
-        .output
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let file = tempfile::NamedTempFile::new_in(parent)?;
-    let mut writer = tokio::fs::File::from_std(file.reopen()?);
-    let mut stream = client
-        .coredump(Request::new(CoredumpRequest {
-            pid: args.pid,
-            mode: CoreMode::from(args.mode) as i32,
-            timeout_ms: args.timeout_ms,
-            buffer_mib: args.buffer_mib,
-            block_kib: args.block_kib,
-        }))
-        .await?
-        .into_inner();
-    let mut summary = None;
-    let mut size = 0_u64;
-    while let Some(chunk) = stream.message().await? {
-        match chunk.part {
-            Some(Part::Data(data)) if summary.is_none() => {
-                writer.write_all(&data).await?;
-                size += data.len() as u64;
-            }
-            Some(Part::SummaryJson(json)) if summary.is_none() => {
-                summary = Some(serde_json::from_slice::<Value>(&json)?);
-            }
-            _ => return Err(io::Error::other("invalid coredump stream").into()),
-        }
-    }
-    let mut summary = summary
-        .filter(|doc| {
-            size > 0
-                && doc["compressed_bytes"].as_u64() == Some(size)
-                && matches!(doc["status"].as_str(), Some("complete" | "partial"))
+impl TargetCallArgs {
+    fn message(self) -> AidbgResult<TargetCallRequest> {
+        Ok(TargetCallRequest {
+            pid: self.pid,
+            tid: self.tid,
+            module: self.module,
+            symbol: self.symbol,
+            instance: self.instance.as_deref().map(parse_address).transpose()?,
+            arguments: self.arguments,
+            return_type: self.return_type,
+            scratch_address: parse_address(&self.scratch_address)?,
+            scratch_length: self.scratch_length,
+            max_steps: self.max_steps,
+            timeout_ms: self.timeout_ms,
+            allow_side_effects: self.allow_side_effects,
         })
-        .ok_or_else(|| io::Error::other("coredump stream ended without a valid summary"))?;
-    writer.flush().await?;
-    writer.sync_all().await?;
-    drop(writer);
-    file.persist_noclobber(&args.output)?;
-    summary["path"] = Value::String(args.output.to_string_lossy().into_owned());
-    Ok(summary)
+    }
 }
 
 #[derive(Subcommand)]
@@ -158,7 +161,13 @@ enum BreakpointCommand {
     Set(BreakpointArgs),
     Remove(RemoveArgs),
     Events(EventsArgs),
-    Capabilities,
+    Capabilities(CapabilityArgs),
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct CapabilityArgs {
+    #[arg(long)]
+    pid: Option<i32>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, JsonSchema, ValueEnum)]
@@ -326,6 +335,280 @@ impl DisassembleArgs {
             before: self.before,
             after: self.after,
             start: self.start.as_deref().map(parse_address).transpose()?,
+        })
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct PerfArgs {
+    #[arg(long)]
+    pid: i32,
+    #[arg(long, conflicts_with = "stack", required_unless_present = "stack")]
+    #[serde(default)]
+    hotspot: bool,
+    #[arg(long)]
+    #[serde(default)]
+    stack: bool,
+    #[arg(long)]
+    duration_ms: Option<u32>,
+    #[arg(long)]
+    frequency_hz: Option<u32>,
+    #[arg(long)]
+    tid: Option<i32>,
+}
+
+impl PerfArgs {
+    fn message(self) -> AidbgResult<ProfileRequest> {
+        if self.hotspot == self.stack {
+            return Err(io::Error::other("select exactly one of hotspot or stack").into());
+        }
+        Ok(ProfileRequest {
+            pid: self.pid,
+            stack: self.stack,
+            duration_ms: self.duration_ms,
+            frequency_hz: self.frequency_hz,
+            tid: self.tid,
+        })
+    }
+}
+
+#[derive(Subcommand)]
+enum SymbolOverrideCommand {
+    Set(OverrideArgs),
+    Remove(OverrideId),
+    List,
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct OverrideArgs {
+    #[arg(long)]
+    pid: i32,
+    #[arg(long)]
+    address: String,
+    #[arg(long, default_value_t = 1)]
+    #[serde(default = "single_byte")]
+    length: u64,
+    #[arg(long)]
+    name: String,
+}
+
+fn single_byte() -> u64 {
+    1
+}
+
+impl OverrideArgs {
+    fn action(self) -> AidbgResult<OverrideAction> {
+        Ok(OverrideAction::Set(SetSymbolOverride {
+            pid: self.pid,
+            address: parse_address(&self.address)?,
+            length: self.length,
+            name: self.name,
+        }))
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct OverrideId {
+    #[arg(long)]
+    id: String,
+}
+
+fn override_request(action: OverrideAction) -> Request<SymbolOverrideRequest> {
+    request(SymbolOverrideRequest {
+        action: Some(action),
+    })
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct InspectArgs {
+    #[arg(long)]
+    pid: i32,
+    #[arg(long)]
+    tid: Option<i32>,
+    #[arg(long)]
+    expression: String,
+    #[arg(long)]
+    module: Option<String>,
+    #[arg(long)]
+    instance: Option<String>,
+}
+
+impl InspectArgs {
+    fn message(self) -> AidbgResult<InspectRequest> {
+        Ok(InspectRequest {
+            pid: self.pid,
+            tid: self.tid,
+            expression: self.expression,
+            module: self.module,
+            instance: self.instance.as_deref().map(parse_address).transpose()?,
+        })
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct AssembleArgs {
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    source: String,
+}
+
+impl AssembleArgs {
+    fn message(self) -> AidbgResult<AssembleRequest> {
+        Ok(AssembleRequest {
+            address: parse_address(&self.address)?,
+            source: self.source,
+        })
+    }
+}
+
+#[derive(Args, Deserialize, JsonSchema)]
+struct PatchArgs {
+    #[arg(long)]
+    base: String,
+    #[arg(long)]
+    address: String,
+    /// Original instruction bytes as hexadecimal, starting at the specified base.
+    #[arg(long)]
+    original: String,
+    #[arg(long)]
+    source: String,
+    /// Existing patch range as ADDRESS:LENGTH. May be repeated.
+    #[arg(long)]
+    #[serde(default)]
+    existing: Vec<String>,
+}
+
+fn hex_bytes(input: &str) -> AidbgResult<Vec<u8>> {
+    let hex = input.strip_prefix("0x").unwrap_or(input);
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(io::Error::other("expected hexadecimal bytes without separators").into());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| Ok(u8::from_str_radix(&hex[i..i + 2], 16)?))
+        .collect()
+}
+
+impl PatchArgs {
+    fn message(self) -> AidbgResult<PatchRequest> {
+        let existing = self
+            .existing
+            .iter()
+            .map(|range| {
+                let (address, length) = range
+                    .split_once(':')
+                    .ok_or_else(|| io::Error::other("expected ADDRESS:LENGTH"))?;
+                Ok(AddressRange {
+                    address: parse_address(address)?,
+                    length: parse_address(length)?,
+                })
+            })
+            .collect::<AidbgResult<_>>()?;
+        Ok(PatchRequest {
+            base: parse_address(&self.base)?,
+            address: parse_address(&self.address)?,
+            original: hex_bytes(&self.original)?,
+            source: self.source,
+            existing,
+        })
+    }
+}
+
+#[derive(Args)]
+struct EmulateFile {
+    #[arg(long)]
+    state: PathBuf,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EmulateArgs {
+    address: String,
+    code: String,
+    #[serde(default)]
+    registers: BTreeMap<String, String>,
+    #[serde(default)]
+    memory: Vec<MemoryArgs>,
+    #[serde(default)]
+    watch: Vec<RangeArgs>,
+    #[serde(default)]
+    objects: Vec<ObjectArgs>,
+    instruction_limit: Option<u32>,
+    timeout_ms: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct MemoryArgs {
+    address: String,
+    bytes: String,
+    #[serde(default)]
+    writable: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct RangeArgs {
+    address: String,
+    length: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ObjectArgs {
+    name: String,
+    address: String,
+    length: u64,
+    #[serde(default)]
+    guard_bytes: u32,
+}
+
+impl EmulateArgs {
+    fn message(self) -> AidbgResult<EmulateRequest> {
+        let registers = self
+            .registers
+            .into_iter()
+            .map(|(name, value)| Ok((name, parse_address(&value)?)))
+            .collect::<AidbgResult<_>>()?;
+        let memory = self
+            .memory
+            .into_iter()
+            .map(|copy| {
+                Ok(MemoryCopy {
+                    address: parse_address(&copy.address)?,
+                    contents: hex_bytes(&copy.bytes)?,
+                    writable: copy.writable,
+                })
+            })
+            .collect::<AidbgResult<_>>()?;
+        let watch = self
+            .watch
+            .into_iter()
+            .map(|range| {
+                Ok(AddressRange {
+                    address: parse_address(&range.address)?,
+                    length: range.length,
+                })
+            })
+            .collect::<AidbgResult<_>>()?;
+        let objects = self
+            .objects
+            .into_iter()
+            .map(|probe| {
+                Ok(ObjectProbe {
+                    name: probe.name,
+                    address: parse_address(&probe.address)?,
+                    length: probe.length,
+                    guard_bytes: probe.guard_bytes,
+                })
+            })
+            .collect::<AidbgResult<_>>()?;
+        Ok(EmulateRequest {
+            address: parse_address(&self.address)?,
+            code: hex_bytes(&self.code)?,
+            registers,
+            memory,
+            watch,
+            objects,
+            instruction_limit: self.instruction_limit,
+            timeout_ms: self.timeout_ms,
         })
     }
 }
@@ -522,7 +805,7 @@ fn argument_error(error: impl ToString) -> CallToolResult {
 #[tool_router(server_handler)]
 impl Mcp {
     #[tool(
-        description = "Save a compressed Linux ELF core to a new client-side path. Modes are lite, stack-4k, stack, standard, extended, and full. Returns coverage and output metadata."
+        description = "Save a compressed Linux ELF core to a client-side path. Set resume to true with the original output path to resume a download. Returns the dump ID, coverage, and output metadata."
     )]
     async fn coredump(&self, Parameters(args): Parameters<CoredumpArgs>) -> CallToolResult {
         match save_coredump(self.client.clone(), args).await {
@@ -633,11 +916,14 @@ impl Mcp {
     #[tool(
         description = "Report the supported breakpoint modes, watch widths, alignment and hardware slots."
     )]
-    async fn breakpoint_capabilities(&self) -> CallToolResult {
+    async fn breakpoint_capabilities(
+        &self,
+        Parameters(args): Parameters<CapabilityArgs>,
+    ) -> CallToolResult {
         document_tool(
             self.client
                 .clone()
-                .breakpoint_capabilities(request(BreakpointCapabilitiesRequest {}))
+                .breakpoint_capabilities(request(BreakpointCapabilitiesRequest { pid: args.pid }))
                 .await,
         )
     }
@@ -646,6 +932,111 @@ impl Mcp {
     async fn disassemble(&self, Parameters(args): Parameters<DisassembleArgs>) -> CallToolResult {
         match args.message() {
             Ok(message) => document_tool(self.client.clone().disassemble(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(description = "Sample user-space hotspots or call stacks with Linux perf events.")]
+    async fn perf(&self, Parameters(args): Parameters<PerfArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().profile(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(description = "Add a debugger-local symbol name over a loaded module range.")]
+    async fn symbol_override_set(
+        &self,
+        Parameters(args): Parameters<OverrideArgs>,
+    ) -> CallToolResult {
+        match args.action() {
+            Ok(action) => document_tool(
+                self.client
+                    .clone()
+                    .symbol_override(override_request(action))
+                    .await,
+            ),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(description = "Remove a debugger-local symbol override by ID.")]
+    async fn symbol_override_remove(
+        &self,
+        Parameters(args): Parameters<OverrideId>,
+    ) -> CallToolResult {
+        document_tool(
+            self.client
+                .clone()
+                .symbol_override(override_request(OverrideAction::RemoveId(args.id)))
+                .await,
+        )
+    }
+
+    #[tool(description = "List debugger-local symbol overrides and their scopes.")]
+    async fn symbol_override_list(&self) -> CallToolResult {
+        document_tool(
+            self.client
+                .clone()
+                .symbol_override(override_request(OverrideAction::List(true)))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read a DWARF-backed C/C++ variable or read-only access expression in the current frame."
+    )]
+    async fn inspect(&self, Parameters(args): Parameters<InspectArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().inspect(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(
+        description = "Compare a live data range after each step in a bounded user-space PC window."
+    )]
+    async fn watch_step(&self, Parameters(args): Parameters<WatchStepArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().step_watch(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(
+        description = "Call a native scalar function within its symbol range using a dedicated target scratch stack and explicit consent to side effects."
+    )]
+    async fn target_call(&self, Parameters(args): Parameters<TargetCallArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().target_call(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(description = "Assemble instructions with Keystone for the server architecture.")]
+    async fn assemble(&self, Parameters(args): Parameters<AssembleArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().assemble(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(
+        description = "Plan an offline patch and check original instruction boundaries with Capstone."
+    )]
+    async fn plan_patch(&self, Parameters(args): Parameters<PatchArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().plan_patch(request(message)).await),
+            Err(e) => argument_error(e),
+        }
+    }
+
+    #[tool(
+        description = "Simulate copied code, registers and memory with Unicorn, with optional watchpoints and object bounds probes."
+    )]
+    async fn emulate(&self, Parameters(args): Parameters<EmulateArgs>) -> CallToolResult {
+        match args.message() {
+            Ok(message) => document_tool(self.client.clone().emulate(request(message)).await),
             Err(e) => argument_error(e),
         }
     }
@@ -686,9 +1077,11 @@ async fn main() -> AidbgResult<ExitCode> {
                     }))
                     .await?
             }
-            BreakpointCommand::Capabilities => {
+            BreakpointCommand::Capabilities(args) => {
                 client
-                    .breakpoint_capabilities(request(BreakpointCapabilitiesRequest {}))
+                    .breakpoint_capabilities(request(BreakpointCapabilitiesRequest {
+                        pid: args.pid,
+                    }))
                     .await?
             }
             BreakpointCommand::Events(args) => {
@@ -710,6 +1103,25 @@ async fn main() -> AidbgResult<ExitCode> {
                 .await?
         }
         Command::Disassemble(args) => client.disassemble(request(args.message()?)).await?,
+        Command::Perf(args) => client.profile(request(args.message()?)).await?,
+        Command::Inspect(args) => client.inspect(request(args.message()?)).await?,
+        Command::WatchStep(args) => client.step_watch(request(args.message()?)).await?,
+        Command::TargetCall(args) => client.target_call(request(args.message()?)).await?,
+        Command::Assemble(args) => client.assemble(request(args.message()?)).await?,
+        Command::Patch(args) => client.plan_patch(request(args.message()?)).await?,
+        Command::Emulate(args) => {
+            let bytes = std::fs::read(args.state)?;
+            let args: EmulateArgs = serde_json::from_slice(&bytes)?;
+            client.emulate(request(args.message()?)).await?
+        }
+        Command::SymbolOverride(command) => {
+            let action = match command {
+                SymbolOverrideCommand::Set(args) => args.action()?,
+                SymbolOverrideCommand::Remove(args) => OverrideAction::RemoveId(args.id),
+                SymbolOverrideCommand::List => OverrideAction::List(true),
+            };
+            client.symbol_override(override_request(action)).await?
+        }
         Command::Mcp => {
             let mcp = Mcp { client }.serve(rmcp::transport::stdio()).await?;
             mcp.waiting().await?;
@@ -722,9 +1134,11 @@ async fn main() -> AidbgResult<ExitCode> {
     out.write_all(&reply.json)?;
     writeln!(out)?;
     out.flush()?;
-    Ok(if doc["status"] == "cleanup_failed" {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(
+        if doc["status"] == "cleanup_failed" || doc["status"] == "unavailable" {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        },
+    )
 }

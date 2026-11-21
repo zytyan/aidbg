@@ -8,6 +8,10 @@ use std::collections::BTreeMap;
 pub struct Registers([Option<u64>; 33]);
 
 impl Registers {
+    pub fn empty() -> Self {
+        Self([None; 33])
+    }
+
     pub fn get(&self, r: Register) -> Result<u64> {
         self.0
             .get(usize::from(r.0))

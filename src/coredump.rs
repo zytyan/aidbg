@@ -7,8 +7,10 @@ use crate::rpc::CoreMode;
 use crate::trace::Trace;
 use crate::{Result, error};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
@@ -17,10 +19,37 @@ const MIB: usize = 1024 * 1024;
 const COMPRESSION_LEVEL: i32 = 1;
 pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 
+pub fn valid_dump_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+// An exclusive advisory lock, held for the lifetime of the open descriptor.
+pub fn try_lock(file: &File) -> std::io::Result<()> {
+    nix::errno::Errno::result(unsafe {
+        nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB)
+    })
+    .map(|_| ())
+    .map_err(std::io::Error::from)
+}
+
+pub fn hash_reader(mut reader: impl Read, hash: &mut Sha256) -> std::io::Result<u64> {
+    let mut buffer = vec![0; 256 * 1024];
+    let mut bytes = 0;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(bytes);
+        }
+        hash.update(&buffer[..n]);
+        bytes += n as u64;
+    }
+}
+
 pub struct CaptureOptions {
     timeout_ms: u32,
     buffer_mib: u32,
     block_bytes: usize,
+    expected_start_ticks: Option<u64>,
 }
 
 impl CaptureOptions {
@@ -49,8 +78,18 @@ impl CaptureOptions {
             timeout_ms,
             buffer_mib,
             block_bytes: block_kib as usize * 1024,
+            expected_start_ticks: None,
         })
     }
+
+    pub fn for_process(mut self, start_ticks: u64) -> Self {
+        self.expected_start_ticks = Some(start_ticks);
+        self
+    }
+}
+
+pub fn target_identity(pid: i32) -> Result<u64> {
+    start_ticks(&std::path::PathBuf::from(format!("/proc/{pid}")))
 }
 
 impl CoreMode {
@@ -145,13 +184,14 @@ fn micros(start: Instant) -> u64 {
 
 pub struct Dump {
     pub header: Vec<u8>,
-    pub payload: File,
+    pub payload: tempfile::NamedTempFile,
     pub summary: Summary,
 }
 
 struct CaptureLimit<'a> {
     deadline: Instant,
     cancelled: &'a (dyn Fn() -> bool + Sync),
+    expected_start_ticks: Option<u64>,
 }
 
 enum CompressionInput {
@@ -182,6 +222,7 @@ pub fn prepare(
     let limit = CaptureLimit {
         deadline: Instant::now() + Duration::from_millis(options.timeout_ms.into()),
         cancelled,
+        expected_start_ticks: options.expected_start_ticks,
     };
     let blocks_in_pool = options.buffer_mib as usize * MIB / options.block_bytes;
     let parallel = mode != CoreMode::CoreLite
@@ -200,7 +241,7 @@ pub fn prepare(
         std::hint::black_box(&mut buffer[..]).fill(0);
         buffer
     };
-    let output = tempfile::tempfile_in(state_dir)?;
+    let output = tempfile::NamedTempFile::new_in(state_dir)?;
     let mut staging_us = 0;
     let (capture, mut payload, staged_bytes) = if parallel {
         let mut raw = tempfile::tempfile_in(state_dir)?;
@@ -213,7 +254,7 @@ pub fn prepare(
                 recycle.send(block())?;
             }
             let (ready, initialized) = mpsc::channel();
-            let compressor = scope.spawn(move || -> Result<File> {
+            let compressor = scope.spawn(move || -> Result<tempfile::NamedTempFile> {
                 let mut writer = encoder(BufWriter::with_capacity(256 * 1024, output))?;
                 let _ = ready.send(());
                 while let Ok(input) = input.recv() {
@@ -312,7 +353,7 @@ pub fn prepare(
     let mut writer = encoder(Vec::new())?;
     elf::write_header(&mut writer, &capture)?;
     let header = writer.finish()?;
-    let compressed_bytes = header.len() as u64 + payload.metadata()?.len();
+    let compressed_bytes = header.len() as u64 + payload.as_file().metadata()?.len();
     payload.rewind()?;
     let missing_bytes = capture
         .coverage
@@ -392,7 +433,9 @@ fn encoder<W: Write>(output: W) -> Result<zstd::stream::write::Encoder<'static, 
     Ok(writer)
 }
 
-fn finish(writer: zstd::stream::write::Encoder<'static, BufWriter<File>>) -> Result<File> {
+fn finish(
+    writer: zstd::stream::write::Encoder<'static, BufWriter<tempfile::NamedTempFile>>,
+) -> Result<tempfile::NamedTempFile> {
     Ok(writer.finish()?.into_inner()?)
 }
 
@@ -418,6 +461,12 @@ fn capture(
     let root = std::path::PathBuf::from(format!("/proc/{pid}"));
     let started = Instant::now();
     let identity = start_ticks(&root)?;
+    if limit
+        .expected_start_ticks
+        .is_some_and(|expected| expected != identity)
+    {
+        return Err(error("target identity changed before coredump capture"));
+    }
     let page = u64::try_from(unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) })?;
     if !page.is_power_of_two() {
         return Err(error("invalid page size"));

@@ -1,58 +1,70 @@
-use crate::Result;
-
-pub(crate) const TRAP: u8 = 0xcc;
+use crate::{Result, error};
+use nix::{libc, sys::ptrace, unistd::Pid};
 
 #[cfg(target_arch = "x86_64")]
-mod imp {
-    use super::Result;
-    use nix::{libc, sys::ptrace, unistd::Pid};
+pub(crate) const TRAP: u32 = 0xcc;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const TRAP: u32 = 0xd420_0000;
+#[cfg(target_arch = "x86_64")]
+const WIDTH: usize = 1;
+#[cfg(target_arch = "aarch64")]
+const WIDTH: usize = 4;
 
-    // PTRACE_POKEDATA replaces a machine word. Align down so a breakpoint
-    // at the end of a mapping never requires reading the next page.
-    pub fn read_byte(tid: i32, address: u64) -> Result<u8> {
-        let word = ptrace::read(Pid::from_raw(tid), (address & !7) as ptrace::AddressType)?;
-        Ok(word.to_ne_bytes()[(address & 7) as usize])
+fn word_location(address: u64) -> Result<(ptrace::AddressType, usize)> {
+    if !address.is_multiple_of(WIDTH as u64) {
+        return Err(error(
+            "software breakpoint address is not instruction aligned",
+        ));
     }
+    Ok((
+        (address & !7) as ptrace::AddressType,
+        (address & 7) as usize,
+    ))
+}
 
-    pub fn write_byte(tid: i32, address: u64, byte: u8) -> Result<()> {
-        let pid = Pid::from_raw(tid);
-        let aligned = (address & !7) as ptrace::AddressType;
-        let mut bytes = ptrace::read(pid, aligned)?.to_ne_bytes();
-        bytes[(address & 7) as usize] = byte;
-        ptrace::write(pid, aligned, libc::c_long::from_ne_bytes(bytes))?;
-        Ok(())
-    }
+// Preserve adjacent instructions in the same ptrace word. ARM Linux performs
+// instruction-cache maintenance for ptrace writes to executable mappings.
+pub(crate) fn read_instruction(tid: i32, address: u64) -> Result<u32> {
+    let (aligned, offset) = word_location(address)?;
+    let word = ptrace::read(Pid::from_raw(tid), aligned)?.to_ne_bytes();
+    let mut bytes = [0; 4];
+    bytes[..WIDTH].copy_from_slice(&word[offset..offset + WIDTH]);
+    Ok(u32::from_ne_bytes(bytes))
+}
 
-    pub fn pc(tid: i32) -> Result<u64> {
-        Ok(ptrace::getregs(Pid::from_raw(tid))?.rip)
-    }
+pub(crate) fn write_instruction(tid: i32, address: u64, instruction: u32) -> Result<()> {
+    let pid = Pid::from_raw(tid);
+    let (aligned, offset) = word_location(address)?;
+    let mut bytes = ptrace::read(pid, aligned)?.to_ne_bytes();
+    bytes[offset..offset + WIDTH].copy_from_slice(&instruction.to_ne_bytes()[..WIDTH]);
+    ptrace::write(pid, aligned, libc::c_long::from_ne_bytes(bytes))?;
+    Ok(())
+}
 
-    pub fn set_pc(tid: i32, address: u64) -> Result<()> {
-        let pid = Pid::from_raw(tid);
-        let mut regs = ptrace::getregs(pid)?;
+pub(crate) fn pc(tid: i32) -> Result<u64> {
+    let regs = ptrace::getregs(Pid::from_raw(tid))?;
+    #[cfg(target_arch = "x86_64")]
+    return Ok(regs.rip);
+    #[cfg(target_arch = "aarch64")]
+    return Ok(regs.pc);
+}
+
+pub(crate) fn trap_address(tid: i32) -> Option<u64> {
+    let pc = pc(tid).ok()?;
+    pc.checked_sub(u64::from(cfg!(target_arch = "x86_64")))
+}
+
+pub(crate) fn set_pc(tid: i32, address: u64) -> Result<()> {
+    let pid = Pid::from_raw(tid);
+    let mut regs = ptrace::getregs(pid)?;
+    #[cfg(target_arch = "x86_64")]
+    {
         regs.rip = address;
-        ptrace::setregs(pid, regs)?;
-        Ok(())
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.pc = address;
+    }
+    ptrace::setregs(pid, regs)?;
+    Ok(())
 }
-
-#[cfg(not(target_arch = "x86_64"))]
-mod imp {
-    use super::Result;
-    use crate::error;
-
-    pub fn read_byte(_: i32, _: u64) -> Result<u8> {
-        Err(error("software breakpoints require x86_64"))
-    }
-    pub fn write_byte(_: i32, _: u64, _: u8) -> Result<()> {
-        Err(error("software breakpoints require x86_64"))
-    }
-    pub fn pc(_: i32) -> Result<u64> {
-        Err(error("software breakpoints require x86_64"))
-    }
-    pub fn set_pc(_: i32, _: u64) -> Result<()> {
-        Err(error("software breakpoints require x86_64"))
-    }
-}
-
-pub(crate) use imp::{pc, read_byte, set_pc, write_byte};

@@ -93,11 +93,6 @@ impl Breakpoints {
     }
 
     pub fn install(&self, req: InstallBreakpointRequest) -> Result<impl Serialize, Status> {
-        if !cfg!(target_arch = "x86_64") {
-            return Err(Status::unimplemented(
-                "breakpoints and watchpoints currently require x86_64",
-            ));
-        }
         let location = match req.location {
             Some(install_breakpoint_request::Location::Address(address)) if address != 0 => {
                 Location::Address(address)

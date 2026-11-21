@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path
 import resource
@@ -181,61 +182,152 @@ def relay(listener, backend, pid, cut):
     client, _ = listener.accept()
     with client, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as upstream:
         upstream.settimeout(10)
-        client.settimeout(10)
         upstream.connect(str(backend))
+        client.setblocking(False)
+        upstream.setblocking(False)
+        to_client, to_server = bytearray(), bytearray()
         forwarded = 0
+        stalled = False
+        upstream_closed = False
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if cut == "capture" and status(pid)["TracerPid"] != "0":
                 return forwarded
-            ready, _, _ = select.select([client, upstream], [], [], 0.001 if cut == "capture" else 0.05)
+            if upstream_closed and not to_client:
+                assert cut is None or stalled, f"connection closed before {cut} cut"
+                return forwarded
+
+            readable = []
+            writable = []
+            if len(to_server) < 256 * 1024:
+                readable.append(client)
+            if not upstream_closed and not stalled and len(to_client) < 256 * 1024:
+                readable.append(upstream)
+            if to_server and not upstream_closed:
+                writable.append(upstream)
+            if to_client and not stalled:
+                writable.append(client)
+            ready, pending, _ = select.select(readable, writable, [],
+                                               0.001 if cut == "capture" else 0.05)
             for source in ready:
-                data = source.recv(64 * 1024)
-                if not data:
-                    assert cut is None, f"connection closed before {cut} cut"
-                    return forwarded
-                if source is client:
-                    upstream.sendall(data)
+                try:
+                    data = source.recv(65536)
+                except BlockingIOError:
                     continue
-                if cut == "stream":
-                    data = data[:STREAM_CUT_BYTES - forwarded]
-                client.sendall(data)
-                forwarded += len(data)
-                if cut == "stream" and forwarded == STREAM_CUT_BYTES:
-                    return forwarded
+                if source is client:
+                    if not data:
+                        assert cut is None or stalled, f"connection closed before {cut} cut"
+                        return forwarded
+                    to_server.extend(data)
+                elif data:
+                    to_client.extend(data)
+                else:
+                    upstream_closed = True
+            for destination in pending:
+                buffer = to_client if destination is client else to_server
+                try:
+                    if destination is client and cut in ("stream", "idle"):
+                        written = destination.send(buffer[:STREAM_CUT_BYTES - forwarded])
+                    else:
+                        written = destination.send(buffer)
+                except BlockingIOError:
+                    continue
+                del buffer[:written]
+                if destination is client:
+                    forwarded += written
+                    if cut == "stream" and forwarded == STREAM_CUT_BYTES:
+                        return forwarded
+                    if cut == "idle" and forwarded == STREAM_CUT_BYTES:
+                        stalled = True
+                        to_client.clear()
         raise RuntimeError("coredump connection test timed out")
 
 
-def verify_disconnect(cli, work, fixture):
+@contextmanager
+def proxy(cli, work):
     endpoint = work / "proxy.sock"
-    proxy_cli = [*cli[:-1], endpoint]
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(1) as pool:
-        listener.bind(str(endpoint))
-        listener.listen()
-        listener.settimeout(10)
-        for cut in ("capture", "stream"):
-            output = work / f"recovered-{cut}.core.zst"
-            first = pool.submit(relay, listener, cli[-1], fixture.pid, cut)
-            failure = capture(proxy_cli, output, fixture, "full", expected=1)
-            forwarded = first.result(timeout=10)
-            if cut == "stream":
-                assert forwarded == STREAM_CUT_BYTES, forwarded
-            assert not failure.stdout and not output.exists() and not list(work.glob(".tmp*"))
-            deadline = time.monotonic() + 10
-            while any(status(fixture.pid, tid.name)["TracerPid"] != "0"
-                      for tid in Path(f"/proc/{fixture.pid}/task").iterdir()):
-                assert time.monotonic() < deadline, "link loss left a thread traced"
-                time.sleep(0.01)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(1) as pool:
+            listener.bind(str(endpoint))
+            listener.listen()
+            listener.settimeout(10)
+            yield [*cli[:-1], endpoint], listener, pool
+    finally:
+        endpoint.unlink(missing_ok=True)
 
+
+def progress(path):
+    partial = Path(f"{path}.part")
+    checkpoint = Path(f"{path}.part.json")
+    assert partial.stat().st_mode & 0o777 == 0o600
+    assert checkpoint.stat().st_mode & 0o777 == 0o600
+    return json.loads(checkpoint.read_text())["dump_id"], partial
+
+
+def resume(cli, path, expected=0):
+    run = subprocess.run([*cli, "coredump", "--resume", "--output", path],
+                         capture_output=True, timeout=30)
+    if expected:
+        assert run.returncode != 0 and not run.stdout, run
+        return run
+    assert run.returncode == 0, run.stderr.decode()
+    return json.loads(run.stdout)
+
+
+def verify_saved(state, path, dump_id, offset, summary):
+    assert summary["dump_id"] == dump_id and summary["resumed_from"] == offset, summary
+    stored = state / "coredumps" / dump_id
+    original = (stored / "header.zst").read_bytes() + (stored / "payload.zst").read_bytes()
+    assert path.read_bytes() == original
+    assert summary["sha256"] == hashlib.sha256(original).hexdigest()
+    assert not Path(f"{path}.part").exists() and not Path(f"{path}.part.json").exists()
+    subprocess.check_call(["zstd", "-qt", path], timeout=30)
+
+
+def interrupt(cli, proxy_cli, listener, pool, fixture, output, cut):
+    first = pool.submit(relay, listener, cli[-1], fixture.pid, cut)
+    extra = ("--download-idle-ms", "1000") if cut == "idle" else ()
+    failure = capture(proxy_cli, output, fixture, "full", extra, expected=1)
+    forwarded = first.result(timeout=10)
+    if cut in ("stream", "idle"):
+        assert forwarded == STREAM_CUT_BYTES, forwarded
+    if cut == "idle":
+        assert b"connection or download stalled" in failure.stderr, failure
+    assert not failure.stdout and not output.exists()
+    deadline = time.monotonic() + 10
+    while any(status(fixture.pid, tid.name)["TracerPid"] != "0"
+              for tid in Path(f"/proc/{fixture.pid}/task").iterdir()):
+        assert time.monotonic() < deadline, "link loss left a thread traced"
+        time.sleep(0.01)
+    dump_id, partial = progress(output)
+    if cut == "capture":
+        assert partial.stat().st_size == 0
+    else:
+        assert 0 < partial.stat().st_size <= STREAM_CUT_BYTES
+    return dump_id, partial
+
+
+def verify_disconnect(cli, work, fixture, state):
+    for cut in ("capture", "stream", "idle"):
+        output = work / f"recovered-{cut}.core.zst"
+        with proxy(cli, work) as (proxy_cli, listener, pool):
+            dump_id, partial = interrupt(cli, proxy_cli, listener, pool, fixture, output, cut)
+        offset = partial.stat().st_size
+        jobs = set((state / "coredumps").iterdir())
+        # Recreate the relay at the same path to discard any handshakes queued
+        # by the first client's HTTP/2 reconnect before it exited.
+        with proxy(cli, work) as (proxy_cli, listener, pool):
             reconnect = pool.submit(relay, listener, cli[-1], fixture.pid, None)
-            summary = capture(proxy_cli, output, fixture, "full")
-            assert reconnect.result(timeout=10) >= summary["compressed_bytes"]
-            subprocess.check_call(["zstd", "-qt", output], timeout=30)
-            assert not list(work.glob(".tmp*"))
-            print(f"PASS connection cut during {cut}, cleanup and fresh capture on the same socket")
+            summary = resume(proxy_cli, output)
+            wire_bytes = reconnect.result(timeout=10)
+        remaining = summary["compressed_bytes"] - offset
+        assert remaining <= wire_bytes < remaining + 128 * 1024, (wire_bytes, remaining)
+        assert set((state / "coredumps").iterdir()) == jobs
+        verify_saved(state, output, dump_id, offset, summary)
+        print(f"PASS {cut} interruption, same coredump resumed from offset {offset}")
 
 
-def verify_mcp(cli, work, fixture):
+def verify_mcp(cli, work, fixture, state):
     output = work / "mcp.core.zst"
     with subprocess.Popen([*cli, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE) as mcp:
         def send(method, params=None, ident=None):
@@ -259,6 +351,18 @@ def verify_mcp(cli, work, fixture):
                 "pid": fixture.pid, "mode": "lite", "output": str(output)}}, 2)
             assert not result.get("isError") and result["structuredContent"]["status"] == "complete", result
             assert output.is_file()
+            dump_id = result["structuredContent"]["dump_id"]
+            resumed = work / "mcp-resumed.core.zst"
+            partial = Path(f"{resumed}.part")
+            checkpoint = Path(f"{resumed}.part.json")
+            partial.write_bytes(output.read_bytes()[:256])
+            checkpoint.write_text(json.dumps({"dump_id": dump_id}))
+            partial.chmod(0o600)
+            checkpoint.chmod(0o600)
+            result = send("tools/call", {"name": "coredump", "arguments": {
+                "resume": True, "output": str(resumed)}}, 3)
+            assert not result.get("isError"), result
+            verify_saved(state, resumed, dump_id, 256, result["structuredContent"])
         finally:
             mcp.stdin.close()
             mcp.wait(timeout=10)
@@ -279,6 +383,7 @@ def verify_cancel(cli, work, fixture):
         assert time.monotonic() < deadline, "cancelled capture left the target traced"
         time.sleep(0.01)
     assert not output.exists() and not list(work.glob(".tmp*"))
+    progress(output)
 
 
 def verify_write_failure(cli, work, fixture):
@@ -292,6 +397,7 @@ def verify_write_failure(cli, work, fixture):
                             capture_output=True, timeout=30)
     assert result.returncode != 0 and b"File too large" in result.stderr, result
     assert not output.exists() and not list(work.glob(".tmp*"))
+    progress(output)
     assert status(fixture.pid)["TracerPid"] == "0"
 
 
@@ -336,6 +442,47 @@ def start_fixture(work, workload):
         finally:
             if fixture.poll() is None:
                 fixture.kill()
+
+
+def verify_restart(cli, work, state):
+    case = work / "restart"
+    output = case / "full.core.zst"
+    with server(cli[-1], state), start_fixture(case, "typical") as (fixture, _):
+        with proxy(cli, case) as (proxy_cli, listener, pool):
+            dump_id, partial = interrupt(cli, proxy_cli, listener, pool, fixture, output, "stream")
+    # The original tracee has exited and the original server is gone.
+    prefix = partial.read_bytes()
+    partial.write_bytes(bytes([prefix[0] ^ 1]) + prefix[1:])
+    with server(cli[-1], state):
+        corrupt = resume(cli, output, expected=1)
+        assert b"SHA-256 mismatch" in corrupt.stderr and not output.exists(), corrupt
+        partial.write_bytes(prefix)
+        summary = resume(cli, output)
+        verify_saved(state, output, dump_id, len(prefix), summary)
+    print("PASS resume after server restart and target exit, with corrupt prefix rejected")
+
+
+def verify_retention(cli, work):
+    state = work / "quota-state"
+    state.mkdir(mode=0o700)
+    case = work / "quota"
+    with server(cli[-1], state, "--coredump-max-mib", "2", "--coredump-retention-secs", "5"), \
+         start_fixture(case, "typical") as (fixture, _):
+        failure = capture(cli, case / "too-large.core.zst", fixture, "full", expected=1)
+        assert b"exceeds the retained-artifact quota" in failure.stderr, failure
+        first = capture(cli, case / "first.core.zst", fixture, "extended")
+        failure = capture(cli, case / "quota-full.core.zst", fixture, "extended", expected=1)
+        assert b"coredump retention quota exhausted" in failure.stderr, failure
+        expired = case / "expired.core.zst"
+        checkpoint = Path(f"{expired}.part.json")
+        checkpoint.write_text(json.dumps({"dump_id": first["dump_id"]}))
+        checkpoint.chmod(0o600)
+        time.sleep(max(0, first["expires_unix_secs"] - time.time()) + 0.1)
+        failure = resume(cli, expired, expected=1)
+        assert b"retention expired" in failure.stderr and not expired.exists(), failure
+        capture(cli, case / "quota-freed.core.zst", fixture, "extended")
+        assert not (state / "coredumps" / first["dump_id"]).exists()
+    print("PASS per-artifact and total quotas, expiration and reclaimed space")
 
 
 def sweep_pause(work, bin_dir, baseline, repeats):
@@ -438,14 +585,16 @@ def main():
                             rejected = case / "invalid.core.zst"
                             capture(cli, rejected, fixture, "full", option, expected=1)
                             assert not rejected.exists()
-                        verify_mcp(cli, case, fixture)
+                        verify_mcp(cli, case, fixture, state)
                         verify_cancel(cli, case, fixture)
-                        verify_disconnect(cli, case, fixture)
+                        verify_disconnect(cli, case, fixture, state)
                         verify_write_failure(cli, case, fixture)
                         verify_breakpoint_conflict(cli, case, fixture, addresses["code"])
                         print("PASS MCP, no-clobber, timeout, cancellation, write failure and breakpoint conflict")
                 if args.benchmark:
                     compare_compression(workload, case / "full.core.zst")
+        verify_restart(cli, work, state)
+        verify_retention(cli, work)
 
 
 if __name__ == "__main__":

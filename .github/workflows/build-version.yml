@@ -22,22 +22,20 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      - name: Install compiler for bundled Capstone
+      - name: Install static build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y cmake ninja-build python3-pip
+          python3 -m pip --disable-pip-version-check install --target "$RUNNER_TEMP/zig" ziglang==0.15.2
+          echo "$RUNNER_TEMP/zig/ziglang" >> "$GITHUB_PATH"
       - name: Build release binaries
         env:
           TARGET: ${{ matrix.target }}
-          CC: musl-gcc
         run: |
           set -euo pipefail
           rustup update stable
           rustup target add --toolchain stable "$TARGET"
-          host=$(rustc +stable -vV | awk '$1 == "host:" {print $2}')
-          lld="$(rustc +stable --print sysroot)/lib/rustlib/$host/bin/rust-lld"
-          RUSTFLAGS="-C linker=$lld -C linker-flavor=ld.lld" \
-            cargo +stable build --locked --release --bins --target "$TARGET"
+          cargo +stable build --locked --release --bins --target "$TARGET"
       - name: Verify ELF and package binaries
         env:
           TARGET: ${{ matrix.target }}

@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import platform
 import select
 import signal
 import subprocess
@@ -15,6 +16,11 @@ ARTIFACTS = ROOT / "artifacts"
 BIN = ARTIFACTS / "aidbg"
 FIXTURE = ARTIFACTS / "fixture"
 SERVER = ARTIFACTS / "aidbg-server"
+ARCH = platform.machine()
+REGISTER_NAMES = {
+    "x86_64": ("rip", "rsp", "eflags"),
+    "aarch64": ("pc", "sp", "pstate"),
+}
 
 
 def status(pid, tid=None):
@@ -26,8 +32,8 @@ def status(pid, tid=None):
 
 
 @contextlib.contextmanager
-def fixture(*args):
-    p = subprocess.Popen([FIXTURE, *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def fixture(*args, env=None):
+    p = subprocess.Popen([FIXTURE, *args], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     try:
         if not select.select([p.stdout], [], [], 5)[0] or p.stdout.readline() != b"READY\n":
             raise RuntimeError("fixture did not become ready")
@@ -41,8 +47,8 @@ def fixture(*args):
 
 
 @contextlib.contextmanager
-def server(socket, state):
-    p = subprocess.Popen([SERVER, "--socket", socket, "--state-dir", state])
+def server(socket, state, *extra):
+    p = subprocess.Popen([SERVER, "--socket", socket, "--state-dir", state, *extra])
     try:
         deadline = time.monotonic() + 5
         while not socket.is_socket():
@@ -84,19 +90,23 @@ def check_detach(p, tids):
 
 
 def check_running(socket):
+    pc, sp, flags = REGISTER_NAMES[ARCH]
     with fixture() as p:
         x = take(socket, p.pid, "running")
         assert x["all_threads_stopped_during_capture"] and x["freeze_achieved"] == "all"
-        assert x["process"]["architecture"] == "x86_64"
+        assert x["process"]["architecture"] == ARCH
         mem = x["memory"]
         assert 0 < mem["rss_bytes"] <= mem["peak_rss_bytes"] <= mem["virtual_bytes"]
         assert len(x["threads"]) == 2 and any(t["name"] == "aidbg-worker" for t in x["threads"])
         assert all(t["stop"]["kind"] == "snapshot_interrupt" for t in x["threads"])
         for t in x["threads"]:
-            assert t["registers"]["rip"].startswith("0x") and t["registers"]["eflags"].startswith("0x")
+            assert t["registers"][pc].startswith("0x") and t["registers"][flags].startswith("0x")
+            if ARCH == "aarch64":
+                assert all(t["registers"][f"x{n}"].startswith("0x") for n in range(31))
+                assert int(t["registers"][pc], 16) % 4 == 0
             assert len(t["stack"]["frames"]) >= 2
-            assert t["stack"]["frames"][0]["pc"] == t["registers"]["rip"]
-            assert t["stack"]["frames"][0]["sp"] == t["registers"]["rsp"]
+            assert t["stack"]["frames"][0]["pc"] == t["registers"][pc]
+            assert t["stack"]["frames"][0]["sp"] == t["registers"][sp]
             mask = 1 << (signal.SIGUSR1 - 1)
             for key in ("blocked", "shared_pending", "caught"):
                 assert int(t["signals"][key], 16) & mask, (t["tid"], key, t["signals"])
@@ -112,6 +122,28 @@ def check_running(socket):
         assert any(f["module_id"] == lib_id for f in lead["stack"]["frames"])
         check_detach(p, [t["tid"] for t in x["threads"]])
         print("PASS live threads, GPR, signal masks, memory, modules and cross-DSO -O2 CFI")
+
+
+def check_missing_unwind_info(socket):
+    library = ARTIFACTS / "libunwind_gap.so"
+    env = {**os.environ, "LD_PRELOAD": str(library)}
+    pc, sp, _ = REGISTER_NAMES[ARCH]
+    with fixture(env=env) as p:
+        x = take(socket, p.pid, "missing-unwind-info", extra=("--freeze", "required"))
+        assert x["freeze_achieved"] == "all" and x["status"] == "partial", x["issues"]
+        lead = next(t for t in x["threads"] if t["tid"] == p.pid)
+        stack = lead["stack"]
+        assert not stack["complete"] and len(stack["frames"]) == 1, stack
+        frame = stack["frames"][0]
+        assert frame["method"] == "registers" and frame["function"] == "library_wait", frame
+        assert frame["pc"] == lead["registers"][pc] and frame["sp"] == lead["registers"][sp], frame
+        module = next(m for m in x["modules"] if m["id"] == frame["module_id"])
+        assert Path(module["path"]).name == library.name, module
+        reason = stack["stop_reason"]
+        assert "no unwind info for address" in reason and "no plausible frame-pointer record" in reason, reason
+        assert {"section": "stack", "tid": p.pid, "message": reason} in x["issues"], x["issues"]
+        check_detach(p, [t["tid"] for t in x["threads"]])
+        print("PASS missing CFI and frame pointer preserve the current frame and resume the target")
 
 
 def check_group_stop(socket):
@@ -231,6 +263,8 @@ def check_mcp(socket, snapshot_id):
             assert {t["name"] for t in listed["tools"]} == {
         "snapshot", "snapshot_query", "coredump", "breakpoint_set", "breakpoint_remove",
         "breakpoint_events", "breakpoint_capabilities", "symbols", "resolve_address", "disassemble",
+        "perf", "symbol_override_set", "symbol_override_remove", "symbol_override_list", "inspect",
+        "assemble", "plan_patch", "emulate", "watch_step", "target_call",
     }
             result = message({"id": 3, "method": "tools/call", "params": {
                 "name": "snapshot_query", "arguments": {
@@ -263,6 +297,7 @@ if __name__ == "__main__":
         state.mkdir(mode=0o700)
         with server(socket, state):
             check_running(socket)
+            check_missing_unwind_info(socket)
             check_group_stop(socket)
             check_contested_thread(socket)
             check_churn(socket)

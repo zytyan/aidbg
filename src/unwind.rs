@@ -101,12 +101,7 @@ impl Image {
         {
             return Ok(Step::Unsupported("aarch64_pac"));
         }
-        let cfa = match row.cfa() {
-            CfaRule::RegisterAndOffset { register, offset } => {
-                c.regs.get(*register)?.wrapping_add_signed(*offset)
-            }
-            CfaRule::Expression(expr) => evaluate(expr.get(section)?, enc, c)?,
-        };
+        let cfa = cfa_value(row.cfa(), section, enc, c)?;
         c.cfa = Some(cfa);
         // Only retain ABI callee-saved registers across a frame when CFI
         // doesn't supply a rule. An x86 return address requires a rule.
@@ -137,14 +132,75 @@ impl Image {
         next.set(SP, Some(cfa));
         Ok(Step::Next(next, "cfi"))
     }
+
+    fn cfa_section<S: UnwindSection<Data>>(
+        &self,
+        section: &S,
+        pc: u64,
+        context: Context<'_>,
+    ) -> Result<u64> {
+        let fde = section.fde_for_address(&self.bases, pc, S::cie_from_offset)?;
+        let mut cache = UnwindContext::new();
+        let row = fde.unwind_info_for_address(section, &self.bases, &mut cache, pc)?;
+        cfa_value(row.cfa(), section, fde.cie().encoding(), context)
+    }
+}
+
+fn cfa_value<S: UnwindSection<Data>>(
+    rule: &CfaRule<usize>,
+    section: &S,
+    encoding: Encoding,
+    context: Context<'_>,
+) -> Result<u64> {
+    match rule {
+        CfaRule::RegisterAndOffset { register, offset } => {
+            Ok(context.regs.get(*register)?.wrapping_add_signed(*offset))
+        }
+        CfaRule::Expression(expr) => evaluate(expr.get(section)?, encoding, context),
+    }
+}
+
+pub(crate) fn canonical_frame_address(
+    bytes: Vec<u8>,
+    module: &Module,
+    link: u64,
+    bias: u64,
+    memory: &dyn UnwindMemory,
+    registers: Registers,
+) -> Result<u64> {
+    let image = Image::new(bytes, module)?;
+    let context = Context {
+        memory,
+        regs: registers,
+        cfa: None,
+        bias,
+    };
+    match image.cfa_section(&image.eh, link, context) {
+        Err(e)
+            if e.downcast_ref::<gimli::Error>() == Some(&gimli::Error::NoUnwindInfoForAddress) =>
+        {
+            image.cfa_section(&image.debug, link, context)
+        }
+        result => result,
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Context<'a> {
-    trace: &'a Trace<'a>,
+    memory: &'a dyn UnwindMemory,
     regs: Registers,
     cfa: Option<u64>,
     bias: u64,
+}
+
+pub(crate) trait UnwindMemory {
+    fn read_word(&self, address: u64, size: usize) -> Result<u64>;
+}
+
+impl UnwindMemory for Trace<'_> {
+    fn read_word(&self, address: u64, size: usize) -> Result<u64> {
+        Trace::read_word(self, address, size)
+    }
 }
 
 fn evaluate(expr: Expression<Data>, encoding: Encoding, c: Context<'_>) -> Result<u64> {
@@ -160,7 +216,7 @@ fn evaluate(expr: Expression<Data>, encoding: Encoding, c: Context<'_>) -> Resul
                 space: None,
                 base_type,
             } if base_type.0 == 0 => eval.resume_with_memory(Value::Generic(
-                c.trace.read_word(address, usize::from(size))?,
+                c.memory.read_word(address, usize::from(size))?,
             ))?,
             EvaluationResult::RequiresRegister {
                 register,
@@ -203,11 +259,11 @@ fn rule_value<S: UnwindSection<Data>>(
 ) -> Result<u64> {
     match rule {
         RegisterRule::SameValue => c.regs.get(reg),
-        RegisterRule::Offset(off) => c.trace.read_word(cfa.wrapping_add_signed(off), 8),
+        RegisterRule::Offset(off) => c.memory.read_word(cfa.wrapping_add_signed(off), 8),
         RegisterRule::ValOffset(off) => Ok(cfa.wrapping_add_signed(off)),
         RegisterRule::Register(r) => c.regs.get(r),
         RegisterRule::Expression(expr) => {
-            c.trace.read_word(evaluate(expr.get(section)?, enc, c)?, 8)
+            c.memory.read_word(evaluate(expr.get(section)?, enc, c)?, 8)
         }
         RegisterRule::ValExpression(expr) => evaluate(expr.get(section)?, enc, c),
         RegisterRule::Constant(value) => Ok(value),
@@ -227,8 +283,8 @@ fn frame_pointer(c: Context<'_>, modules: &[Module]) -> Result<Step> {
     if fp % 8 != 0 || fp < sp || fp - sp > 1024 * 1024 {
         return Err(error("no plausible frame-pointer record"));
     }
-    let previous = c.trace.read_word(fp, 8)?;
-    let ret = c.trace.read_word(
+    let previous = c.memory.read_word(fp, 8)?;
+    let ret = c.memory.read_word(
         fp.checked_add(8)
             .ok_or_else(|| error("frame pointer overflow"))?,
         8,
@@ -267,9 +323,11 @@ pub struct Frame {
     function: Option<String>,
     #[serde(flatten)]
     names: Option<crate::cpp_names::Names>,
-    method: &'static str,
+    pub(crate) method: &'static str,
     #[serde(skip)]
     link_pc: Option<u64>,
+    #[serde(skip)]
+    pub(crate) lookup_address: u64,
 }
 
 #[derive(Serialize)]
@@ -355,9 +413,30 @@ impl Images {
         }
     }
 
+    pub(crate) fn profile_location(
+        &mut self,
+        pc: u64,
+        maps: &[Module],
+        root: &Path,
+        exe: Option<&Metadata>,
+    ) -> Option<(usize, u64, Option<(String, u64)>)> {
+        let (id, module, map) = maps
+            .iter()
+            .enumerate()
+            .find_map(|(id, module)| module.executable_at(pc).map(|map| (id, module, map)))?;
+        let image = self.image(id, module, root, exe).ok()?;
+        let (_, link) = image.layout.for_address(map, pc)?;
+        let object = object::File::parse(&*image.bytes).ok()?;
+        let offset = link.checked_sub(image.layout.elf_base)?;
+        let symbol = modules::text_symbol(&object, link)
+            .filter(|(_, base)| *base >= image.layout.elf_base)
+            .map(|(name, base)| (name.to_owned(), link - base));
+        Some((id, offset, symbol))
+    }
+
     pub fn walk(
         &mut self,
-        trace: &Trace<'_>,
+        memory: &dyn UnwindMemory,
         mut regs: Registers,
         maps: &[Module],
         root: &Path,
@@ -394,13 +473,14 @@ impl Images {
                     names: None,
                     method,
                     link_pc: None,
+                    lookup_address: lookup,
                 };
                 if Instant::now() >= deadline {
                     frames.push(frame);
                     return Err(error("snapshot deadline reached"));
                 }
                 let mut c = Context {
-                    trace,
+                    memory,
                     regs,
                     cfa: None,
                     bias: 0,

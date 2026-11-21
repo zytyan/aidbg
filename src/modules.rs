@@ -58,13 +58,13 @@ pub struct ModuleInfo {
     mappings: Vec<MappingInfo>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct ModuleIdentity {
     path: String,
     device: String,
     inode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    build_id: Option<String>,
+    pub(crate) build_id: Option<String>,
 }
 
 pub(crate) fn id_hex(id: &[u8]) -> String {
@@ -596,6 +596,11 @@ pub fn signed_hex(value: i128) -> String {
 }
 
 pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<crate::cpp_names::Names> {
+    let (name, _) = text_symbol(obj, pc)?;
+    Some(crate::cpp_names::names(name))
+}
+
+pub(crate) fn text_symbol<'data>(obj: &object::File<'data>, pc: u64) -> Option<(&'data str, u64)> {
     let s = obj
         .symbols()
         .chain(obj.dynamic_symbols())
@@ -606,6 +611,5 @@ pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<crate::cpp_names::Names
                 && pc - s.address() < s.size()
         })
         .max_by_key(|s| s.address())?;
-    let name = s.name().ok()?;
-    Some(crate::cpp_names::names(name))
+    Some((s.name().ok()?, s.address()))
 }

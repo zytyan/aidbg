@@ -11,7 +11,7 @@ use nix::sys::{
 use nix::unistd::Pid;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::IoSliceMut;
+use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::rc::Rc;
@@ -26,6 +26,7 @@ pub enum Stop {
     Event(Signal, i32),
     Breakpoint {
         slots: u64,
+        address: Option<u64>,
         observed: Instant,
         unix_ms: u64,
     },
@@ -133,7 +134,7 @@ pub struct Trace<'a> {
 }
 
 struct Patch {
-    original: u8,
+    original: u32,
     mapping: modules::CodeMapping,
 }
 
@@ -320,20 +321,33 @@ impl<'a> Trace<'a> {
                     }
                     Some(Stop::Event(sig, event))
                 }
-                Ok(WaitStatus::Stopped(_, Signal::SIGTRAP)) if self.monitored => {
-                    let code = ptrace::getsiginfo(Pid::from_raw(tid))
-                        .ok()
-                        .map(|info| info.si_code);
+                Ok(WaitStatus::Stopped(_, Signal::SIGTRAP))
+                    if self.monitored || thread.stepping =>
+                {
+                    let info = ptrace::getsiginfo(Pid::from_raw(tid)).ok();
+                    let code = info.as_ref().map(|info| info.si_code);
                     let observed = Instant::now();
                     let unix_ms = epoch_ms();
                     match code {
+                        Some(libc::TRAP_TRACE) if thread.stepping && !self.monitored => {
+                            Some(Stop::Step)
+                        }
                         Some(libc::TRAP_TRACE | libc::TRAP_HWBKPT)
                             if thread.stepping || code == Some(libc::TRAP_HWBKPT) =>
                         {
                             match crate::breakpoint::triggered(tid) {
-                                Ok(0) if thread.stepping => Some(Stop::Step),
+                                Ok(0)
+                                    if thread.stepping
+                                        && (cfg!(target_arch = "x86_64")
+                                            || code == Some(libc::TRAP_TRACE)) =>
+                                {
+                                    Some(Stop::Step)
+                                }
                                 Ok(slots) => Some(Stop::Breakpoint {
                                     slots,
+                                    address: info
+                                        .as_ref()
+                                        .map(|info| unsafe { info.si_addr() } as u64),
                                     observed,
                                     unix_ms,
                                 }),
@@ -341,15 +355,14 @@ impl<'a> Trace<'a> {
                                     failure.get_or_insert(e);
                                     Some(Stop::Breakpoint {
                                         slots: 0,
+                                        address: None,
                                         observed,
                                         unix_ms,
                                     })
                                 }
                             }
                         }
-                        Some(libc::SI_KERNEL | libc::TRAP_BRKPT) => software::pc(tid)
-                            .ok()
-                            .and_then(|pc| pc.checked_sub(1))
+                        Some(libc::SI_KERNEL | libc::TRAP_BRKPT) => software::trap_address(tid)
                             .filter(|address| self.patches.contains_key(address))
                             .map(|address| Stop::Software {
                                 address,
@@ -465,11 +478,13 @@ impl<'a> Trace<'a> {
         let tid = self.stopped_tid()?;
         let mapping = modules::private_code_mapping(self.root, address, true)?
             .ok_or_else(|| error("software breakpoints require a private executable mapping"))?;
-        let original = software::read_byte(tid, address)?;
+        let original = software::read_instruction(tid, address)?;
         if original == software::TRAP {
-            return Err(error("software breakpoint address already contains INT3"));
+            return Err(error(
+                "software breakpoint address already contains the trap instruction",
+            ));
         }
-        software::write_byte(tid, address, software::TRAP)?;
+        software::write_instruction(tid, address, software::TRAP)?;
         self.patches.insert(address, Patch { original, mapping });
         Ok(())
     }
@@ -483,9 +498,9 @@ impl<'a> Trace<'a> {
 
     fn restore_byte(&self, tid: i32, address: u64, patch: &Patch, root: &Path) -> Result<()> {
         if modules::private_code_mapping(root, address, false)?.as_ref() == Some(&patch.mapping)
-            && software::read_byte(tid, address)? == software::TRAP
+            && software::read_instruction(tid, address)? == software::TRAP
         {
-            software::write_byte(tid, address, patch.original)?;
+            software::write_instruction(tid, address, patch.original)?;
         }
         Ok(())
     }
@@ -509,16 +524,12 @@ impl<'a> Trace<'a> {
         Ok(())
     }
 
-    pub fn step_software(&mut self, tid: i32, address: u64, deadline: Instant) -> Result<()> {
+    pub fn step_software(&mut self, tid: i32, address: u64, deadline: Instant) -> Result<bool> {
         let patch = &self.patches[&address];
         self.restore_byte(tid, address, patch, self.root)?;
         software::set_pc(tid, address)?;
         loop {
-            ptrace::step(Pid::from_raw(tid), None)?;
-            let thread = self.threads.get_mut(&tid).expect("known thread");
-            thread.stop = None;
-            thread.stepping = true;
-            self.wait_for_stops(deadline)?;
+            self.step_one(tid, deadline)?;
             if !self
                 .threads
                 .get(&tid)
@@ -536,20 +547,59 @@ impl<'a> Trace<'a> {
                 "target address space changed during software single-step",
             ));
         }
+        // AArch64 watchpoints can interrupt the original instruction before it
+        // executes. Leave its bytes in place while the session handles that hit.
+        if cfg!(target_arch = "aarch64")
+            && self
+                .threads
+                .get(&tid)
+                .is_some_and(|t| matches!(t.stop, Some(Stop::Breakpoint { .. })))
+            && software::pc(tid)? == address
+        {
+            return Ok(true);
+        }
+        self.rearm_software(address)?;
+        Ok(false)
+    }
+
+    pub fn rearm_software(&self, address: u64) -> Result<()> {
         if let Ok(tid) = self.stopped_tid() {
             // The old instruction may have unmapped or changed its own page.
             let patch = &self.patches[&address];
             if modules::private_code_mapping(self.root, address, true)?.as_ref()
                 != Some(&patch.mapping)
-                || software::read_byte(tid, address)? != patch.original
+                || software::read_instruction(tid, address)? != patch.original
             {
                 return Err(error(
                     "software breakpoint instruction changed during single-step",
                 ));
             }
-            software::write_byte(tid, address, software::TRAP)?;
+            software::write_instruction(tid, address, software::TRAP)?;
         }
         Ok(())
+    }
+
+    pub fn step_one(&mut self, tid: i32, deadline: Instant) -> Result<Option<Stop>> {
+        if Instant::now() >= deadline {
+            return Err(error("single-step deadline reached"));
+        }
+        let thread = self
+            .threads
+            .get_mut(&tid)
+            .ok_or_else(|| error("unknown thread"))?;
+        if !matches!(
+            thread.stop,
+            Some(Stop::Interrupt | Stop::Step | Stop::Software { .. } | Stop::Breakpoint { .. })
+        ) {
+            return Err(error(
+                "thread has no debugger stop eligible for single-step",
+            ));
+        }
+        ptrace::step(Pid::from_raw(tid), None)?;
+        thread.stop = None;
+        thread.stepping = true;
+        self.wait_for_stops(deadline)?;
+        Ok(self.threads.get(&tid).and_then(|thread| thread.stop))
     }
 
     pub fn exec_observed(&self) -> bool {
@@ -580,6 +630,21 @@ impl<'a> Trace<'a> {
         let got = uio::process_vm_readv(self.pid, local, &remote)?;
         if got != size {
             return Err(error(format!("short remote read: {got}/{size}")));
+        }
+        Ok(())
+    }
+
+    pub fn write_memory(&self, addr: u64, buf: &[u8]) -> Result<()> {
+        let len = buf.len();
+        addr.checked_add(len as u64)
+            .ok_or_else(|| error("invalid remote write range"))?;
+        let remote = [uio::RemoteIoVec {
+            base: usize::try_from(addr)?,
+            len,
+        }];
+        let got = uio::process_vm_writev(self.pid, &[IoSlice::new(buf)], &remote)?;
+        if got != len {
+            return Err(error(format!("short remote write: {got}/{len}")));
         }
         Ok(())
     }

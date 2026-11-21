@@ -27,7 +27,7 @@ pub struct Window {
     instructions: Vec<Instruction>,
 }
 
-fn decoder(architecture: &str) -> Result<(Capstone, u64)> {
+pub(crate) fn decoder(architecture: &str) -> Result<(Capstone, u64)> {
     Ok(match architecture {
         "x86_64" => (
             Capstone::new()
