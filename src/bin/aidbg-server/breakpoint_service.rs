@@ -312,6 +312,7 @@ impl Breakpoints {
         req: InstallBreakpointRequest,
         callback_js: Option<(String, String, Option<String>)>,
         run: Option<Control>,
+        overrides: &[aidbg::symbols::OverrideRule],
     ) -> Result<impl Serialize, Status> {
         let mode = BreakpointKind::try_from(req.kind)
             .map_err(|_| Status::invalid_argument("unknown breakpoint kind"))?;
@@ -321,22 +322,14 @@ impl Breakpoints {
                 Location::Address(address)
             }
             Some(install_breakpoint_request::Location::Symbol(symbol))
-                if !symbol.module.is_empty() && !symbol.symbol.is_empty() =>
+                if !symbol.symbol.is_empty() =>
             {
-                if execution && symbol.offset.is_none() {
-                    Location::Symbol {
-                        module: symbol.module,
-                        symbol: symbol.symbol,
-                        instance: symbol.instance,
-                    }
-                } else {
-                    Location::ModuleOffset {
-                        module: symbol.module,
-                        offset: symbol.offset.unwrap_or_default(),
-                        execution,
-                        instance: symbol.instance,
-                        symbol: Some(symbol.symbol),
-                    }
+                Location::Symbol {
+                    module: (!symbol.module.is_empty()).then_some(symbol.module),
+                    symbol: symbol.symbol,
+                    instance: symbol.instance,
+                    offset: symbol.offset.unwrap_or_default(),
+                    execution,
                 }
             }
             Some(install_breakpoint_request::Location::Source(source))
@@ -374,7 +367,7 @@ impl Breakpoints {
                 Some(length @ (1 | 2 | 4 | 8)),
             ) if matches!(
                 location,
-                Location::Address(_) | Location::ModuleOffset { .. }
+                Location::Address(_) | Location::ModuleOffset { .. } | Location::Symbol { .. }
             ) =>
             {
                 Kind::Watch {
@@ -407,12 +400,24 @@ impl Breakpoints {
             return Err(Status::invalid_argument("timeout_ms must be in 1..=500"));
         }
 
+        if req.stop_after_hit && run.is_none() {
+            return Err(Status::invalid_argument("stop_after_hit requires run_id"));
+        }
         let callback = self.callback(req.rule_id, callback_js, req.handler)?;
         let id = self.ids.fetch_add(1, Ordering::Relaxed) + 1;
         let (result, owner) = if let Some(run) = run {
             (
                 run.install(
-                    req.pid, id, location, scope, budget, kind, req.tid, callback,
+                    req.pid,
+                    id,
+                    location,
+                    scope,
+                    budget,
+                    kind,
+                    req.tid,
+                    callback,
+                    req.stop_after_hit,
+                    overrides,
                 ),
                 run.downgrade(),
             )
@@ -430,7 +435,16 @@ impl Breakpoints {
             let control = sessions.workers[&req.pid].control();
             let owner = control.downgrade();
             let result = control.install(
-                req.pid, id, location, scope, budget, kind, req.tid, callback,
+                req.pid,
+                id,
+                location,
+                scope,
+                budget,
+                kind,
+                req.tid,
+                callback,
+                req.stop_after_hit,
+                overrides,
             );
             if new_worker && result.is_err() {
                 sessions.workers.remove(&req.pid);

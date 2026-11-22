@@ -53,6 +53,7 @@ interface DebugPage<T> {
     readonly items: readonly T[];
     readonly next_offset: number | null;
     readonly warnings: readonly DebugWarning[];
+    readonly issue?: DebugWarning | null;
 }
 
 interface DebugPageOptions {
@@ -68,6 +69,11 @@ interface DebugVariable {
     readonly module: string;
     readonly unit_offset: number | null;
     readonly availability: string;
+    readonly file: string | null;
+    readonly line: number | null;
+    readonly in_scope: boolean;
+    readonly readable: boolean;
+    readonly scope_ranges: readonly { readonly start: string; readonly end: string }[];
 }
 
 interface DebugType {
@@ -146,19 +152,17 @@ interface DebugConsole {
     log(...values: unknown[]): void;
 }
 
-interface DebugCoreScope extends DebugMemoryScope {
-    locals(frame: DebugFrameRef, page?: DebugPageOptions): DebugPage<DebugVariable>;
-    inspect(expr: string, options: DebugInspectOptions & { frame: DebugFrameRef }): DebugValue;
-    printVal(expr: string, options: DebugPrintOptions & { frame: DebugFrameRef }): void;
-}
-interface DebugStoppedScope extends DebugMemoryScope {
+interface DebuggerScope extends DebugMemoryScope {
     inspect(expression: string, options?: DebugInspectOptions & { readonly frame?: DebugFrameRef }): DebugValue;
     printVal(expression: string, options?: DebugPrintOptions & { readonly frame?: DebugFrameRef }): void;
     locals(page?: DebugPageOptions): DebugPage<DebugVariable>;
     locals(frame: DebugFrameRef, page?: DebugPageOptions): DebugPage<DebugVariable>;
 }
 
-interface BreakpointHit extends DebugStoppedScope {
+type DebugCoreScope = DebuggerScope;
+type DebugStoppedScope = DebuggerScope;
+
+interface BreakpointHit extends DebuggerScope {
     readonly pid: number;
     readonly tid: number;
     readonly address: bigint;
@@ -243,7 +247,7 @@ interface LiveBreakpointEvent {
     };
 }
 
-interface DebugLiveScope extends DebugStoppedScope {
+interface DebugLiveScope extends DebuggerScope {
     hardwareBreakpoint(address: bigint, callback?: BreakpointCallback, options?: LiveBreakpointOptions): BreakpointHandle;
     softwareBreakpoint(address: bigint, callback?: BreakpointCallback, options?: LiveBreakpointOptions): BreakpointHandle;
     watchpoint(address: bigint, length: 1 | 2 | 4 | 8, access: "read" | "write" | "read_write", callback: BreakpointCallback, options?: LiveBreakpointOptions): BreakpointHandle;

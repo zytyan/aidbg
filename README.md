@@ -290,13 +290,15 @@ MCP 的 `rule_define({name, source})` 在服务端登记命名规则。将返回
 ### 活进程脚本与线程限定
 
 - CLI 的 `read-memory --run-id ID --address ADDRESS --length N` 和 MCP 的 `read_memory` 都接受 `run_id`、`pid` 或 core 的 `target_id`。两种目标返回同样的十六进制 `bytes`、`bytes_read` 和 `complete`。遇到缺页时保留连续可读前缀并给出 `first_unread_address`。读运行中的目标时，数据可能被目标并发修改。
-- `hit.locals(page?)`、`hit.globals(glob?, page?)` 和 `hit.types(glob?, page?)` 使用离线脚本的分页结果。回调中的枚举使用命中帧所属模块的 DWARF。两种脚本也共用 `modules()`、`memory()`、`inspect()`、`printVal()` 的结果格式。离线读取变量时传入 `{frame}`，回调使用当前命中帧。
+- live 的 `dbg`、离线的 `dbg` 和断点回调的 `hit` 共用 `DebuggerScope`。`locals()`、`inspect()` 和 `printVal()` 默认选择当前线程的顶层帧，也可通过 frame handle 指定其他帧。core 有多个候选线程时，先用 `threads()` 和 `frames(tid)` 选择帧。
+- `locals()` 按声明列出当前函数中的参数和变量，包含暂时不在作用域内的声明。每项带 `file`、`line`、`scope_ranges`、`in_scope` 和 `readable`，可区分同名变量。作用域区间使用运行时半开地址。函数入口处的 `issue.code` 为 `PROLOGUE`，表示局部变量的存储可能还未初始化。
+- `breakpoint_set({run_id, symbol, stop_after_hit: true})` 命中后保持进程停止，事件的 `resume_status` 为 `stopped`。用 `inspect({run_id, expressions, tid?, frame_index?})` 读取同一现场，或直接查询 `symbols`、`disassemble` 和 `read_memory`。`coredump({run_id, output, mode: "full"})` 保存当前现场。用 `run_continue` 恢复执行。
 - 对暂停的 run 使用 `step` 执行一条机器指令，`next` 跨过当前调用，`step_out` 执行到当前帧的返回位置。三个工具都接受 `run_id`、可选 `tid`、`timeout_ms` 和 `max_steps`。调试器停点、信号、系统调用边界或预算会提前结束步进，结果包含 `stop_reason` 和当前 PC。
 - `run({exit_coredump: true, …})` 在进程领头线程的退出停点保存 core。通过 `exit_coredump.dump_id` 打开，采集失败可查看 `exit_coredump_issue`。CLI 对应 `run --exit-coredump`。
 - `run_list` 列出仍在保留期内的 run。受管理进程的断点按 `run_id` 管理，在进程退出后自动撤销。对已撤销断点的重复移除返回 `already_removed`，历史事件在事件缓冲区内仍可查询。用 `breakpoint_list({run_id})` 检查当前安装状态，用 `breakpoint_capabilities({run_id})` 的 `used_slots` 查看每线程实际配置的执行、观察及共享槽位占用。
 - 观察点可用 `module + offset` 或 `module + symbol + offset` 定位。CLI 示例为 `breakpoint set --run-id ID --kind write --length 4 --module D08 --symbol rows --offset 0`。偏移相对于 ELF 模块基址或选中符号。
 
-- `inspect` 的 `timeout_ms` 可设为 1–5000 毫秒。MCP、`hit.inspect` 和离线 `dbg.inspect` 都接受 `expand: {offset?, limit?}`，返回结构体字段、数组或 `std::array` 元素的分页结果。`printVal` 可用同样的展开选项。页大小为 1–64，`next_offset` 为下一页边界。
+- `inspect` 的 `timeout_ms` 可设为 1–5000 毫秒。MCP、`hit.inspect` 和离线 `dbg.inspect` 都接受 `expand: {offset?, limit?}`，返回结构体字段、数组或 `std::array` 元素的分页结果。结构体数组的元素下包含字段页。表达式支持 `&var`、指针与指针或空值比较，以及由字节对齐的 DWARF 片段组成的变量值。`printVal` 可用同样的展开选项。页大小为 1–64，`next_offset` 为下一页边界。
 - `observe_threads({run_id|pid|target_id, samples?, interval_ms?, locks?, waits?})` 返回线程状态变化和最新一帧锁依赖图。`locks` 中每个条目使用 `{address, owner_offset?}`，默认偏移 8 字节，适用于 glibc mutex。活进程通过可读的 futex 系统调用识别等待线程，锁图按观察到的等待者和锁所有者连边。core 提供单次采集状态和寄存器，可提供 `waits: [{tid, address}]` 作为等待证据。采样间发生的变化可能遗漏。
 - `breakpoint_events` 的 `accesses` 按地址、线程、停点 PC 和访问类型统计本次返回的观察点事件。没有充分证据区分读写时返回 `unknown`。x86 的记录 PC 位于触发指令执行后。
 - 观察点事件的 `stop_context` 包含停点函数、可用的源码行、被观察地址的符号和命中时采集的形参。预算或 DWARF 不足时，参数页会带状态。先读 `pc_relation` 判断停点 PC 是否位于触发指令之后。
@@ -322,7 +324,7 @@ dbg.hardwareBreakpoint(0x401020n, hit => {
 
 `dbg.watchpoint(address, length, "read" | "write" | "read_write", callback, options?)` 与 MCP 观察点共用同一个安装和回调路径。AArch64 支持只读观察点。通过 `breakpoint_capabilities.watch_access` 查看目标支持的模式。`tid` 可通过 MCP 的 `breakpoint_set`、CLI 的 `--tid` 或脚本选项传入。硬件断点和观察点使用选定线程的槽位。软件执行断点会让其他线程经过同址时单步执行原指令，跳过逻辑命中。定向断点在线程退出后自动撤销。快照范围仍由 `all_threads` 控制。
 
-要在一次调用中收集事件，在安装完成后调用 `dbg.continue()`，再 `await dbg.events()`。事件集合包含本次脚本安装的断点，默认等待目标退出的上限为一秒。在线和离线的 `script_run` 都可通过 `timeout_ms` 调整执行预算，范围为 1–10000 毫秒。两者都支持顶层 `return` 和默认导出函数。MCP 的 `breakpoint_workflow({run_id?, run?, points, timeout_ms?})` 封装了安装、继续和收集流程。每个点可用 `address` 或 `symbol` 配合可选的 `module` 和 `offset`，并指定命中时读取的 `expressions`。`return_value` 按事件采集顺序排列，`points` 给出每个站点的观测命中次数和回调完成状态。
+要在一次调用中收集事件，在安装完成后调用 `dbg.continue()`，再 `await dbg.events()`。事件集合包含本次脚本安装的断点，默认等待目标退出的上限为一秒。在线和离线的 `script_run` 都可通过 `timeout_ms` 调整执行预算，范围为 1–10000 毫秒。两者都支持顶层 `return` 和默认导出函数。MCP 的 `breakpoint_workflow({run_id?, run?, points, timeout_ms?, per_hit_timeout_ms?})` 封装了安装、继续和收集流程。每个点可用 `address` 或 `symbol` 配合可选的 `module` 和 `offset`，并指定命中时读取的 `expressions`。每次回调默认有 100 毫秒预算，可用 `per_hit_timeout_ms` 或单个点的 `timeout_ms` 设置为 1–500 毫秒。`return_value` 按事件采集顺序排列，`points` 给出每个站点的观测命中次数和回调完成状态。
 
 ```ts
 export default async function main() {
@@ -372,14 +374,15 @@ C++ 符号保留原始名称、完整解修饰名和简写显示名。libstdc++�
 - `connect`，Linux 本地连接传 `{socket: "/absolute/path/aidbg.sock"}`。SSH 转发连接传 `{endpoint: "http://127.0.0.1:55051"}`。空对象默认连接该转发地址。连接验证成功后，同一会话的远程工具使用新连接。连接失败时可以继续使用上一次成功连接。返回值包含客户端版本、远端版本、构建修订和远端能力，以及服务端探测到的用户态 VA 位数与 ASan 高位地址可映射性。两端 CLI 均支持 `--version`。
 - `snapshot`，接受 `pid` 或 detached run 的 `run_id`，以及 `freeze` 和可选的 `fields`、`tid`、`frames`。
 - `snapshot_query`，接受 `snapshot_id` 或断点 `event_id` 及相同的筛选项。
-- `coredump`，接受 `pid`、`output` 和可选采集参数，返回输出路径、`dump_id` 和采集摘要。设置 `resume: true` 后用原 `output` 续传，可用 `download_idle_ms` 调整下载等待时间。
-- `core_open`、`core_close`，管理离线 core 目标。`script_api` 和 `script_check` 提供离线脚本、断点回调和信号回调的声明和检查，`script_run` 执行离线脚本。
+- `coredump`，接受 `pid` 或 `run_id`、`output` 和可选采集参数，返回输出路径、`dump_id` 和采集摘要。设置 `resume: true` 后用原 `output` 续传，可用 `download_idle_ms` 调整下载等待时间。
+- `core_open`、`core_close`，管理离线 core 目标。客户端与服务端各自最多保留 16 个打开的 core，服务端可用 `--max-open-cores` 调低上限。`script_api` 和 `script_check` 提供离线脚本、断点回调和信号回调的声明和检查，`script_run` 执行离线脚本。
 - `run`，启动一个服务端进程，从程序入口跟踪信号，可用 TypeScript 回调保留崩溃现场。支持 `env`、`stdin`、`detach` 和 `pause_at_entry`。用 `run_pause`、`run_continue` 控制运行，用 `run_status` 和 `run_cancel` 查询或取消。断点安装、移除、快照和变量检查可用 `run_id` 复用该进程的 tracer。
 - `breakpoint_set`、`breakpoint_remove`、`breakpoint_events`，安装、撤销和查询断点或观察点。使用 `rule_source` 传入 TypeScript 回调，或用 `rule_id` 复用已登记的回调。
 - `rule_define`、`rule_list`、`rule_update`、`rule_remove`，管理服务端命名断点规则。
 - `breakpoint_capabilities`，查询观察类型、宽度、对齐和槽位。
-- `symbols`、`resolve_address`、`disassemble`，接受 live `pid` 或离线 `target_id`，查询 ELF 符号、运行时地址和指令。
-- `search_memory`、`xref`、`pointer_chain`，搜索字节、查找引用或跟踪 core 中的指针链。前两项还接受活进程的 `pid` 或 `run_id` 和明确的 `start/end`。
+- `symbols` 和 `disassemble` 接受 `pid`、`run_id` 或 `target_id`。符号名可选 `module` 消歧，适用于 `breakpoint_set` 和 `breakpoint_workflow`。
+- `resolve_address` 接受 `pid` 或 `target_id`，查询运行时地址归属。
+- `search_memory`、`xref`、`pointer_chain`，以 `pid`、`run_id` 或 `target_id` 为目标搜索字节、查找引用和跟踪指针链。
 - `export_bundle`，将保留的 core、匹配镜像和分析材料导出到客户端目录。
 - `perf`、`symbol_override_set`、`symbol_override_list`、`symbol_override_remove`、`inspect`，采样和查询进程状态。
 - `assemble`、`plan_patch`、`emulate`，汇编、生成离线补丁和运行仿真。

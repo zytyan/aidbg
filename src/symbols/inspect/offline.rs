@@ -30,8 +30,9 @@ impl Validation {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DwarfImage {
-    sections: DwarfSections<Vec<u8>>,
+    pub(super) data: std::sync::Arc<cache::Data>,
     pub bias: u64,
     pub path: PathBuf,
 }
@@ -41,68 +42,37 @@ impl DwarfImage {
         if obj.section_by_name(".debug_info").is_none() {
             return Ok(None);
         }
-        let sections = load_sections(obj, std::borrow::Cow::into_owned)?;
         Ok(Some(Self {
-            sections,
+            data: cache::Data::load(obj)?,
             bias,
             path,
         }))
     }
 
+    pub fn relocated(mut self, bias: u64) -> Self {
+        self.bias = bias;
+        self
+    }
+
     pub fn line(&self, pc: u64) -> Result<Option<super::super::Line>> {
-        let dwarf = self
-            .sections
-            .borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
+        let dwarf = self.data.borrow();
         super::super::line_for_pc(&dwarf, pc)
     }
 
-    fn lookup<T>(
-        &self,
+    fn lookup<'a, T>(
+        &'a self,
         target: &str,
         pc: Option<u64>,
-        mut shadow: Option<&mut bool>,
+        shadow: Option<&mut bool>,
         deadline: Instant,
-        mut evaluate: impl FnMut(&Dwarf<Reader<'_>>, &Unit<Reader<'_>>, Candidate<'_>) -> Result<T>,
+        evaluate: impl FnMut(&Dwarf<Reader<'a>>, &Unit<Reader<'a>>, Candidate<'a>) -> Result<T>,
     ) -> Result<Option<T>> {
-        let dwarf = self
-            .sections
-            .borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
-        let mut units = dwarf.units();
-        let mut scanned = 0;
-        let mut best = None;
-        while let Some(header) = units.next()? {
-            let unit = dwarf.unit(header)?;
-            let Some(candidate) = find_variable(
-                &dwarf,
-                &unit,
-                target,
-                pc,
-                &mut scanned,
-                deadline,
-                shadow.as_deref_mut(),
-                None,
-            )?
-            else {
-                continue;
-            };
-            match best {
-                Some((priority, _)) if priority > candidate.priority => continue,
-                Some((priority, _)) if priority == candidate.priority => {
-                    best = Some((
-                        priority,
-                        Err(failure(
-                            "ambiguous",
-                            "multiple compilation units define the variable",
-                        )),
-                    ));
-                }
-                _ => {
-                    let result = evaluate(&dwarf, &unit, candidate.clone());
-                    best = Some((candidate.priority, result));
-                }
-            }
-        }
-        best.map(|(_, value)| value).transpose()
+        self.data.schedule();
+        let dwarf = self.data.borrow();
+        self.data
+            .lookup(&dwarf, target, pc, shadow, deadline, evaluate)?
+            .map(|(_, value)| value)
+            .transpose()
     }
 
     pub fn parameters(
@@ -146,16 +116,26 @@ impl DwarfImage {
             .into());
         }
         let pattern = glob::Pattern::new(pattern)?;
-        let dwarf = self
-            .sections
-            .borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
-        let mut units = dwarf.units();
+        let dwarf = self.data.borrow();
         let mut items = Vec::new();
-        let mut scanned = 0;
+        let mut budget = ScanBudget::foreground(deadline);
         let mut matched = 0;
         let mut truncated = false;
+        let mut prologue = false;
         let pc = frame.and_then(|frame| frame.link);
-        while let Some(header) = units.next()? {
+        let indexed = pc.and_then(|pc| self.data.functions(pc));
+        let mut indexed = indexed.as_ref().map(|functions| functions.iter());
+        let mut units = dwarf.units();
+        loop {
+            let (header, function) = if let Some(functions) = &mut indexed {
+                let Some((unit, function)) = functions.next() else {
+                    break;
+                };
+                (dwarf.unit_header(*unit)?, Some(*function))
+            } else {
+                let Some(header) = units.next()? else { break };
+                (header, None)
+            };
             let unit = dwarf.unit(header)?;
             let eval = Eval {
                 dwarf: &dwarf,
@@ -172,8 +152,7 @@ impl DwarfImage {
                 &unit,
                 "",
                 pc,
-                &mut scanned,
-                deadline,
+                &mut budget,
                 None,
                 Some(&mut |qualified, local, tag, candidate| {
                     if local != frame.is_some()
@@ -191,65 +170,96 @@ impl DwarfImage {
                         return false;
                     }
                     if parameters {
-                        let outcome = Outcome::from_result(
-                            unit.entry(candidate.offset)
-                                .map_err(Into::into)
-                                .and_then(|entry| {
-                                    evaluate_variable(
-                                        &eval,
-                                        &entry,
-                                        candidate.frame_base,
-                                        &[],
-                                        self.path.clone(),
-                                    )
-                                }),
-                        );
+                        let outcome = Outcome::from_result(evaluate_candidate(
+                            &eval,
+                            candidate,
+                            &[],
+                            self.path.clone(),
+                        ));
                         items.push(json!({"name": qualified, "value": outcome}));
                         return true;
                     }
+                    prologue |= candidate.prologue;
                     let entry = unit.entry(candidate.offset);
-                    let availability = entry
+                    let file = entry.as_ref().ok().and_then(|entry| {
+                        let AttributeValue::FileIndex(index) =
+                            resolved_attr(&unit, entry, gimli::DW_AT_decl_file, 0).ok()??
+                        else {
+                            return None;
+                        };
+                        let header = unit.line_program.as_ref()?.header();
+                        super::super::source_path(&dwarf, &unit, header, header.file(index)?).ok()
+                    });
+                    let line = entry
                         .as_ref()
                         .ok()
-                        .map(|entry| {
-                            if matches!(
-                                resolved_attr(&unit, entry, gimli::DW_AT_location, 0),
-                                Ok(None)
-                            ) && matches!(
-                                resolved_attr(&unit, entry, gimli::DW_AT_const_value, 0),
-                                Ok(None)
-                            ) {
-                                return "optimized_out";
-                            }
-                            match evaluate_variable(
-                                &eval,
-                                entry,
-                                candidate.frame_base,
-                                &[],
-                                self.path.clone(),
-                            ) {
-                                Ok(_) => "readable",
-                                Err(error) => error
-                                    .downcast_ref::<Failure>()
-                                    .map_or("unavailable", |issue| issue.0),
-                            }
+                        .and_then(|entry| {
+                            resolved_attr(&unit, entry, gimli::DW_AT_decl_line, 0)
+                                .ok()
+                                .flatten()
                         })
-                        .unwrap_or("unavailable");
+                        .and_then(|attribute| attribute.udata_value());
+                    let availability = if !candidate.active {
+                        "out_of_scope"
+                    } else {
+                        entry
+                            .as_ref()
+                            .ok()
+                            .map(|entry| {
+                                if matches!(
+                                    resolved_attr(&unit, entry, gimli::DW_AT_location, 0),
+                                    Ok(None)
+                                ) && matches!(
+                                    resolved_attr(&unit, entry, gimli::DW_AT_const_value, 0),
+                                    Ok(None)
+                                ) {
+                                    return "optimized_out";
+                                }
+                                match evaluate_candidate(&eval, candidate, &[], self.path.clone()) {
+                                    Ok(_) => "readable",
+                                    Err(error) => error
+                                        .downcast_ref::<Failure>()
+                                        .map_or("unavailable", |issue| issue.0),
+                                }
+                            })
+                            .unwrap_or("unavailable")
+                    };
+                    let ranges: Vec<_> = candidate.ranges.iter().filter_map(|range| {
+                        Some(json!({"start": hex(range.begin.checked_add(self.bias)?), "end": hex(range.end.checked_add(self.bias)?)}))
+                    }).collect();
                     items.push(json!({
                     "name": qualified, "kind": if tag == gimli::DW_TAG_formal_parameter { "parameter" } else { "variable" },
                     "scope": if local { "local" } else { "global" }, "scope_depth": candidate.priority,
                     "module": self.path, "unit_offset": gimli::UnitOffset(0).to_debug_info_offset(&unit.header).map(|offset| offset.0),
-                    "availability": availability,
+                    "availability": availability, "readable": availability == "readable",
+                    "file": file, "line": line, "in_scope": candidate.active, "scope_ranges": ranges,
                 }));
                     true
                 }),
+                frame.is_some() && !parameters,
+                function,
             )?;
             if truncated || (parameters && !items.is_empty()) {
                 break;
             }
         }
+        let issue = if prologue {
+            Some(crate::Diagnostic::new(
+                "PROLOGUE",
+                "Stopped at the function entry. Local storage may be uninitialized until the prologue has executed.",
+                None,
+            ))
+        } else if frame.is_some() && items.is_empty() && offset == 0 {
+            Some(crate::Diagnostic::new(
+                "NO_LOCALS",
+                "No local variable declarations were found for this frame and filter.",
+                None,
+            ))
+        } else {
+            None
+        };
         Ok(
-            json!({"items": items, "next_offset": truncated.then_some(offset + limit), "warnings": []}),
+            json!({"items": items, "next_offset": truncated.then_some(offset + limit), "warnings": [], "issue": issue}),
         )
     }
 
@@ -269,9 +279,7 @@ impl DwarfImage {
             .into());
         }
         let pattern = glob::Pattern::new(pattern)?;
-        let dwarf = self
-            .sections
-            .borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
+        let dwarf = self.data.borrow();
         let mut units = dwarf.units();
         let mut items = Vec::new();
         let mut matched = 0;
@@ -369,14 +377,7 @@ impl DwarfImage {
                         bias: i128::from(self.bias),
                         preview_deadline: Some(deadline),
                     };
-                    let entry = unit.entry(candidate.offset)?;
-                    evaluate_variable(
-                        &eval,
-                        &entry,
-                        candidate.frame_base,
-                        operations,
-                        self.path.clone(),
-                    )
+                    evaluate_candidate(&eval, &candidate, operations, self.path.clone())
                 })?
                 .ok_or_else(|| failure("not_found", "variable not found in the selected scope"))
             })
@@ -399,107 +400,114 @@ impl DwarfImage {
         };
         let mut shadowed = false;
         let shadow = (pc.is_none() && !target.starts_with("::")).then_some(&mut shadowed);
-        let result = self.lookup(&target, pc, shadow, Instant::now() + Duration::from_millis(100), |dwarf, unit, candidate| {
-            let entry = unit.entry(candidate.offset)?;
-            let mut ty = typedef_target(unit, &entry)?;
-            let eval = Eval {
-                dwarf,
-                unit,
-                memory,
-                regs: Registers::empty(),
-                link_pc: pc,
-                cfa: None,
-                bias: 0,
-                preview_deadline: None,
-            };
-            let mut pointer_index = false;
-            for (operation, span) in parser.operations.iter().zip(parser.spans.iter()) {
-                let entry = underlying(unit, ty)?;
-                ty = match operation {
-                    Access::Deref if entry.tag() == gimli::DW_TAG_pointer_type => {
-                        typedef_target(unit, &entry)?
-                    }
-                    Access::Index(index) => match index_type(&eval, &entry, *index, false) {
-                        Ok(Some((element, _))) => {
-                            pointer_index |= entry.tag() == gimli::DW_TAG_pointer_type;
-                            element
+        let result = self.lookup(
+            &target,
+            pc,
+            shadow,
+            Instant::now() + Duration::from_millis(100),
+            |dwarf, unit, candidate| {
+                let entry = unit.entry(candidate.offset)?;
+                let mut ty = typedef_target(unit, &entry)?;
+                let eval = Eval {
+                    dwarf,
+                    unit,
+                    memory,
+                    regs: Registers::empty(),
+                    link_pc: pc,
+                    cfa: None,
+                    bias: 0,
+                    preview_deadline: None,
+                };
+                let mut pointer_index = false;
+                for (operation, span) in parser.operations.iter().zip(parser.spans.iter()) {
+                    let entry = underlying(unit, ty)?;
+                    ty = match operation {
+                        Access::Deref if entry.tag() == gimli::DW_TAG_pointer_type => {
+                            typedef_target(unit, &entry)?
                         }
-                        Err(e)
-                            if e.downcast_ref::<Failure>()
-                                .is_some_and(|f| f.0 == "out_of_bounds") =>
+                        Access::Index(index) => match index_type(&eval, &entry, *index, false) {
+                            Ok(Some((element, _))) => {
+                                pointer_index |= entry.tag() == gimli::DW_TAG_pointer_type;
+                                element
+                            }
+                            Err(e)
+                                if e.downcast_ref::<Failure>()
+                                    .is_some_and(|f| f.0 == "out_of_bounds") =>
+                            {
+                                return Ok(Validation::invalid(
+                                    "OUT_OF_BOUNDS",
+                                    "array index exceeds the DWARF bound",
+                                    span.clone(),
+                                ));
+                            }
+                            Err(e) => return Err(e),
+                            Ok(None) => {
+                                return Ok(Validation::invalid(
+                                    "TYPE_MISMATCH",
+                                    "expression operation does not match the DWARF type",
+                                    span.clone(),
+                                ));
+                            }
+                        },
+                        Access::Member(field)
+                            if matches!(
+                                entry.tag(),
+                                gimli::DW_TAG_structure_type
+                                    | gimli::DW_TAG_class_type
+                                    | gimli::DW_TAG_union_type
+                            ) =>
                         {
-                            return Ok(Validation::invalid(
-                                "OUT_OF_BOUNDS",
-                                "array index exceeds the DWARF bound",
-                                span.clone(),
-                            ));
+                            if matches!(
+                                entry.attr_value(gimli::DW_AT_declaration),
+                                Some(AttributeValue::Flag(true))
+                            ) {
+                                return Ok(Validation::unchecked("INCOMPLETE_TYPE"));
+                            }
+                            let Some((member, _)) = find_member(&eval, &entry, field, 0, false)?
+                            else {
+                                return Ok(Validation::invalid(
+                                    "UNKNOWN_MEMBER",
+                                    unknown_member(&eval, &entry, field),
+                                    span.clone(),
+                                ));
+                            };
+                            member
                         }
-                        Err(e) => return Err(e),
-                        Ok(None) => {
+                        _ => {
                             return Ok(Validation::invalid(
                                 "TYPE_MISMATCH",
                                 "expression operation does not match the DWARF type",
                                 span.clone(),
                             ));
                         }
-                    },
-                    Access::Member(field)
-                        if matches!(
-                            entry.tag(),
-                            gimli::DW_TAG_structure_type
-                                | gimli::DW_TAG_class_type
-                                | gimli::DW_TAG_union_type
-                        ) =>
-                    {
-                        if matches!(
-                            entry.attr_value(gimli::DW_AT_declaration),
-                            Some(AttributeValue::Flag(true))
-                        ) {
-                            return Ok(Validation::unchecked("INCOMPLETE_TYPE"));
-                        }
-                        let Some((member, _)) = find_member(&eval, &entry, field, 0, false)? else {
-                            return Ok(Validation::invalid(
-                                "UNKNOWN_MEMBER",
-                                unknown_member(&eval, &entry, field),
-                                span.clone(),
-                            ));
-                        };
-                        member
+                    };
+                    let entry = underlying(unit, ty)?;
+                    if matches!(
+                        entry.tag(),
+                        gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type
+                    ) {
+                        ty = typedef_target(unit, &entry)?;
                     }
-                    _ => {
-                        return Ok(Validation::invalid(
-                            "TYPE_MISMATCH",
-                            "expression operation does not match the DWARF type",
-                            span.clone(),
-                        ));
-                    }
-                };
+                }
                 let entry = underlying(unit, ty)?;
                 if matches!(
-                    entry.tag(),
-                    gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type
+                    entry.attr_value(gimli::DW_AT_declaration),
+                    Some(AttributeValue::Flag(true))
                 ) {
-                    ty = typedef_target(unit, &entry)?;
+                    return Ok(Validation::unchecked("INCOMPLETE_TYPE"));
                 }
-            }
-            let entry = underlying(unit, ty)?;
-            if matches!(
-                entry.attr_value(gimli::DW_AT_declaration),
-                Some(AttributeValue::Flag(true))
-            ) {
-                return Ok(Validation::unchecked("INCOMPLETE_TYPE"));
-            }
-            Ok(Validation {
-                status: "verified",
-                code: if pointer_index {
-                    "POINTER_BOUNDS_DEFERRED"
-                } else {
-                    "OK"
-                },
-                message: String::new(),
-                span: None,
-            })
-        });
+                Ok(Validation {
+                    status: "verified",
+                    code: if pointer_index {
+                        "POINTER_BOUNDS_DEFERRED"
+                    } else {
+                        "OK"
+                    },
+                    message: String::new(),
+                    span: None,
+                })
+            },
+        );
         if shadowed {
             return Validation::unchecked("NO_FRAME_CONTEXT");
         }

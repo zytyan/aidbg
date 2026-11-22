@@ -60,6 +60,9 @@ struct Args {
     /// Total quota in MiB for retained compressed coredumps.
     #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..))]
     coredump_max_mib: u32,
+    /// Concurrent open core targets retained by the server.
+    #[arg(long, default_value_t = script::MAX_OPEN_CORES, value_parser = clap::value_parser!(u32).range(1..=i64::from(script::MAX_OPEN_CORES)))]
+    max_open_cores: u32,
     /// JSON allowlist of build IDs and raw ELF function names for target_call.
     #[arg(long)]
     target_call_policy: Option<PathBuf>,
@@ -246,6 +249,7 @@ impl Debugger for Service {
                 "asan_high_address": "0x500000000000",
                 "asan_high_address_mappable": address_mappable(0x500000000000),
             },
+            "limits": {"max_open_cores": self.scripts.max_open_cores()},
             "capabilities": ["run_control", "run_breakpoints", "live_inspect", "live_memory_search", "connect", "retained_core", "core_queries", "dump_coverage", "script_return", "detached_run", "core_memory_search", "export_bundle", "target_call_policy", "core_emulation"]
         }))
     }
@@ -558,8 +562,33 @@ impl Debugger for Service {
         request: Request<aidbg::rpc::PointerChainRequest>,
     ) -> std::result::Result<Response<DocumentReply>, Status> {
         let request = request.into_inner();
-        self.script_task(move |scripts| scripts.pointer_chain(request).map_err(script_error))
-            .await
+        match (
+            request.target_id.is_empty(),
+            request.pid,
+            request.run_id.as_deref(),
+        ) {
+            (false, None, None) => {
+                self.script_task(move |scripts| {
+                    scripts.pointer_chain(request).map_err(script_error)
+                })
+                .await
+            }
+            (true, Some(pid), None) => {
+                validate_pid(pid)?;
+                self.script_task(move |_| {
+                    script::pointer_chain_live(pid, request.base, request.offsets)
+                        .map_err(script_error)
+                })
+                .await
+            }
+            (true, None, Some(run_id)) => {
+                let (_, control) = self.runs.get(run_id)?.target()?;
+                self.script_task(move |_| control.pointer_chain(request).map_err(script_error))
+                    .await
+            }
+            (true, None, None) => Err(Status::invalid_argument("provide target_id, pid or run_id")),
+            _ => Err(conflicting_target("target_id, pid or run_id")),
+        }
     }
 
     async fn start_coredump(
@@ -568,7 +597,31 @@ impl Debugger for Service {
     ) -> std::result::Result<Response<CoredumpJob>, Status> {
         let StartCoredumpRequest { dump_id, capture } = request.into_inner();
         let req = capture.ok_or_else(|| Status::invalid_argument("capture request is missing"))?;
-        let (mode, options) = validate_capture(&req)?;
+        let mut capture = req.clone();
+        let selected_run = match self.capture_target(&mut capture) {
+            Ok(run) => run,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::NotFound
+                ) =>
+            {
+                let store = self.dump_store.clone();
+                let job = tokio::task::spawn_blocking(move || {
+                    store.existing_capture(&dump_id, &req.encode_to_vec())
+                })
+                .await
+                .map_err(internal)?;
+                return match job {
+                    Ok(job) => Ok(Response::new(job)),
+                    Err(status) if status.code() == tonic::Code::NotFound => Err(error),
+                    Err(status) => Err(status),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        let (mode, options) = validate_capture(&capture)?;
+        let pid = capture.pid;
         let store = Arc::clone(&self.dump_store);
         let slots = Arc::clone(&self.coredumps);
         let lock = Arc::clone(&self.capture_lock);
@@ -579,7 +632,6 @@ impl Debugger for Service {
         let job = tokio::spawn(async move {
             let reserve = Arc::clone(&store);
             let id = dump_id.clone();
-            let pid = req.pid;
             let (job, worker) = tokio::task::spawn_blocking(move || {
                 let identity = aidbg::coredump::target_identity(pid);
                 let (job, worker) = reserve.reserve(&id, req.encode_to_vec())?;
@@ -600,9 +652,12 @@ impl Debugger for Service {
                         tokio::task::spawn_blocking(move || -> Result<()> {
                             let _permit = permit;
                             let directory = worker_store.path(&id);
-                            let control = runs
-                                .control_for_pid(pid)?
-                                .or_else(|| breakpoints.inspect_control(pid));
+                            let control = match selected_run {
+                                Some(control) => Some(control),
+                                None => runs
+                                    .control_for_pid(pid)?
+                                    .or_else(|| breakpoints.inspect_control(pid)),
+                            };
                             let dump = if let Some(control) = control {
                                 let dump = control.capture_core(mode, options, directory)?;
                                 drop(guard);
@@ -814,12 +869,14 @@ impl Debugger for Service {
         &self,
         request: Request<CoredumpRequest>,
     ) -> std::result::Result<Response<Self::CoredumpStream>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
+        let selected_run = self.capture_target(&mut req)?;
         let (mode, options) = validate_capture(&req)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let lock = Arc::clone(&self.capture_lock);
         let slots = Arc::clone(&self.coredumps);
         let breakpoints = self.breakpoints.clone();
+        let runs = self.runs.clone();
         let store = Arc::clone(&self.store);
         tokio::spawn(async move {
             let permit = tokio::select! {
@@ -836,20 +893,27 @@ impl Debugger for Service {
             let chunks = sender.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                if breakpoints.contains(req.pid) {
-                    return Err(Status::failed_precondition(
-                        "an active breakpoint session owns this PID",
-                    ));
-                }
-                let dump = aidbg::coredump::prepare(
-                    req.pid,
-                    mode,
-                    options,
-                    &store.0,
-                    &|| chunks.is_closed(),
-                    || drop(guard),
-                )
-                .map_err(internal)?;
+                let control = match selected_run {
+                    Some(control) => Some(control),
+                    None => runs
+                        .control_for_pid(req.pid)?
+                        .or_else(|| breakpoints.inspect_control(req.pid)),
+                };
+                let dump = if let Some(control) = control {
+                    let result = control.capture_core(mode, options, store.0.clone());
+                    drop(guard);
+                    result.map_err(script_error)?
+                } else {
+                    aidbg::coredump::prepare(
+                        req.pid,
+                        mode,
+                        options,
+                        &store.0,
+                        &|| chunks.is_closed(),
+                        || drop(guard),
+                    )
+                    .map_err(internal)?
+                };
                 let mut stream = io::Cursor::new(dump.header).chain(dump.payload);
                 let mut buffer = vec![0; 256 * 1024];
                 loop {
@@ -1133,9 +1197,15 @@ impl Debugger for Service {
         };
         let guard = Arc::clone(&self.capture_lock).lock_owned().await;
         let breakpoints = self.breakpoints.clone();
+        let overrides = self.overrides.clone();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            document(breakpoints.install(req, callback_js, run)?)
+            document(breakpoints.install(
+                req,
+                callback_js,
+                run,
+                &overrides.list().map_err(internal)?,
+            )?)
         })
         .await
         .map_err(internal)?
@@ -1202,11 +1272,20 @@ impl Debugger for Service {
         &self,
         request: Request<SearchSymbolsRequest>,
     ) -> std::result::Result<Response<DocumentReply>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         if req.target_id.is_some() {
+            if req.pid != 0 || req.run_id.is_some() {
+                return Err(conflicting_target("pid, target_id or run_id"));
+            }
             return self
                 .script_task(move |scripts| scripts.symbols(req).map_err(script_error))
                 .await;
+        }
+        if let Some(id) = req.run_id.as_deref() {
+            if req.pid != 0 {
+                return Err(conflicting_target("pid or run_id"));
+            }
+            req.pid = self.runs.get(id)?.target()?.0;
         }
         validate_pid(req.pid)?;
         let mode = SymbolMatch::try_from(req.match_mode)
@@ -1253,14 +1332,30 @@ impl Debugger for Service {
         &self,
         request: Request<DisassembleRequest>,
     ) -> std::result::Result<Response<DocumentReply>, Status> {
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         if req.target_id.is_some() {
+            if req.pid != 0 || req.run_id.is_some() {
+                return Err(conflicting_target("pid, target_id or run_id"));
+            }
             return self
                 .script_task(move |scripts| scripts.disassemble(req).map_err(script_error))
                 .await;
         }
+        let run = if let Some(id) = req.run_id.as_deref() {
+            if req.pid != 0 {
+                return Err(conflicting_target("pid or run_id"));
+            }
+            let (pid, control) = self.runs.get(id)?.target()?;
+            req.pid = pid;
+            Some(control)
+        } else {
+            None
+        };
         validate_pid(req.pid)?;
         tokio::task::spawn_blocking(move || {
+            if let Some(control) = run {
+                return document(control.disassemble(req).map_err(script_error)?);
+            }
             let window = aidbg::disassembly::disassemble(
                 req.pid,
                 req.address,
@@ -1432,9 +1527,9 @@ impl Debugger for Service {
                 .script_task(move |scripts| scripts.inspect_core(req).map_err(script_error))
                 .await;
         }
-        if req.frame_index.is_some() || !req.expressions.is_empty() {
+        if req.run_id.is_none() && (req.frame_index.is_some() || !req.expressions.is_empty()) {
             return Err(Status::invalid_argument(
-                "frame_index and expressions require target_id",
+                "frame_index and expressions require run_id or target_id",
             ));
         }
 
@@ -1536,6 +1631,21 @@ impl Service {
         job.target()?;
         job.set_paused(paused).await?;
         document(job.document(&request.run_id, false)?)
+    }
+
+    fn capture_target(
+        &self,
+        req: &mut CoredumpRequest,
+    ) -> std::result::Result<Option<aidbg::breakpoint::Control>, Status> {
+        let Some(id) = req.run_id.as_deref() else {
+            return Ok(None);
+        };
+        if req.pid != 0 {
+            return Err(conflicting_target("pid or run_id"));
+        }
+        let (pid, control) = self.runs.get(id)?.target()?;
+        req.pid = pid;
+        Ok(Some(control))
     }
 
     fn run_breakpoint_target(
@@ -1717,7 +1827,7 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store(args.state_dir));
     let (breakpoints, saver) = Breakpoints::new(Arc::clone(&store))?;
     let service = Service {
-        scripts: Arc::new(Scripts::remote()),
+        scripts: Arc::new(Scripts::remote(args.max_open_cores)),
         script_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         run_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         runs: Arc::default(),

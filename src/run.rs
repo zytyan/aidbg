@@ -305,6 +305,9 @@ pub fn execute(
     drop(release);
     let mut launched = Some(launched);
     let mut session = Session::new(pid, &root, start, trace, publish, true);
+    if let Some(control) = &control {
+        session.track_pause_state(control.paused.clone());
+    }
 
     let deadline = Instant::now() + Duration::from_millis(timeout.into());
     let expired = || Instant::now() >= deadline || cancelled();
@@ -338,11 +341,13 @@ pub fn execute(
         if session.trace.exec_observed() {
             if exec_observed {
                 session.reset_address_space()?;
+                crate::symbols::inspect::warm_dwarf(pid);
                 if let Some(thread) = session.trace.threads.get_mut(&pid) {
                     thread.stop = Some(Stop::ExecBoundary);
                 }
             } else {
                 exec_observed = true;
+                crate::symbols::inspect::warm_dwarf(pid);
                 session.paused = request.pause_at_entry;
                 // The initial exec establishes the address space used by all subsequent commands.
                 if let Some(thread) = session.trace.threads.get_mut(&pid) {
@@ -418,10 +423,7 @@ pub fn execute(
                             Ok(())
                         };
                         if result.is_ok() {
-                            session.paused = paused;
-                            control
-                                .paused
-                                .store(paused, std::sync::atomic::Ordering::Relaxed);
+                            session.set_paused(paused);
                         }
                         let _ = reply.send(result);
                     }
@@ -544,7 +546,14 @@ pub fn execute(
                 continue;
             }
             handled?;
-            session.remove_exhausted()?;
+            if let Some(control) = &control {
+                control
+                    .paused
+                    .store(session.paused, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !session.paused {
+                session.remove_exhausted()?;
+            }
         }
     };
 

@@ -56,6 +56,27 @@ pub fn disassemble(
     after: u32,
     start: Option<u64>,
 ) -> Result<Window> {
+    disassemble_with(pid, address, before, after, start, |anchor, buffer| {
+        let remote = [uio::RemoteIoVec {
+            base: usize::try_from(anchor)?,
+            len: buffer.len(),
+        }];
+        Ok(uio::process_vm_readv(
+            Pid::from_raw(pid),
+            &mut [IoSliceMut::new(buffer)],
+            &remote,
+        )?)
+    })
+}
+
+pub(crate) fn disassemble_with(
+    pid: i32,
+    address: u64,
+    before: u32,
+    after: u32,
+    start: Option<u64>,
+    read: impl FnOnce(u64, &mut [u8]) -> Result<usize>,
+) -> Result<Window> {
     let procdir = File::open(format!("/proc/{pid}"))?;
     let root = PathBuf::from(format!("/proc/self/fd/{}", procdir.as_raw_fd()));
     let start_ticks = procfs::start_ticks(&root)?;
@@ -74,12 +95,7 @@ pub fn disassemble(
         symbols::code_start(&root, address),
         "process",
         |anchor, buffer| {
-            let remote = [uio::RemoteIoVec {
-                base: usize::try_from(anchor)?,
-                len: buffer.len(),
-            }];
-            let read =
-                uio::process_vm_readv(Pid::from_raw(pid), &mut [IoSliceMut::new(buffer)], &remote)?;
+            let read = read(anchor, buffer)?;
             use std::os::unix::fs::MetadataExt;
             let current = std::fs::metadata(root.join("exe"))?;
             if procfs::start_ticks(&root)? != start_ticks

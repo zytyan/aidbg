@@ -21,7 +21,6 @@ use std::{
 
 pub(crate) mod inspect;
 mod overrides;
-pub(crate) use inspect::inspect_with_trace;
 pub use inspect::{Report as InspectReport, inspect};
 pub use overrides::{Overrides, Rule as OverrideRule};
 
@@ -168,7 +167,7 @@ pub(crate) fn find_external_debug(
         }
     }
     for (path, crc) in candidates {
-        let Ok(bytes) = debug_bytes(&path, limit.min(DEBUG_LIMIT)) else {
+        let Ok(bytes) = debug_bytes(&path, limit) else {
             continue;
         };
         if crc.is_some_and(|expected| crc32fast::hash(&bytes) != expected) {
@@ -208,7 +207,7 @@ impl DebugFile {
         Some(Self { path, bytes })
     }
 
-    fn parse(&self) -> Option<object::File<'_>> {
+    pub(crate) fn parse(&self) -> Option<object::File<'_>> {
         object::File::parse(&*self.bytes).ok()
     }
 
@@ -589,16 +588,87 @@ impl BreakpointSite {
     }
 }
 
-pub(crate) fn breakpoint_site(
+pub(crate) fn unique_breakpoint_location(
+    pid: i32,
     root: &Path,
-    filter: &str,
-    name: &str,
-    base: Option<u64>,
-) -> Result<BreakpointSite> {
-    if name.len() > 1024 {
-        return Err(error("symbol name exceeds length limit"));
+    module: Option<&str>,
+    symbol: &str,
+    instance: Option<u64>,
+    offset: u64,
+    execution: bool,
+    overrides: &[OverrideRule],
+) -> Result<(u64, Option<BreakpointSite>)> {
+    let report = search(
+        pid,
+        symbol,
+        SymbolMatch::Exact,
+        module,
+        MAX_RESULTS,
+        overrides,
+    )?;
+    let parse = |value: &str| u64::from_str_radix(value.trim_start_matches("0x"), 16);
+    let mut matches = report.matches.iter().filter(|item| {
+        instance.is_none_or(|base| parse(&item.instance).ok() == Some(base))
+            && (!execution || item.symbol.kind == "text")
+    });
+    let first = matches.next();
+    if report.truncated || matches.next().is_some() {
+        return Err(Diagnostic::new(
+            "AMBIGUOUS_SYMBOL",
+            format!("symbol {symbol} is ambiguous across loaded locations"),
+            Some("Specify module or instance."),
+        )
+        .into());
     }
-    breakpoint_site_matching(root, filter, base, |symbol| symbol == name)
+    let found = first.ok_or_else(|| {
+        Diagnostic::new(
+            "SYMBOL_NOT_FOUND",
+            format!("symbol {symbol} is unavailable"),
+            None,
+        )
+    })?;
+    let invalid = || {
+        Diagnostic::new(
+            "INVALID_ARGUMENT",
+            "symbol address plus offset overflows",
+            None,
+        )
+    };
+    let address = if offset == 0 {
+        parse(&found.runtime_address)?
+    } else {
+        let offset = parse(&found.module_offset)?
+            .checked_add(offset)
+            .ok_or_else(invalid)?;
+        resolve_module_offset(
+            root,
+            &found.module.path,
+            offset,
+            execution,
+            Some(parse(&found.instance)?),
+        )?
+    };
+    if !execution {
+        return Ok((address, None));
+    }
+    let (backing, mapping) = modules::map_entries(root)?
+        .into_iter()
+        .find(|(_, mapping)| mapping.contains(address) && mapping.executable())
+        .ok_or_else(|| error("symbol is outside executable mappings"))?;
+    let file_offset = mapping
+        .file_offset(address)
+        .ok_or_else(|| error("invalid symbol mapping offset"))?;
+    Ok((
+        address,
+        Some(BreakpointSite {
+            address,
+            size: found.symbol.size,
+            build_id: found.module.build_id.clone(),
+            symbols: vec![found.symbol.name.clone()],
+            backing,
+            file_offset,
+        }),
+    ))
 }
 
 pub(crate) fn breakpoint_site_matching(
@@ -1297,14 +1367,23 @@ mod tests {
             .windows(id.len())
             .position(|window| window == id)
             .expect("build ID in GNU note");
+        let discover = || {
+            find_external_debug(
+                Some(&root.path().join("root")),
+                &module.path(),
+                &image,
+                bytes.len() as u64,
+            )
+        };
         let mut mismatch = bytes.clone();
         mismatch[usize::try_from(offset)? + position] ^= 1;
         fs::write(&file, &mismatch)?;
-        assert!(external_debug(root.path(), &module, &image).is_none());
+        assert!(discover().is_none());
+        drop(mismatch);
 
         fs::write(&file, &bytes)?;
-        let (found_path, found) = external_debug(root.path(), &module, &image)
-            .ok_or_else(|| error("verified debug file was not discovered"))?;
+        let (found_path, found) =
+            discover().ok_or_else(|| error("verified debug file was not discovered"))?;
         assert_eq!(found_path, Path::new("/").join(candidate));
         assert_eq!(object::File::parse(&*found)?.build_id()?, Some(id));
         Ok(())

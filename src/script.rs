@@ -1,7 +1,9 @@
 pub(crate) mod breakpoint;
 mod compiler;
 mod core;
-pub use core::memory::{read_live, search_live};
+mod debugger;
+pub(crate) use core::memory::{live_missing_memory, pointer_chain_with, read_range};
+pub use core::memory::{pointer_chain_live, read_live, search_live};
 pub(crate) mod live;
 mod runtime;
 pub mod synchronization;
@@ -27,7 +29,7 @@ pub use api::*;
 use api::{DECLARATIONS, LIVE_DECLARATIONS, RULE_DECLARATIONS, SIGNAL_DECLARATIONS};
 
 const MAX_SOURCE_BYTES: usize = 64 * 1024;
-const MAX_TARGETS: usize = 4;
+pub const MAX_OPEN_CORES: u32 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Range {
@@ -86,7 +88,7 @@ pub struct RunResult {
 
 #[derive(Default)]
 pub struct Scripts {
-    remote: bool,
+    remote_limit: Option<u32>,
     compiler: Mutex<Option<Compiler>>,
     rules_compiler: Mutex<Option<Compiler>>,
     live_compiler: Mutex<Option<Compiler>>,
@@ -95,11 +97,15 @@ pub struct Scripts {
 }
 
 impl Scripts {
-    pub fn remote() -> Self {
+    pub fn remote(max_open_cores: u32) -> Self {
         Self {
-            remote: true,
+            remote_limit: Some(max_open_cores.clamp(1, MAX_OPEN_CORES)),
             ..Self::default()
         }
+    }
+
+    pub fn max_open_cores(&self) -> u32 {
+        self.remote_limit.unwrap_or(MAX_OPEN_CORES)
     }
 
     pub fn open(&self, path: &Path, symbols: CoreSymbols) -> Result<CoreInfo> {
@@ -107,7 +113,11 @@ impl Scripts {
     }
 
     pub fn open_compressed(&self, source: impl Read, symbols: CoreSymbols) -> Result<CoreInfo> {
-        self.add_target(core::decompress(source)?, symbols, self.remote)
+        self.add_target(
+            core::decompress(source)?,
+            symbols,
+            self.remote_limit.is_some(),
+        )
     }
 
     fn add_target(
@@ -120,11 +130,21 @@ impl Scripts {
             .targets
             .lock()
             .map_err(|_| error("target store unavailable"))?;
-        if targets.len() >= MAX_TARGETS {
-            return Err(error("too many open cores"));
+        let limit = self.max_open_cores();
+        if targets.len() >= limit as usize {
+            return Err(crate::Diagnostic::new(
+                "INVALID_ARGUMENT",
+                format!("At most {limit} cores can be open. Close a core before opening another."),
+                None,
+            )
+            .into());
         }
         let temporary = tempfile::Builder::new()
-            .prefix(if self.remote { "remote-core-" } else { "core-" })
+            .prefix(if self.remote_limit.is_some() {
+                "remote-core-"
+            } else {
+                "core-"
+            })
             .rand_bytes(24)
             .tempfile()?;
         let id = temporary
@@ -274,7 +294,12 @@ impl Scripts {
         emit: bool,
     ) -> Result<(CheckResult, Option<(String, u64)>)> {
         if source.len() > MAX_SOURCE_BYTES {
-            return Err(error("script source exceeds 64 KiB"));
+            return Err(crate::Diagnostic::new(
+                "INVALID_ARGUMENT",
+                "script source exceeds 64 KiB",
+                None,
+            )
+            .into());
         }
         let started = Instant::now();
         let (compiler, declarations) = match mode {

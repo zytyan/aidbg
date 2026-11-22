@@ -259,7 +259,11 @@ impl Client {
 
     pub(super) async fn pointer_chain(&self, request: rpc::PointerChainRequest) -> Result<Value> {
         #[cfg(target_os = "linux")]
-        if !remote_target(&request.target_id) {
+        if !request.target_id.is_empty()
+            && request.pid.is_none()
+            && request.run_id.is_none()
+            && !remote_target(&request.target_id)
+        {
             let local = self.local.clone();
             return task(move || local.pointer_chain(request)).await;
         }

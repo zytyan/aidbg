@@ -712,8 +712,7 @@ impl Target {
                 |lookup| {
                     let image = self.image_at(lookup)?;
                     let link = image.link(lookup)?;
-                    let main = matches!(image, images::Image::Main(_));
-                    Some((image, link, main))
+                    Some((image, link))
                 },
                 thread.regs,
                 &[module],
@@ -768,7 +767,7 @@ impl Target {
                 .iter()
                 .enumerate()
                 .map(|(index, frame)| {
-                    let lookup = frame.pc.saturating_sub(u64::from(index > 0));
+                    let lookup = frame.lookup_pc;
                     let image = self.image_at(lookup);
                     let source = image
                         .as_ref()
@@ -824,6 +823,20 @@ impl Target {
         })
     }
 
+    fn frame_dwarf(&self, frame: &OfflineFrame) -> Result<DwarfImage> {
+        if let Some(image) = self.image_at(frame.lookup_pc)
+            && let Some(dwarf) = image.dwarf(self)?
+        {
+            return Ok(dwarf);
+        }
+        Err(Diagnostic::new(
+            "NO_DWARF",
+            "No verified DWARF image for this core frame",
+            Some("Supply matching debug information for the frame's module."),
+        )
+        .into())
+    }
+
     pub fn locals(
         &self,
         handle: &str,
@@ -841,7 +854,7 @@ impl Target {
                     Some("Select a current frame from dbg.frames(tid)."),
                 )
             })?;
-        self.dwarf()?
+        self.frame_dwarf(frame)?
             .variables(self, Some(frame), "*", offset, limit, deadline)
     }
 
@@ -1051,7 +1064,7 @@ impl Target {
     }
 
     fn frame_arguments(&self, frame: &OfflineFrame, deadline: Instant) -> Value {
-        let args = self.dwarf().and_then(|dwarf| {
+        let args = self.frame_dwarf(frame).and_then(|dwarf| {
             if frame.link.is_none() {
                 return Err(Diagnostic::new(
                     "NO_FRAME_CONTEXT",
@@ -1075,6 +1088,29 @@ impl Target {
         })
     }
 
+    fn default_tid(&self) -> Option<i32> {
+        if self.threads.len() == 1 {
+            return self.threads.keys().next().copied();
+        }
+        let mut signaled = self
+            .threads
+            .iter()
+            .filter(|(_, thread)| thread.stop_signal != 0);
+        let tid = *signaled.next()?.0;
+        signaled.next().is_none().then_some(tid)
+    }
+
+    fn default_frame_handle(&self) -> Result<String> {
+        let tid = self.default_tid().ok_or_else(|| {
+            Diagnostic::new(
+                "THREAD_REQUIRED",
+                "Select a core frame when the captured thread is ambiguous",
+                None,
+            )
+        })?;
+        Ok(format!("{}:{tid}:0", self.id))
+    }
+
     pub fn inspect_request(&self, request: crate::rpc::InspectRequest) -> Result<Value> {
         let invalid = |message| Diagnostic::new("INVALID_ARGUMENT", message, None);
         if request.pid != 0
@@ -1093,26 +1129,13 @@ impl Target {
             return Err(invalid("timeout_ms must be between 1 and 5000").into());
         }
         let deadline = Instant::now() + std::time::Duration::from_millis(u64::from(timeout));
-        let tid = request
-            .tid
-            .or_else(|| {
-                if self.threads.len() == 1 {
-                    return self.threads.keys().next().copied();
-                }
-                let mut signaled = self
-                    .threads
-                    .iter()
-                    .filter(|(_, thread)| thread.stop_signal != 0);
-                let tid = *signaled.next()?.0;
-                signaled.next().is_none().then_some(tid)
-            })
-            .ok_or_else(|| {
-                Diagnostic::new(
-                    "THREAD_REQUIRED",
-                    "Select the thread to inspect in this core",
-                    None,
-                )
-            })?;
+        let tid = request.tid.or_else(|| self.default_tid()).ok_or_else(|| {
+            Diagnostic::new(
+                "THREAD_REQUIRED",
+                "Select the thread to inspect in this core",
+                None,
+            )
+        })?;
         let index = request.frame_index.unwrap_or_default();
         let handle = format!("{}:{tid}:{index}", self.id);
         let frame = self.frame(&handle).ok_or_else(|| {
@@ -1122,38 +1145,9 @@ impl Target {
                 None,
             )
         })?;
-        let evaluate = |text: &str| {
-            let mut value = self.inspect(text, &handle, deadline, request.expand.clone());
-            let result = &mut value["result"];
-            if Instant::now() < deadline
-                && result["type"]["kind"] == "pointer"
-                && let Some(address) = result["value"].as_str()
-                && let Ok(address) = u64::from_str_radix(address.trim_start_matches("0x"), 16)
-                && address != 0
-                && let Some(symbol) = self.address_symbol(address)
-            {
-                result["symbol"] = symbol;
-            }
-            value
-        };
-        let mut value = if batch {
-            let results: Vec<_> = request
-                .expressions
-                .iter()
-                .map(|text| json!({"expression": text, "value": evaluate(text)}))
-                .collect();
-            let status = if results
-                .iter()
-                .all(|result| result["value"]["status"] == "complete")
-            {
-                "complete"
-            } else {
-                "partial"
-            };
-            json!({"status": status, "results": results})
-        } else {
-            evaluate(&request.expression)
-        };
+        let mut value = crate::symbols::inspect::inspect_batch(&request, |text| {
+            self.inspect(text, &handle, deadline, request.expand.clone())
+        });
         let mut metadata = self.frame_metadata(tid)?[index as usize].clone();
         metadata["args"] = self.frame_arguments(frame, deadline);
         metadata["tid"] = json!(tid);
@@ -1176,27 +1170,115 @@ impl Target {
         let Some(frame) = self.frame(handle) else {
             return json!({"status": "invalid_frame", "result": null, "issue": "frame is absent from this core target", "code": "NO_FRAME_CONTEXT", "hint": "Select a current frame from dbg.frames(tid)."});
         };
-        let Some(dwarf) = &self.dwarf else {
-            return json!({"status": "no_dwarf", "result": null, "issue": "no verified DWARF image", "code": "NO_DWARF", "hint": "Supply a matching executable and debug symbols."});
-        };
-        dwarf.inspect(
-            text, self, frame.regs, frame.link, frame.cfa, deadline, expand,
-        )
+        let mut result = self.frame_dwarf(frame).map(|dwarf| {
+            dwarf.inspect(
+                text,
+                self,
+                frame.regs,
+                frame.link,
+                frame.cfa,
+                deadline,
+                expand.clone(),
+            )
+        });
+        if let Some(main) = &self.dwarf
+            && (result.is_err()
+                || result
+                    .as_ref()
+                    .is_ok_and(|report| report["status"] == "not_found"))
+            && !matches!(self.image_at(frame.lookup_pc), Some(images::Image::Main(_)))
+        {
+            result = Ok(main.inspect(text, self, frame.regs, None, None, deadline, expand));
+        }
+        let mut report = result.unwrap_or_else(|error| json!({"status": "no_dwarf", "result": null, "issue": error.to_string(), "code": "NO_DWARF", "hint": "Supply matching executable and debug symbols."}));
+        let value = &mut report["result"];
+        if Instant::now() < deadline
+            && value["type"]["kind"] == "pointer"
+            && let Some(address) = value["value"].as_str()
+            && let Ok(address) = u64::from_str_radix(address.trim_start_matches("0x"), 16)
+            && address != 0
+            && let Some(symbol) = self.address_symbol(address)
+        {
+            value["symbol"] = symbol;
+        }
+        report
     }
 
     pub fn preflight(&self, text: &str, handle: Option<&str>) -> Validation {
-        let Some(dwarf) = &self.dwarf else {
-            return Validation::unchecked("NO_DWARF");
-        };
-        let pc = if let Some(handle) = handle {
+        if let Some(handle) = handle {
             let Some(frame) = self.frame(handle) else {
                 return Validation::unchecked("UNKNOWN_FRAME");
             };
-            frame.link
-        } else {
-            None
+            return self.frame_dwarf(frame).map_or_else(
+                |_| Validation::unchecked("NO_DWARF"),
+                |dwarf| dwarf.preflight(text, self, frame.link),
+            );
+        }
+        self.dwarf.as_ref().map_or_else(
+            || Validation::unchecked("NO_DWARF"),
+            |dwarf| dwarf.preflight(text, self, None),
+        )
+    }
+}
+
+impl super::debugger::Debugger for Target {
+    fn threads(&self) -> Result<Value> {
+        Ok(self.threads())
+    }
+
+    fn frames(&self, tid: i32, deadline: Instant) -> Result<Value> {
+        self.frames(tid, deadline)
+    }
+
+    fn modules(&self) -> Result<Value> {
+        Ok(self.modules())
+    }
+
+    fn read_prefix(&self, address: u64, bytes: &mut [u8]) -> Result<usize> {
+        self.read_prefix(address, bytes)
+    }
+
+    fn discover(
+        &self,
+        kind: crate::symbols::inspect::Discovery,
+        frame: Option<&str>,
+        pattern: &str,
+        (offset, limit): (usize, usize),
+        deadline: Instant,
+    ) -> Result<Value> {
+        use crate::symbols::inspect::Discovery;
+        match kind {
+            Discovery::Locals => {
+                let handle = frame
+                    .map(str::to_owned)
+                    .map_or_else(|| self.default_frame_handle(), Ok)?;
+                self.locals(&handle, offset, limit, deadline)
+            }
+            Discovery::Globals => self.globals(pattern, offset, limit, deadline),
+            Discovery::Types => self.types(pattern, offset, limit, deadline),
+            Discovery::Parameters => unreachable!("parameters are exposed through frames"),
+        }
+    }
+
+    fn inspect(
+        &self,
+        expression: String,
+        frame: Option<&str>,
+        expand: Option<crate::rpc::InspectExpansion>,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let handle = match frame
+            .map(str::to_owned)
+            .map_or_else(|| self.default_frame_handle(), Ok)
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                return Ok(json!({
+                    "status": "invalid_frame", "result": null, "code": "THREAD_REQUIRED", "issue": error.to_string(),
+                }));
+            }
         };
-        dwarf.preflight(text, self, pc)
+        Ok(self.inspect(&expression, &handle, deadline, expand))
     }
 }
 

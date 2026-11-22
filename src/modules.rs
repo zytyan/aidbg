@@ -60,7 +60,7 @@ pub struct ModuleInfo {
 
 #[derive(Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct ModuleIdentity {
-    path: String,
+    pub(crate) path: String,
     pub(crate) device: String,
     pub(crate) inode: String,
     #[serde(skip_serializing_if = "Option::is_none")]

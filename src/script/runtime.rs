@@ -53,16 +53,6 @@ pub(super) fn frame_handle<'js>(ctx: &Ctx<'js>, frame: Value<'js>) -> rquickjs::
     }
 }
 
-fn inspect(
-    target: &Target,
-    expression: &str,
-    options: &Object<'_>,
-    deadline: Instant,
-) -> rquickjs::Result<Json> {
-    let handle = frame_handle(options.ctx(), options.get("frame")?)?;
-    Ok(target.inspect(expression, &handle, deadline, expansion(Some(options))?))
-}
-
 pub(super) fn expansion(
     options: Option<&Object<'_>>,
 ) -> rquickjs::Result<Option<crate::rpc::InspectExpansion>> {
@@ -205,119 +195,22 @@ fn evaluate<'js>(
         globals.remove(global)?;
     }
     let dbg = Object::new(ctx.clone())?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "threads",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
-            check_deadline(&ctx, deadline)?;
-            as_js(&ctx, site.threads())
-        })?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "frames",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, tid: i32| {
-            check_deadline(&ctx, deadline)?;
-            let frames = site
-                .frames(tid, deadline)
-                .map_err(|e| Exception::throw_message(&ctx, &e.to_string()))?;
-            as_js(&ctx, frames)
-        })?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "modules",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
-            check_deadline(&ctx, deadline)?;
-            as_js(&ctx, site.modules())
-        })?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "memory",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, address: BigInt<'js>, length: f64| {
-                check_deadline(&ctx, deadline)?;
-                let constructor = ctx
-                    .globals()
-                    .get::<_, rquickjs::function::Constructor>("DataView")?;
-                memory_view(&ctx, address, length, &constructor, |addr, bytes| {
-                    site.read_prefix(addr, bytes)
-                        .map_err(|error| Exception::throw_message(&ctx, &error.to_string()))
-                })
-            },
-        )?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "locals",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, frame: Value<'js>, options: Opt<Object<'js>>| {
-                let (offset, limit) = page(&ctx, options, deadline)?;
-                let handle = frame_handle(&ctx, frame)?;
-                debugger_reply(&ctx, site.locals(&handle, offset, limit, deadline))
-            },
-        )?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "globals",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, pattern: Opt<String>, options: Opt<Object<'js>>| {
-                let (offset, limit) = page(&ctx, options, deadline)?;
-                debugger_reply(
-                    &ctx,
-                    site.globals(pattern.0.as_deref().unwrap_or("*"), offset, limit, deadline),
-                )
-            },
-        )?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "types",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, pattern: Opt<String>, options: Opt<Object<'js>>| {
-                let (offset, limit) = page(&ctx, options, deadline)?;
-                debugger_reply(
-                    &ctx,
-                    site.types(pattern.0.as_deref().unwrap_or("*"), offset, limit, deadline),
-                )
-            },
-        )?,
-    )?;
-    let site = Arc::clone(&target);
-    dbg.set(
-        "inspect",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, expr: String, options: Object<'js>| {
-                check_deadline(&ctx, deadline)?;
-                debug_value(&ctx, inspect(&site, &expr, &options, deadline)?)
-            },
-        )?,
-    )?;
     let print_entries = Rc::clone(&entries);
     let print_bytes = Rc::clone(&output_bytes);
-    dbg.set(
-        "printVal",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, expr: String, options: Object<'js>| {
-                check_deadline(&ctx, deadline)?;
-                let label: Option<String> = options.get("label")?;
-                let report = inspect(&target, &expr, &options, deadline)?;
-                push_output(
-                    &ctx,
-                    &print_entries,
-                    &print_bytes,
-                    json!({"label": label, "expression": expr, "value": report}),
-                )
-            },
-        )?,
+    super::debugger::bind(
+        &ctx,
+        &dbg,
+        target,
+        deadline,
+        |ctx| ctx.globals().get("DataView"),
+        move |ctx, expression, label, report| {
+            push_output(
+                ctx,
+                &print_entries,
+                &print_bytes,
+                json!({"label": label, "expression": expression, "value": report}),
+            )
+        },
     )?;
     let emit_entries = Rc::clone(&entries);
     let emit_bytes = Rc::clone(&output_bytes);
@@ -452,7 +345,7 @@ pub(super) fn debugger_reply<'js>(
             let diagnostic = error.downcast::<crate::Diagnostic>().unwrap();
             as_js(
                 ctx,
-                json!({ "items": [], "next_offset": null, "warnings": [diagnostic] }),
+                json!({ "items": [], "next_offset": null, "issue": diagnostic, "warnings": [diagnostic] }),
             )
         }
         Err(error) => Err(Exception::throw_message(ctx, &error.to_string())),

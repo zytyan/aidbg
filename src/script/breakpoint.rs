@@ -462,6 +462,7 @@ pub(crate) struct StoppedTarget {
     pub pid: i32,
     pub root: PathBuf,
     pub tids: Vec<i32>,
+    pub focus: Option<i32>,
 }
 
 pub(super) fn setup_scope<'js>(
@@ -472,11 +473,12 @@ pub(super) fn setup_scope<'js>(
     actions: Rc<RefCell<Option<Actions>>>,
     deadline: Instant,
 ) -> rquickjs::Result<CloseHit<'js>> {
-    let tid = if target.tids.contains(&target.pid) {
-        target.pid
-    } else {
-        target.tids.first().copied().unwrap_or(target.pid)
-    };
+    let tid = target
+        .focus
+        .filter(|tid| target.tids.contains(tid))
+        .or_else(|| target.tids.contains(&target.pid).then_some(target.pid))
+        .or_else(|| target.tids.first().copied())
+        .unwrap_or(target.pid);
     let read = Rc::new(HitReader {
         pid: target.pid,
         tid,
@@ -508,149 +510,30 @@ fn bind_scope<'js>(
     intrinsics: &HitIntrinsics<'js>,
 ) -> rquickjs::Result<()> {
     let deadline = read.deadline;
-    let reader = Rc::clone(read);
-    scope.set(
-        "inspect",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>,
-                  expression: String,
-                  options: rquickjs::function::Opt<Object<'js>>| {
-                let report = reader.inspect(&ctx, expression, options.0.as_ref())?;
-                super::runtime::debug_value(&ctx, report)
-            },
-        )?,
-    )?;
-    let reader = Rc::clone(read);
     let output = Rc::clone(&read.actions);
-    scope.set(
-        "printVal",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>,
-                  expression: String,
-                  options: rquickjs::function::Opt<Object<'js>>| {
-                let report = reader.inspect(&ctx, expression.clone(), options.0.as_ref())?;
-                let label = options
-                    .0
-                    .as_ref()
-                    .map(|options| options.get::<_, Option<String>>("label"))
-                    .transpose()?
-                    .flatten()
-                    .unwrap_or(expression);
-                emit_field(
-                    &ctx,
-                    &output,
-                    OutputField {
-                        label,
-                        value: FieldValue::Json(report),
-                    },
-                )
-            },
-        )?,
-    )?;
-    let reader = Rc::clone(read);
-    scope.set(
-        "modules",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
-            reader.check(&ctx)?;
-            let result = crate::modules::read(&reader.root)
-                .map_err(|issue| Exception::throw_message(&ctx, &issue.to_string()))?;
-            let exe = std::fs::metadata(reader.root.join("exe")).ok();
-            let items: Vec<_> = result
-                .iter()
-                .enumerate()
-                .map(|(id, module)| module.info(id, exe.as_ref(), None))
-                .collect();
-            super::runtime::as_js(&ctx, json!(items))
-        })?,
-    )?;
-    for (name, kind) in [
-        ("globals", crate::symbols::inspect::Discovery::Globals),
-        ("types", crate::symbols::inspect::Discovery::Types),
-    ] {
-        let reader = Rc::clone(read);
-        scope.set(
-            name,
-            Function::new(
-                ctx.clone(),
-                move |ctx: Ctx<'js>,
-                      pattern: rquickjs::function::Opt<String>,
-                      options: rquickjs::function::Opt<Object<'js>>| {
-                    reader.discover(
-                        &ctx,
-                        kind,
-                        pattern.0.as_deref().unwrap_or("*"),
-                        options,
-                        None,
-                    )
-                },
-            )?,
-        )?;
-    }
-    let reader = Rc::clone(read);
-    scope.set(
-        "locals",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>,
-                  first: rquickjs::function::Opt<Value<'js>>,
-                  second: rquickjs::function::Opt<Object<'js>>| {
-                let (frame, page) = match first.0 {
-                    Some(first) if first.is_string() => (Some(first), second.0),
-                    Some(first) => match first.into_object() {
-                        Some(object) if object.contains_key("handle")? => {
-                            (Some(object.into_value()), second.0)
-                        }
-                        options => (None, options.or(second.0)),
-                    },
-                    None => (None, second.0),
-                };
-                reader.discover(
-                    &ctx,
-                    crate::symbols::inspect::Discovery::Locals,
-                    "*",
-                    rquickjs::function::Opt(page),
-                    frame,
-                )
-            },
-        )?,
-    )?;
-    let reader = Rc::clone(read);
-    scope.set(
-        "threads",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
-            reader.check(&ctx)?;
-            let rows: Vec<_> = reader.tids.iter().map(|tid| json!({"tid": tid})).collect();
-            super::runtime::as_js(&ctx, json!(rows))
-        })?,
-    )?;
-    let reader = Rc::clone(read);
-    scope.set(
-        "frames",
-        Function::new(ctx.clone(), move |ctx: Ctx<'js>, tid: i32| {
-            reader.frames(&ctx, tid)
-        })?,
-    )?;
-    let reader = Rc::clone(read);
     let memory_intrinsics = Rc::clone(intrinsics);
-    scope.set(
-        "memory",
-        Function::new(
-            ctx.clone(),
-            move |ctx: Ctx<'js>, address: BigInt<'js>, length: f64| {
-                reader.check(&ctx)?;
-                let constructor = memory_intrinsics
-                    .borrow()
-                    .as_ref()
-                    .expect("active synchronous callback")
-                    .0
-                    .clone();
-                super::runtime::memory_view(&ctx, address, length, &constructor, |addr, bytes| {
-                    Ok(reader.read_prefix(addr, bytes))
-                })
-            },
-        )?,
+    super::debugger::bind(
+        ctx,
+        scope,
+        Rc::clone(read),
+        deadline,
+        move |ctx| {
+            memory_intrinsics
+                .borrow()
+                .as_ref()
+                .map(|(constructor, _)| constructor.clone())
+                .ok_or_else(|| Exception::throw_message(ctx, "debug read scope has ended"))
+        },
+        move |ctx, expression, label, report| {
+            emit_field(
+                ctx,
+                &output,
+                OutputField {
+                    label: label.unwrap_or(expression),
+                    value: FieldValue::Json(report),
+                },
+            )
+        },
     )?;
     let state = Rc::clone(&read.actions);
     let emit_intrinsics = Rc::clone(intrinsics);
@@ -722,37 +605,58 @@ struct HitReader {
 }
 
 impl HitReader {
-    fn selected(&self, ctx: &Ctx<'_>, frame: Option<String>) -> rquickjs::Result<(i32, Registers)> {
+    fn selected(&self, frame: Option<&str>) -> Result<(i32, Registers)> {
         match frame {
             None => Ok((self.tid, self.registers)),
             Some(handle) => self
                 .frame_regs
                 .borrow()
-                .get(&handle)
+                .get(handle)
                 .copied()
                 .ok_or_else(|| {
-                    Exception::throw_message(ctx, "frame is absent from this stopped target")
+                    crate::Diagnostic::new(
+                        "NO_FRAME_CONTEXT",
+                        "Frame is absent from this stopped target",
+                        None,
+                    )
+                    .into()
                 }),
         }
     }
+}
 
-    fn frames<'js>(&self, ctx: &Ctx<'js>, tid: i32) -> rquickjs::Result<Value<'js>> {
-        self.check(ctx)?;
+impl super::debugger::Debugger for HitReader {
+    fn threads(&self) -> Result<Json> {
+        Ok(json!(
+            self.tids
+                .iter()
+                .map(|tid| json!({"tid": tid}))
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    fn modules(&self) -> Result<Json> {
+        let modules = crate::modules::read(&self.root)?;
+        let exe = std::fs::metadata(self.root.join("exe")).ok();
+        Ok(json!(
+            modules
+                .iter()
+                .enumerate()
+                .map(|(id, module)| module.info(id, exe.as_ref(), None))
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    fn frames(&self, tid: i32, deadline: Instant) -> Result<Json> {
         if !self.tids.contains(&tid) {
-            return Err(Exception::throw_message(
-                ctx,
-                "TID is absent from this stopped target",
-            ));
+            return Err(error("TID is absent from this stopped target"));
         }
         let regs = if tid == self.tid {
             self.registers
         } else {
-            crate::regs::read(tid)
-                .map_err(|e| Exception::throw_message(ctx, &e.to_string()))?
-                .stack
+            crate::regs::read(tid)?.stack
         };
-        let maps = crate::modules::read(&self.root)
-            .map_err(|e| Exception::throw_message(ctx, &e.to_string()))?;
+        let maps = crate::modules::read(&self.root)?;
         let exe = std::fs::metadata(self.root.join("exe")).ok();
         let mut images = crate::unwind::Images::new();
         let mut stored = self.frame_regs.borrow_mut();
@@ -762,8 +666,15 @@ impl HitReader {
             &maps,
             &self.root,
             exe.as_ref(),
-            self.deadline,
-            |i, regs| {
+            deadline,
+            |i, mut regs| {
+                if i > 0 {
+                    let pc = regs
+                        .get(crate::regs::PC)
+                        .ok()
+                        .and_then(|pc| pc.checked_sub(1));
+                    regs.set(crate::regs::PC, pc);
+                }
                 stored.insert(format!("live:{tid}:{i}"), (tid, regs));
             },
         );
@@ -781,84 +692,59 @@ impl HitReader {
                 self.pid, &self.root, self, regs, deadline,
             );
         }
-        super::runtime::as_js(ctx, json!(frames))
+        Ok(json!(frames))
     }
 
-    fn inspect<'js>(
+    fn inspect(
         &self,
-        ctx: &Ctx<'js>,
         expression: String,
-        options: Option<&Object<'js>>,
-    ) -> rquickjs::Result<Json> {
-        self.check(ctx)?;
-        let frame = options
-            .map(|options| options.get::<_, Option<Value>>("frame"))
-            .transpose()?
-            .flatten()
-            .map(|frame| super::runtime::frame_handle(ctx, frame))
-            .transpose()?;
-        let (tid, registers) = self.selected(ctx, frame)?;
+        frame: Option<&str>,
+        expand: Option<crate::rpc::InspectExpansion>,
+        deadline: Instant,
+    ) -> Result<Json> {
+        let (tid, registers) = match self.selected(frame) {
+            Ok(selected) => selected,
+            Err(error) => {
+                return Ok(json!({
+                    "status": "invalid_frame", "result": null, "issue": error.to_string(), "code": "NO_FRAME_CONTEXT",
+                }));
+            }
+        };
         let report = inspect_stopped(
-            self.pid,
-            tid,
-            expression,
-            &self.root,
-            self,
-            registers,
-            self.deadline,
-            super::runtime::expansion(options)?,
+            self.pid, tid, expression, &self.root, self, registers, deadline, expand,
         );
-        serde_json::to_value(report)
-            .map_err(|issue| Exception::throw_message(ctx, &issue.to_string()))
+        Ok(serde_json::to_value(report)?)
     }
 
-    fn discover<'js>(
+    fn discover(
         &self,
-        ctx: &Ctx<'js>,
         kind: crate::symbols::inspect::Discovery,
+        frame: Option<&str>,
         pattern: &str,
-        options: rquickjs::function::Opt<Object<'js>>,
-        frame: Option<Value<'js>>,
-    ) -> rquickjs::Result<Value<'js>> {
-        self.check(ctx)?;
-        let frame = frame
-            .map(|frame| super::runtime::frame_handle(ctx, frame))
-            .transpose()?;
-        let (_, registers) = self.selected(ctx, frame)?;
-        let page = super::runtime::page(ctx, options, self.deadline)?;
-        super::runtime::debugger_reply(
-            ctx,
-            crate::symbols::inspect::discover_stopped(
-                &self.root,
-                self,
-                registers,
-                kind,
-                pattern,
-                page,
-                self.deadline,
-            ),
+        page: (usize, usize),
+        deadline: Instant,
+    ) -> Result<Json> {
+        let (_, registers) = self.selected(frame)?;
+        crate::symbols::inspect::discover_stopped(
+            &self.root, self, registers, kind, pattern, page, deadline,
         )
     }
-    fn read_prefix(&self, address: u64, bytes: &mut [u8]) -> usize {
-        // SAFETY: _SC_PAGESIZE takes no pointer or mutable argument.
+
+    fn read_prefix(&self, address: u64, bytes: &mut [u8]) -> Result<usize> {
         trace::read_process_prefix(self.pid, address, bytes, || Instant::now() < self.deadline)
-            .unwrap_or(0)
     }
 
-    fn check(&self, ctx: &Ctx<'_>) -> rquickjs::Result<()> {
+    fn check(&self, deadline: Instant) -> Result<()> {
         if self
             .actions
             .borrow()
             .as_ref()
             .is_none_or(|actions| actions.closed)
         {
-            return Err(Exception::throw_message(ctx, "debug read scope has ended"));
+            return Err(error("debug read scope has ended"));
         }
-        if Instant::now() >= self.deadline {
-            return Err(Exception::throw_message(
-                ctx,
-                "callback pause budget exceeded",
-            ));
+        if Instant::now() >= deadline {
+            return Err(error("callback pause budget exceeded"));
         }
         Ok(())
     }

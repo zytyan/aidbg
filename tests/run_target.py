@@ -157,6 +157,110 @@ if (frame) dbg.printVal("crash_pointer", {{ frame: frame.handle }});
         assert event["watch"]["value_after"] == "0x2a", event
         assert event["watch"]["value_after_decimal"] == "42", event
 
+        entry = tool("run", executable=str(fixture), arguments=["inspect"],
+                     pause_at_entry=True, timeout_ms=20000)
+        run_id = entry["run_id"]
+        prologue, = tool("symbols", run_id=run_id, pattern="inspect_values")["matches"]
+        cli_symbol, = cli("symbols", "--run-id", run_id, "--pattern", "inspect_values")["matches"]
+        assert cli_symbol["runtime_address"] == prologue["runtime_address"], cli_symbol
+        point = tool("breakpoint_set", run_id=run_id, symbol="inspect_values", kind="software",
+                     stop_after_hit=True, timeout_ms=500, rule_source="""
+export default function onHit(hit: BreakpointHit) {
+    hit.emit("locals", hit.locals(), {kind: "json"});
+}
+""")
+        assert point["address"] == prologue["runtime_address"], point
+        callee = tool("breakpoint_set", run_id=run_id, symbol="scope_marker",
+                      stop_after_hit=True, timeout_ms=500)
+        tool("run_continue", run_id=run_id)
+        for _ in range(100):
+            stopped = tool("run_status", run_id=run_id)
+            if stopped["status"] == "paused":
+                break
+            time.sleep(0.025)
+        assert stopped["status"] == "paused", stopped
+        event, = tool("breakpoint_events", breakpoint_id=point["breakpoint_id"])["events"]
+        assert event["resume_status"] == "stopped", event
+        locals_page = event["callback"]["output"][0]["value"]
+        assert locals_page["issue"]["code"] == "PROLOGUE", locals_page
+        shadows = [row for row in locals_page["items"] if row["name"] == "shadow"]
+        assert len(shadows) == 2 and shadows[0]["line"] != shadows[1]["line"], locals_page
+        assert all(not row["readable"] and row["scope_ranges"] for row in shadows), shadows
+
+        address = point["address"]
+        decoded = tool("disassemble", run_id=run_id, address=address, before=0, after=1)
+        assert decoded["instructions"][0]["address"] == address, decoded
+        assert decoded["instructions"][0]["mnemonic"] not in ("int3", "brk"), decoded
+        cli_window = cli("disassemble", "--run-id", run_id, "--address", address,
+                         "--before", "0", "--after", "1")
+        assert cli_window["instructions"] == decoded["instructions"], cli_window
+        expressions = ["head == &samples[0]", "head != nullptr", "&head", "samples"]
+        live = tool("inspect", run_id=run_id, expressions=expressions, expand={"limit": 2})
+        assert live["status"] == "complete" and live["frame"]["pc"] == address, live
+        a, b, holder, array = [row["value"] for row in live["results"]]
+        assert a["result"]["value"] is True and b["result"]["value"] is True, live
+        fields = array["children"]["items"][1]["value"]["children"]["items"]
+        assert fields[0]["expression"] == "samples[1].value", fields
+        assert fields[0]["value"]["result"]["value"] == 42, fields
+        base = holder["result"]["value"]
+        chain = tool("pointer_chain", run_id=run_id, base=base, offsets=[0])
+        assert len(chain["steps"]) == 1, chain
+        live_script = tool("script_run", run_id=run_id, source="""
+export default function main() {
+    return dbg.inspect("head == &samples[0]").result?.value;
+}
+""")
+        assert live_script["return_value"] is True, live_script
+
+        output = work / "held.core.zst"
+        saved = tool("coredump", run_id=run_id, mode="full", output=str(output))
+        assert output.is_file() and saved["dump_id"], saved
+        assert tool("run_status", run_id=run_id)["status"] == "paused"
+        assert tool("inspect", run_id=run_id, expressions=["head"])["frame"]["pc"] == address
+        offline = tool("core_open", dump_id=saved["dump_id"], executable=str(fixture))["target_id"]
+        core_report = tool("inspect", target_id=offline, expressions=expressions, expand={"limit": 2})
+        assert core_report["status"] == "complete" and core_report["frame"]["pc"] == address, core_report
+        assert tool("pointer_chain", target_id=offline, base=base, offsets=[0])["steps"] == chain["steps"]
+        core_script = tool("script_run", target_id=offline, source="""
+export default function main() {
+    return dbg.inspect("head == &samples[0]").result?.value;
+}
+""")
+        assert core_script["return_value"] is True, core_script
+        invalid = tool("script_run", target_id=offline, timeout_ms=10001, source="return 0;")
+        assert invalid["code"] == "INVALID_ARGUMENT", invalid
+        invalid = tool("breakpoint_workflow", run_id=run_id, per_hit_timeout_ms=501,
+                       points=[{"address": address}])
+        assert invalid["code"] == "INVALID_ARGUMENT", invalid
+        live_code = tool("read_memory", run_id=run_id, address=address, length=4)
+        core_code = tool("read_memory", target_id=offline, address=address, length=4)
+        assert live_code["bytes"] == core_code["bytes"], (live_code, core_code)
+        tool("run_continue", run_id=run_id)
+        for _ in range(100):
+            stopped = tool("run_status", run_id=run_id)
+            if stopped["status"] == "paused":
+                break
+            time.sleep(0.025)
+        caller = tool("inspect", run_id=run_id, frame_index=1, expressions=["shadow"])
+        assert caller["frame"]["index"] == 1, caller
+        assert caller["results"][0]["value"]["result"]["value"] == 99, caller
+        tool("run_continue", run_id=run_id)
+        for _ in range(100):
+            finished = tool("run_status", run_id=run_id)
+            if finished["status"] == "finished":
+                break
+            time.sleep(0.025)
+        assert finished["result"]["exit_code"] == 0, finished
+        assert len(tool("breakpoint_events", breakpoint_id=point["breakpoint_id"])["events"]) == 1
+        assert len(tool("breakpoint_events", breakpoint_id=callee["breakpoint_id"])["events"]) == 1
+
+        opened = [offline] + [tool("core_open", dump_id=saved["dump_id"])["target_id"]
+                              for _ in range(15)]
+        limit = tool("core_open", dump_id=saved["dump_id"])
+        assert limit["code"] == "INVALID_ARGUMENT", limit
+        for target in opened:
+            assert tool("core_close", target_id=target)["closed"]
+
         for mode in ("fork", "exec"):
             entry = tool("run", executable=str(fixture), arguments=[mode], pause_at_entry=True)
             run_id = entry["run_id"]
@@ -177,7 +281,8 @@ if (frame) dbg.printVal("crash_pointer", {{ frame: frame.handle }});
         run_id = attached["run_id"]
         assert attached["pid"] > 0 and attached["status"] == "running", attached
         assert tool("run_pause", run_id=run_id)["status"] == "paused"
-        assert tool("snapshot", run_id=run_id, freeze="required")["freeze_achieved"] == "all"
+        snapshot = tool("snapshot", run_id=run_id, freeze="required")
+        assert snapshot.get("freeze_achieved") == "all", snapshot
         assert tool("run_continue", run_id=run_id)["status"] == "running"
         assert tool("run_pause", run_id=run_id)["status"] == "paused"
         assert tool("run_cancel", run_id=run_id)["cancel_requested"]
@@ -190,6 +295,7 @@ if (frame) dbg.printVal("crash_pointer", {{ frame: frame.handle }});
         assert not Path(f"/proc/{attached['pid']}").exists(), cancelled
 
     print("PASS run CLI/MCP, signal core, offline read, environment, stdin, pause, watchpoint and live memory")
+    print("PASS held software and hardware stops, live/core inspection, and open-core limit")
     print("PASS launched scoped software breakpoint cleanup on fork and exec")
 
 

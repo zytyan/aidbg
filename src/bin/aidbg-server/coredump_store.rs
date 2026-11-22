@@ -280,6 +280,7 @@ impl DumpStore {
             .filter(|id| valid_dump_id(id))
             .ok_or_else(|| io::Error::other("could not generate coredump ID"))?;
         let request = aidbg::rpc::CoredumpRequest {
+            run_id: None,
             pid,
             mode: aidbg::rpc::CoreMode::CoreFull as i32,
             ..Default::default()
@@ -374,6 +375,20 @@ impl DumpStore {
 
     pub(super) fn path(&self, id: &str) -> PathBuf {
         self.root.join(id)
+    }
+
+    pub(super) fn existing_capture(
+        &self,
+        id: &str,
+        request: &[u8],
+    ) -> std::result::Result<CoredumpJob, Status> {
+        let entry = self.manifest(id)?;
+        if entry.request != request {
+            return Err(Status::already_exists(
+                "coredump ID belongs to a different capture",
+            ));
+        }
+        entry.job(id).map_err(super::internal)
     }
 
     pub(super) fn reserve(

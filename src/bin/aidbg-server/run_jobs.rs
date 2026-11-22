@@ -195,7 +195,7 @@ impl Job {
                 ("cancelled", None, Some(error.message()))
             }
             Some((_, Err(error))) => ("failed", None, Some(error.message())),
-            None if self.paused.load(Ordering::Relaxed) => ("paused", None, None),
+            None if self.paused.load(Ordering::Acquire) => ("paused", None, None),
             None if state.pid.is_some() => ("running", None, None),
             None => ("starting", None, None),
         };

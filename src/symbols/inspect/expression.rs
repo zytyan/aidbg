@@ -8,6 +8,7 @@ pub(super) enum Number {
     U32(u32),
     I64(i64),
     U64(u64),
+    Pointer(u64),
     F32(f32),
     F64(f64),
     Bool(bool),
@@ -46,7 +47,7 @@ impl Number {
             Self::I32(v) => v.into(),
             Self::U32(v) => v.into(),
             Self::I64(v) => v.into(),
-            Self::U64(v) => v.into(),
+            Self::U64(v) | Self::Pointer(v) => v.into(),
             Self::Bool(v) => i128::from(v),
             _ => return None,
         })
@@ -65,18 +66,19 @@ impl Number {
             Self::I32(_) | Self::Bool(_) => ScalarType::I32,
             Self::U32(_) => ScalarType::U32,
             Self::I64(_) => ScalarType::I64,
-            Self::U64(_) => ScalarType::U64,
+            Self::U64(_) | Self::Pointer(_) => ScalarType::U64,
             Self::F32(_) => ScalarType::F32,
             Self::F64(_) => ScalarType::F64,
         }
     }
 
-    fn datum(self) -> Datum {
+    pub(super) fn datum(self) -> Datum {
         let (name, size, bits, value) = match self {
             Self::I32(v) => ("int", 4, v as u64, json!(v)),
             Self::U32(v) => ("unsigned int", 4, v.into(), json!(v)),
             Self::I64(v) => ("long", 8, v as u64, json!(v)),
             Self::U64(v) => ("unsigned long", 8, v, json!(v)),
+            Self::Pointer(v) => ("void *", 8, v, json!(crate::hex(v))),
             Self::F32(v) => ("float", 4, v.to_bits().into(), json!(v)),
             Self::F64(v) => ("double", 8, v.to_bits(), json!(v)),
             Self::Bool(v) => ("bool", 1, u64::from(v), json!(v)),
@@ -84,7 +86,11 @@ impl Number {
         Datum {
             ty: Type {
                 name: Some(name.into()),
-                kind: "scalar",
+                kind: if matches!(self, Self::Pointer(_)) {
+                    "pointer"
+                } else {
+                    "scalar"
+                },
                 byte_size: size,
                 fields: vec![],
                 element_count: None,
@@ -297,7 +303,7 @@ impl Expression {
                 expect_operand = true;
                 cursor += token.len();
             } else {
-                expect_operand = c == b'!';
+                expect_operand = matches!(c, b'!' | b'&');
                 cursor += 1;
             }
         }
@@ -334,6 +340,17 @@ impl Expression {
                 Box::new(Self::parse_at(text[1..].trim_start(), depth + 1)?),
             ));
         }
+        if let Some(operand) = text.strip_prefix('&') {
+            return match Self::parse_at(operand.trim_start(), depth + 1)? {
+                Self::Variable(name, mut access)
+                    if !matches!(access.last(), Some(Access::Address)) =>
+                {
+                    access.push(Access::Address);
+                    Ok(Self::Variable(name, access))
+                }
+                _ => Err(error("address-of requires a variable or member lvalue")),
+            };
+        }
         let mut parser = Parser::new(text);
         let name = parser.expression(0)?;
         if !parser.rest.trim().is_empty() {
@@ -368,6 +385,10 @@ impl Expression {
                 let v = inner.number(lookup)?;
                 match op {
                     '!' => Ok(Number::Bool(!v.truth())),
+                    '+' if matches!(v, Number::Pointer(_)) => Err(failure(
+                        "invalid_expression",
+                        "unary plus requires a scalar",
+                    )),
                     '+' => v.ty().cast(v),
                     '-' => binary(Op::Sub, Number::I32(0), v),
                     _ => unreachable!(),
@@ -387,6 +408,9 @@ impl Expression {
 }
 
 fn literal(text: &str) -> Option<Number> {
+    if text == "nullptr" {
+        return Some(Number::Pointer(0));
+    }
     if text == "true" || text == "false" {
         return Some(Number::Bool(text == "true"));
     }
@@ -445,6 +469,22 @@ fn compare<T: PartialEq + PartialOrd>(op: Op, a: T, b: T) -> Option<Number> {
 fn binary(op: Op, left: Number, right: Number) -> Result<Number> {
     if matches!(op, Op::And | Op::Or) {
         return Ok(Number::Bool(right.truth()));
+    }
+    if matches!(left, Number::Pointer(_)) || matches!(right, Number::Pointer(_)) {
+        let address = |operand: Number| match operand {
+            Number::Pointer(address) => Some(address),
+            value if value.integer() == Some(0) => Some(0),
+            _ => None,
+        };
+        if let Some((left, right)) = address(left).zip(address(right))
+            && let Some(result) = compare(op, left, right)
+        {
+            return Ok(result);
+        }
+        return Err(failure(
+            "invalid_expression",
+            "pointer operands support comparisons with pointers or zero",
+        ));
     }
     // Enum order implements LP64 usual arithmetic conversions after promotion.
     let ty = left.ty().max(right.ty());

@@ -59,6 +59,7 @@ const RETURN: u8 = 0;
 struct Program {
     scope: Scope,
     budget: Duration,
+    stop_after_hit: bool,
 }
 
 impl Program {
@@ -82,6 +83,7 @@ impl Program {
         Ok(Self {
             scope,
             budget: Duration::from_millis(budget_ms.into()),
+            stop_after_hit: false,
         })
     }
 
@@ -135,9 +137,11 @@ impl Program {
 pub enum Location {
     Address(u64),
     Symbol {
-        module: String,
+        module: Option<String>,
         symbol: String,
         instance: Option<u64>,
+        offset: u64,
+        execution: bool,
     },
     Source {
         file: PathBuf,
@@ -161,7 +165,7 @@ struct PreparedLocation {
 }
 
 impl PreparedLocation {
-    fn resolve(pid: i32, location: Location) -> Result<Self> {
+    fn resolve(pid: i32, location: Location, overrides: &[symbols::OverrideRule]) -> Result<Self> {
         match location {
             Location::Address(address) => Ok(Self {
                 address,
@@ -172,15 +176,26 @@ impl PreparedLocation {
                 module,
                 symbol,
                 instance,
+                offset,
+                execution,
             } => {
                 // Resolve on the caller's thread so file I/O cannot delay pending hits.
                 let procdir = File::open(format!("/proc/{pid}"))?;
                 let root = PathBuf::from(format!("/proc/self/fd/{}", procdir.as_raw_fd()));
                 let start = start_ticks(&root)?;
-                let site = symbols::breakpoint_site(&root, &module, &symbol, instance)?;
+                let (address, site) = symbols::unique_breakpoint_location(
+                    pid,
+                    &root,
+                    module.as_deref(),
+                    &symbol,
+                    instance,
+                    offset,
+                    execution,
+                    overrides,
+                )?;
                 Ok(Self {
-                    address: site.address,
-                    site: Some(site),
+                    address,
+                    site,
                     start: Some(start),
                 })
             }
@@ -431,6 +446,7 @@ pub struct Installed {
     #[serde(skip_serializing_if = "Option::is_none")]
     rule_revision: Option<u64>,
     pub address: String,
+    pub stop_after_hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tid: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -535,7 +551,11 @@ enum Command {
     Script(ScriptCommand),
     Inspect(
         crate::rpc::InspectRequest,
-        mpsc::Sender<Result<symbols::InspectReport>>,
+        mpsc::Sender<Result<serde_json::Value>>,
+    ),
+    Disassemble(
+        crate::rpc::DisassembleRequest,
+        mpsc::Sender<Result<crate::disassembly::Window>>,
     ),
     Install {
         id: u64,
@@ -564,6 +584,10 @@ enum Command {
     List(mpsc::Sender<Vec<Installed>>),
     ReadMemory(
         crate::rpc::ReadMemoryRequest,
+        mpsc::Sender<Result<serde_json::Value>>,
+    ),
+    PointerChain(
+        crate::rpc::PointerChainRequest,
         mpsc::Sender<Result<serde_json::Value>>,
     ),
     Step(
@@ -602,6 +626,17 @@ impl Control {
         result
             .recv()
             .map_err(|_| error("run ended during memory read"))?
+    }
+
+    pub fn pointer_chain(
+        &self,
+        request: crate::rpc::PointerChainRequest,
+    ) -> Result<serde_json::Value> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::PointerChain(request, reply))?;
+        result
+            .recv()
+            .map_err(|_| error("run ended during pointer chain"))?
     }
 
     pub fn step(&self, request: crate::rpc::StepRunRequest) -> Result<serde_json::Value> {
@@ -713,9 +748,12 @@ impl Control {
         kind: Kind,
         tid: Option<i32>,
         callback: Option<CallbackSource>,
+        stop_after_hit: bool,
+        overrides: &[symbols::OverrideRule],
     ) -> Result<Installed> {
-        let program = Program::snapshot(scope, budget_ms)?;
-        let location = PreparedLocation::resolve(pid, location)?;
+        let mut program = Program::snapshot(scope, budget_ms)?;
+        program.stop_after_hit = stop_after_hit;
+        let location = PreparedLocation::resolve(pid, location, overrides)?;
         let (reply, result) = mpsc::channel();
         self.send(Command::Install {
             id,
@@ -770,12 +808,23 @@ impl Control {
             .map_err(|_| error("breakpoint session ended during removal"))?
     }
 
-    pub fn inspect(&self, request: crate::rpc::InspectRequest) -> Result<symbols::InspectReport> {
+    pub fn inspect(&self, request: crate::rpc::InspectRequest) -> Result<serde_json::Value> {
         let (reply, result) = mpsc::channel();
         self.send(Command::Inspect(request, reply))?;
         result
             .recv()
             .map_err(|_| error("debugger session ended during inspection"))?
+    }
+
+    pub fn disassemble(
+        &self,
+        request: crate::rpc::DisassembleRequest,
+    ) -> Result<crate::disassembly::Window> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Disassemble(request, reply))?;
+        result
+            .recv()
+            .map_err(|_| error("debugger session ended during disassembly"))?
     }
 
     fn send(&self, command: Command) -> Result<()> {
@@ -801,6 +850,9 @@ pub(crate) struct Session<'a> {
     start: u64,
     pub(crate) trace: Trace,
     pub(crate) paused: bool,
+    held_tid: Option<i32>,
+    pause_state: Option<Arc<AtomicBool>>,
+    pending_breakpoint: bool,
     launched: bool,
     hardware: BTreeMap<u64, Rule>,
     software: BTreeMap<u64, Rule>,
@@ -856,6 +908,9 @@ impl<'a> Session<'a> {
             start,
             trace,
             paused: false,
+            held_tid: None,
+            pause_state: None,
+            pending_breakpoint: false,
             launched,
             hardware: BTreeMap::new(),
             software: BTreeMap::new(),
@@ -1026,7 +1081,18 @@ impl<'a> Session<'a> {
                 let _ = reply.send(points);
             }
             Command::ReadMemory(request, reply) => {
-                let _ = reply.send(crate::script::read_live(self.pid, &request));
+                let _ = reply.send(crate::script::read_range(&request, |address, buffer| {
+                    self.trace.read_code_prefix(address, buffer)
+                }));
+            }
+            Command::PointerChain(request, reply) => {
+                let _ = reply.send(crate::script::pointer_chain_with(
+                    request.base,
+                    request.offsets,
+                    Vec::new(),
+                    |address, buffer| self.trace.read_code_prefix(address, buffer),
+                    crate::script::live_missing_memory,
+                ));
             }
             Command::Step(request, reply) => {
                 let _ = reply.send(self.step(request));
@@ -1054,16 +1120,24 @@ impl<'a> Session<'a> {
                 let _ = reply.send(self.remove(id));
             }
             Command::Inspect(request, reply) => {
-                let result = symbols::inspect_with_trace(
+                let tid = request.tid.or(self.held_tid);
+                let result = symbols::inspect::inspect_request_with_trace(
                     self.pid,
-                    request.tid,
-                    request.expression,
-                    request.module.as_deref(),
-                    request.instance,
-                    request.timeout_ms,
-                    request.expand,
+                    tid,
+                    request,
                     self.root,
                     &mut self.trace,
+                );
+                let _ = reply.send(result);
+            }
+            Command::Disassemble(request, reply) => {
+                let result = crate::disassembly::disassemble_with(
+                    self.pid,
+                    request.address,
+                    request.before.unwrap_or(4),
+                    request.after.unwrap_or(8),
+                    request.start,
+                    |address, buffer| self.trace.read_code_prefix(address, buffer),
                 );
                 let _ = reply.send(result);
             }
@@ -1071,6 +1145,8 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn reset_address_space(&mut self) -> Result<()> {
+        self.pending_breakpoint = false;
+        self.held_tid = None;
         self.trace.clear_patches();
         self.hardware.clear();
         self.software.clear();
@@ -1094,7 +1170,27 @@ impl<'a> Session<'a> {
             }
         }
         self.trace.foreign_software = false;
+        self.pending_breakpoint = false;
         Ok(())
+    }
+
+    pub(crate) fn track_pause_state(&mut self, paused: Arc<AtomicBool>) {
+        self.pause_state = Some(paused);
+    }
+
+    pub(crate) fn set_paused(&mut self, value: bool) {
+        self.paused = value;
+        if !value {
+            self.held_tid = None;
+        }
+        if let Some(paused) = &self.pause_state {
+            paused.store(value, Ordering::Release);
+        }
+    }
+
+    fn hold_at(&mut self, tid: i32) {
+        self.held_tid = Some(tid);
+        self.set_paused(true);
     }
 
     pub(crate) fn empty(&self) -> bool {
@@ -1143,70 +1239,86 @@ impl<'a> Session<'a> {
         options: crate::coredump::CaptureOptions,
         directory: &Path,
     ) -> Result<crate::coredump::Dump> {
+        if self.paused {
+            return self.capture_stopped_core(mode, options, directory);
+        }
         let mut result = None;
         self.control(|session| {
-            let mut points = Vec::new();
-            let mut sources = BTreeMap::new();
-            for rule in session.hardware.values().chain(session.software.values()) {
-                let mut point = symbols::resolve(session.pid, rule.address, &[])?.replay_location();
-                let callback = session.callbacks.get(&rule.id);
-                if let Some(callback) = callback
-                    && let Some((source, export)) = callback.replay_source()
-                {
-                    let (id, revision) = callback.version().expect("registered source");
-                    let key = format!("{id}-{revision}");
-                    sources.insert(key.clone(), source);
-                    point["source"] = key.into();
-                    point["export"] = serde_json::json!(export);
-                } else if let Some(live) = session.live_sources.get(&rule.id) {
-                    let key = format!("live-{}", live.key);
-                    sources.insert(key.clone(), &live.source);
-                    point["source"] = key.into();
-                    point["live"] = serde_json::json!({
-                        "ordinal": live.ordinal,
-                        "requested_address": hex(live.requested_address),
-                    });
-                }
-                point["breakpoint_id"] = rule.id.into();
-                point["address"] = hex(rule.address).into();
-                point["kind"] = rule.kind.name().into();
-                point["scope"] = rule.program.scope.name().into();
-                point["timeout_ms"] = (rule.program.budget.as_millis() as u64).into();
-                if let Kind::Watch { length, .. } = rule.kind {
-                    point["length"] = length.into();
-                }
-                if let Some((tid, _)) = rule.thread {
-                    point["thread"] = if tid == session.pid {
-                        "leader"
-                    } else {
-                        "specific"
-                    }
-                    .into();
-                }
-                points.push(point);
-            }
-            let replay = serde_json::json!({"breakpoints": points, "rules": sources});
-            if serde_json::to_vec(&replay)?.len() > 1024 * 1024 {
-                return Err(error("breakpoint replay metadata exceeds 1 MiB"));
-            }
-            let pid = session.pid;
-            let dump = session.trace.with_unpatched(|trace| {
-                crate::coredump::prepare_with_trace(
-                    pid,
-                    mode,
-                    options,
-                    directory,
-                    &|| false,
-                    || {},
-                    Some((trace, None)),
-                )
-            });
-            let mut dump = dump?;
-            dump.summary.breakpoint_replay = Some(replay);
-            result = Some(dump);
+            result = Some(session.capture_stopped_core(mode, options, directory)?);
             Ok(())
         })?;
         Ok(result.expect("coredump ran at a safe stop"))
+    }
+
+    fn capture_stopped_core(
+        &mut self,
+        mode: crate::rpc::CoreMode,
+        options: crate::coredump::CaptureOptions,
+        directory: &Path,
+    ) -> Result<crate::coredump::Dump> {
+        let session = self;
+        let mut points = Vec::new();
+        let mut sources = BTreeMap::new();
+        for rule in session.hardware.values().chain(session.software.values()) {
+            let mut point = symbols::resolve(session.pid, rule.address, &[])?.replay_location();
+            let callback = session.callbacks.get(&rule.id);
+            if let Some(callback) = callback
+                && let Some((source, export)) = callback.replay_source()
+            {
+                let (id, revision) = callback.version().expect("registered source");
+                let key = format!("{id}-{revision}");
+                sources.insert(key.clone(), source);
+                point["source"] = key.into();
+                point["export"] = serde_json::json!(export);
+            } else if let Some(live) = session.live_sources.get(&rule.id) {
+                let key = format!("live-{}", live.key);
+                sources.insert(key.clone(), &live.source);
+                point["source"] = key.into();
+                point["live"] = serde_json::json!({
+                    "ordinal": live.ordinal,
+                    "requested_address": hex(live.requested_address),
+                });
+            }
+            point["breakpoint_id"] = rule.id.into();
+            point["address"] = hex(rule.address).into();
+            point["kind"] = rule.kind.name().into();
+            point["scope"] = rule.program.scope.name().into();
+            point["timeout_ms"] = (rule.program.budget.as_millis() as u64).into();
+            if rule.program.stop_after_hit {
+                point["stop_after_hit"] = true.into();
+            }
+            if let Kind::Watch { length, .. } = rule.kind {
+                point["length"] = length.into();
+            }
+            if let Some((tid, _)) = rule.thread {
+                point["thread"] = if tid == session.pid {
+                    "leader"
+                } else {
+                    "specific"
+                }
+                .into();
+            }
+            points.push(point);
+        }
+        let replay = serde_json::json!({"breakpoints": points, "rules": sources});
+        if serde_json::to_vec(&replay)?.len() > 1024 * 1024 {
+            return Err(error("breakpoint replay metadata exceeds 1 MiB"));
+        }
+        let pid = session.pid;
+        let dump = session.trace.with_unpatched(|trace| {
+            crate::coredump::prepare_with_trace(
+                pid,
+                mode,
+                options,
+                directory,
+                &|| false,
+                || {},
+                Some((trace, None)),
+            )
+        });
+        let mut dump = dump?;
+        dump.summary.breakpoint_replay = Some(replay);
+        Ok(dump)
     }
 
     fn shared_engine(&mut self) -> Result<Rc<Engine>> {
@@ -1239,7 +1351,7 @@ impl<'a> Session<'a> {
         let mut breakpoint_ids = Vec::new();
         let mut evaluation = None;
         let mut output = Vec::new();
-        let setup = self.control(|session| {
+        let mut setup = |session: &mut Self| {
             if replaying
                 && (!session.paused
                     || replay_count != replay_points.len()
@@ -1257,6 +1369,7 @@ impl<'a> Session<'a> {
                 pid: session.pid,
                 root: session.root.to_path_buf(),
                 tids: session.trace.threads.keys().copied().collect(),
+                focus: session.held_tid,
             };
             let result = live::evaluate(
                 &realm,
@@ -1294,8 +1407,11 @@ impl<'a> Session<'a> {
                     } else {
                         (Location::Address(requested_address), request.tid)
                     };
+                    if session.pending_breakpoint {
+                        session.control(|_| Ok(()))?;
+                    }
                     let id = ids.fetch_add(1, Ordering::Relaxed) + 1;
-                    let location = PreparedLocation::resolve(session.pid, location)?;
+                    let location = PreparedLocation::resolve(session.pid, location, &[])?;
                     let program = Program::snapshot(Scope::Thread, request.timeout_ms)?;
                     let callback = request.handler.map(|handler| {
                         AttachedCallback::inline(Callback::new(
@@ -1346,7 +1462,12 @@ impl<'a> Session<'a> {
                     Err(issue)
                 }
             }
-        });
+        };
+        let setup = if self.paused && self.pending_breakpoint {
+            setup(self)
+        } else {
+            self.control(setup)
+        };
         let result = match setup.map(|()| evaluation.expect("live script ran")) {
             Ok(live::Evaluation::Continue(waiting)) => {
                 self.live_script = Some(LiveScript {
@@ -1500,6 +1621,7 @@ impl<'a> Session<'a> {
             kind: rule.kind.name(),
             breakpoint_id: rule.id,
             address: hex(rule.address),
+            stop_after_hit: rule.program.stop_after_hit,
             tid: rule.thread.map(|(tid, _)| tid),
             callback: limits,
             rule_id: version.map(|(id, _)| id),
@@ -1532,7 +1654,7 @@ impl<'a> Session<'a> {
             let replacement = session.attach(id, source, &rule.program, sender)?;
             if rule.address != old.address {
                 let location =
-                    PreparedLocation::resolve(session.pid, Location::Address(rule.address))?;
+                    PreparedLocation::resolve(session.pid, Location::Address(rule.address), &[])?;
                 session.place_stopped(rule, &location, Some(old.address))?;
             }
             let previous = session
@@ -1801,11 +1923,18 @@ impl<'a> Session<'a> {
         self.trace.rewind_software_stops()?;
         let mut hits = self.hits()?;
         self.observe_writes(&mut hits);
-        let mut captured = self.capture_hits(hits, frozen.is_ok());
+        let mut captured = if std::mem::take(&mut self.pending_breakpoint) {
+            Vec::new()
+        } else {
+            self.capture_hits(hits, frozen.is_ok())
+        };
         let stepping = self
             .complete_hardware_hits(frozen.is_ok(), &mut captured)
             .and_then(|()| self.step_software_stops(frozen.is_ok(), &mut captured));
         let stepping = stepping.and_then(|()| self.consume_hardware_stops());
+        let hold = captured
+            .iter()
+            .find_map(|(hit, _)| hit.rule.program.stop_after_hit.then_some(hit.tid));
         let mut result = Ok(());
         let resume = stepping.and_then(|()| {
             result = frozen.and_then(|()| {
@@ -1817,13 +1946,20 @@ impl<'a> Session<'a> {
             if self.runtime_poisoned() && result.is_err() {
                 return Err(error("could not disarm a failed live script runtime"));
             }
+            if let Some(tid) = hold {
+                self.hold_at(tid);
+            }
             if self.launched {
                 Ok(())
             } else {
                 self.resume_stopped()
             }
         });
-        self.finish_hits(captured, resume.as_ref().err().map(|error| error.as_ref()));
+        self.finish_hits(
+            captured,
+            resume.as_ref().err().map(|error| error.as_ref()),
+            hold.is_some() && resume.is_ok(),
+        );
         if let Err(e) = resume {
             self.close_breakpoints();
             return Err(e);
@@ -2252,6 +2388,7 @@ impl<'a> Session<'a> {
         &mut self,
         captured: Vec<CapturedHit>,
         resume: Option<&(dyn std::error::Error + Send + Sync)>,
+        held: bool,
     ) {
         for (hit, mut outcome) in captured {
             let pause_ms = hit.observed.elapsed().as_millis() as u64;
@@ -2259,7 +2396,7 @@ impl<'a> Session<'a> {
                 snapshot.snapshot.trace_window_ms = Some(pause_ms);
                 snapshot.snapshot.status
             } else if let Some(callback) = &outcome.callback {
-                if callback.suppressed && resume.is_none() {
+                if callback.suppressed && resume.is_none() && !held {
                     continue;
                 }
                 callback.status
@@ -2284,7 +2421,9 @@ impl<'a> Session<'a> {
                 observed_unix_ms: hit.unix_ms,
                 pause_ms,
                 capture_status,
-                resume_status: if resume.is_none() {
+                resume_status: if held {
+                    "stopped"
+                } else if resume.is_none() {
                     "resumed"
                 } else {
                     "failed"
@@ -2336,11 +2475,12 @@ impl<'a> Session<'a> {
             .any(|hit| matches!(hit.rule.program.scope, Scope::Process))
             .then(|| initial.iter().map(|hit| self.hit_deadline(hit)).min())
             .flatten();
-        let deadline = if needs_software_freeze {
-            Some(Instant::now() + CONTROL_BUDGET)
-        } else {
-            capture_deadline
-        };
+        let deadline =
+            if needs_software_freeze || initial.iter().any(|hit| hit.rule.program.stop_after_hit) {
+                Some(Instant::now() + CONTROL_BUDGET)
+            } else {
+                capture_deadline
+            };
         let frozen = deadline.is_some_and(|limit| self.trace.freeze(limit).is_ok());
         if self.trace.exec_observed() || self.trace.foreign_software {
             return Err(error("target address space changed"));
@@ -2352,7 +2492,29 @@ impl<'a> Session<'a> {
             initial
         };
         self.observe_writes(&mut hits);
-        let mut captured = self.capture_hits(hits, frozen);
+        let mut captured = if std::mem::take(&mut self.pending_breakpoint) {
+            Vec::new()
+        } else {
+            self.capture_hits(hits, frozen)
+        };
+        let hold = captured
+            .iter()
+            .find_map(|(hit, _)| hit.rule.program.stop_after_hit.then_some(hit.tid));
+        // AArch64 watchpoints need a single-step to finish their before/after observation.
+        let watch_needs_step = cfg!(target_arch = "aarch64")
+            && captured
+                .iter()
+                .any(|(hit, _)| matches!(hit.rule.kind, Kind::Watch { .. }));
+        if let Some(tid) = hold.filter(|_| !watch_needs_step) {
+            if !frozen {
+                self.trace.freeze(Instant::now() + CONTROL_BUDGET)?;
+                self.trace.rewind_software_stops()?;
+            }
+            self.hold_at(tid);
+            self.pending_breakpoint = true;
+            self.finish_hits(captured, None, true);
+            return Ok(());
+        }
         let resume = self
             .complete_hardware_hits(frozen, &mut captured)
             .and_then(|()| self.step_software_stops(frozen, &mut captured))
@@ -2372,9 +2534,19 @@ impl<'a> Session<'a> {
                     }
                     self.discard_poisoned_runtime()?;
                 }
-                self.resume_stopped()
+                if let Some(tid) = hold {
+                    self.hold_at(tid);
+                    self.consume_hardware_stops()
+                } else {
+                    self.held_tid = None;
+                    self.resume_stopped()
+                }
             });
-        self.finish_hits(captured, resume.as_ref().err().map(|error| error.as_ref()));
+        self.finish_hits(
+            captured,
+            resume.as_ref().err().map(|error| error.as_ref()),
+            hold.is_some() && resume.is_ok(),
+        );
         resume
     }
 

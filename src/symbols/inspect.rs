@@ -10,7 +10,9 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+mod cache;
 mod expression;
+pub(crate) use cache::warm as warm_dwarf;
 pub(crate) mod offline;
 use expression::Number;
 
@@ -49,6 +51,7 @@ fn memory_failure(
 
 #[derive(Debug)]
 enum Access {
+    Address,
     Deref,
     Member(String),
     Index(u64),
@@ -84,32 +87,41 @@ pub(crate) fn discover_stopped(
         .into_iter()
         .find(|module| module.executable_at(pc).is_some())
         .ok_or_else(no_dwarf)?;
-    let bytes = module.read_image(root, exe.as_ref(), IMAGE_LIMIT)?;
-    let image = object::File::parse(&*bytes)?;
+    let cached = cache::live_image(root, &module, exe.as_ref())?;
+    let image = object::File::parse(cached.bytes.as_slice())?;
     let layout = Layout::new(&image, &module)?;
     let (instance, link) = module
         .executable_at(pc)
         .and_then(|mapping| layout.for_address(mapping, pc))
         .ok_or_else(no_dwarf)?;
-    let debug = DebugFile::discover(root, &module, &image);
-    let source = debug
-        .as_ref()
-        .and_then(DebugFile::parse)
-        .filter(|file| file.section_by_name(".debug_info").is_some());
     let bias = u64::try_from(instance.bias)?;
-    let dwarf = offline::DwarfImage::load(source.as_ref().unwrap_or(&image), bias, module.path())?
-        .ok_or_else(no_dwarf)?;
+    let dwarf = offline::DwarfImage {
+        bias,
+        path: module.path(),
+        data: cached
+            .separate
+            .as_ref()
+            .or(cached.primary.as_ref())
+            .cloned()
+            .ok_or_else(no_dwarf)?,
+    };
     let (offset, limit) = page;
     let result = match kind {
         Discovery::Locals | Discovery::Parameters => {
             let cfa = crate::unwind::canonical_frame_address(
-                bytes, &module, link, bias, memory, registers,
+                cached.bytes.clone(),
+                &module,
+                link,
+                bias,
+                memory,
+                registers,
             )
             .ok();
             let frame = crate::unwind::OfflineFrame {
                 pc,
                 regs: registers,
                 link: Some(link),
+                lookup_pc: pc,
                 cfa,
             };
             if matches!(kind, Discovery::Parameters) {
@@ -496,11 +508,11 @@ impl<'a> Eval<'a, '_> {
         ))
     }
 
-    fn evaluate(
+    fn evaluate_pieces(
         &self,
         expr: Expression<Reader<'a>>,
         frame_base: Option<u64>,
-    ) -> Result<Location<Reader<'a>>> {
+    ) -> Result<Vec<gimli::Piece<Reader<'a>>>> {
         let mut evaluation = expr.evaluation(self.unit.encoding());
         evaluation.set_max_iterations(256);
         let mut state = evaluation.evaluate()?;
@@ -566,13 +578,63 @@ impl<'a> Eval<'a, '_> {
                 }
             };
         }
-        match evaluation.result().as_slice() {
-            [piece] if piece.size_in_bits.is_none() && piece.bit_offset.is_none() => {
-                Ok(piece.location)
+        Ok(evaluation.result())
+    }
+
+    fn locate(&self, expr: Expression<Reader<'a>>, frame_base: Option<u64>) -> Result<Place> {
+        let pieces = self.evaluate_pieces(expr, frame_base)?;
+        if let [piece] = pieces.as_slice()
+            && piece.size_in_bits.is_none()
+            && piece.bit_offset.is_none()
+        {
+            return self.place(piece.location);
+        }
+        let mut bytes = Vec::new();
+        for piece in pieces {
+            let size = piece
+                .size_in_bits
+                .filter(|size| size.is_multiple_of(8))
+                .and_then(|size| usize::try_from(size / 8).ok())
+                .filter(|size| *size <= MAX_VALUE - bytes.len())
+                .ok_or_else(|| {
+                    failure(
+                        "unsupported",
+                        "DWARF piece is not byte-aligned or exceeds the value budget",
+                    )
+                })?;
+            let offset = piece.bit_offset.unwrap_or_default();
+            if !offset.is_multiple_of(8) {
+                return Err(failure(
+                    "unsupported",
+                    "DWARF piece offset is not byte-aligned",
+                ));
             }
+            if size != 0 {
+                let place = self.place(piece.location)?.advance(offset / 8)?;
+                bytes.extend_from_slice(&self.bytes(&place, size)?);
+            }
+        }
+        Ok(Place::Bytes(bytes))
+    }
+
+    fn place(&self, location: Location<Reader<'a>>) -> Result<Place> {
+        match location {
+            Location::Address { address } => Ok(Place::Address(address)),
+            Location::Register { register } => Ok(Place::Bytes(
+                self.regs
+                    .get(register)
+                    .map_err(|e| failure("unavailable_at_pc", e))?
+                    .to_le_bytes()
+                    .to_vec(),
+            )),
+            Location::Value { value } => {
+                Ok(Place::Bytes(value.to_u64(u64::MAX)?.to_le_bytes().to_vec()))
+            }
+            Location::Bytes { value } => Ok(Place::Bytes(value.to_vec())),
+            Location::Empty => Err(failure("optimized_out", "empty DWARF location")),
             _ => Err(failure(
                 "unsupported",
-                "DWARF location uses multiple pieces or bit offsets",
+                "unsupported DWARF variable location",
             )),
         }
     }
@@ -1203,6 +1265,44 @@ fn string_preview<'a>(
     }))
 }
 
+fn frame_relative_location<'a>(eval: &Eval<'a, '_>, entry: &Die<'a>) -> bool {
+    let Ok(Some(attribute)) = resolved_attr(eval.unit, entry, gimli::DW_AT_location, 0) else {
+        return false;
+    };
+    let Ok(expression) = eval.location(attribute) else {
+        return false;
+    };
+    let mut operations = expression.operations(eval.unit.encoding());
+    while let Ok(Some(op)) = operations.next() {
+        match op {
+            gimli::Operation::FrameOffset { .. } | gimli::Operation::CallFrameCFA => return true,
+            gimli::Operation::RegisterOffset { register, .. }
+                if register == regs::SP || register == regs::FP =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn evaluate_candidate<'a>(
+    eval: &Eval<'a, '_>,
+    candidate: &Candidate<'a>,
+    operations: &[Access],
+    module: PathBuf,
+) -> Result<Datum> {
+    let entry = eval.unit.entry(candidate.offset)?;
+    if candidate.prologue && frame_relative_location(eval, &entry) {
+        return Err(failure(
+            "unavailable_at_pc",
+            "Frame-relative storage may be uninitialized at function entry",
+        ));
+    }
+    evaluate_variable(eval, &entry, candidate.frame_base, operations, module)
+}
+
 fn evaluate_variable<'a>(
     eval: &Eval<'a, '_>,
     entry: &Die<'a>,
@@ -1213,34 +1313,12 @@ fn evaluate_variable<'a>(
     let ty = typedef_target(eval.unit, entry)?;
     let place = if let Some(attr) = resolved_attr(eval.unit, entry, gimli::DW_AT_location, 0)? {
         let frame_base = frame_base.and_then(|attr| {
-            match eval.evaluate(eval.location(attr).ok()?, None).ok()? {
-                Location::Address { address } => Some(address),
-                Location::Register { register } => eval.regs.get(register).ok(),
-                Location::Value { value } => value.to_u64(u64::MAX).ok(),
-                _ => None,
+            match eval.locate(eval.location(attr).ok()?, None).ok()? {
+                Place::Address(address) => Some(address),
+                Place::Bytes(bytes) => word(&bytes).ok(),
             }
         });
-        match eval.evaluate(eval.location(attr)?, frame_base)? {
-            Location::Address { address } => Place::Address(address),
-            Location::Register { register } => Place::Bytes(
-                eval.regs
-                    .get(register)
-                    .map_err(|e| failure("unavailable_at_pc", e))?
-                    .to_le_bytes()
-                    .to_vec(),
-            ),
-            Location::Value { value } => {
-                Place::Bytes(value.to_u64(u64::MAX)?.to_le_bytes().to_vec())
-            }
-            Location::Bytes { value } => Place::Bytes(value.to_vec()),
-            Location::Empty => return Err(failure("optimized_out", "empty DWARF location")),
-            _ => {
-                return Err(failure(
-                    "unsupported",
-                    "unsupported DWARF variable location",
-                ));
-            }
-        }
+        eval.locate(eval.location(attr)?, frame_base)?
     } else if let Some(attr) = resolved_attr(eval.unit, entry, gimli::DW_AT_const_value, 0)? {
         match attr {
             AttributeValue::Block(value) => Place::Bytes(value.to_vec()),
@@ -1258,8 +1336,40 @@ fn evaluate_variable<'a>(
             "DWARF variable has no materialized location or constant",
         ));
     };
+    let address_of = matches!(operations.last(), Some(Access::Address));
+    let operations = if address_of {
+        &operations[..operations.len() - 1]
+    } else {
+        operations
+    };
+    let ty_entry = underlying(eval.unit, ty)?;
+    let (ty, place) = if matches!(
+        ty_entry.tag(),
+        gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type
+    ) {
+        (
+            typedef_target(eval.unit, &ty_entry)?,
+            Place::Address(pointer(eval, &place, &ty_entry)?),
+        )
+    } else {
+        (ty, place)
+    };
     let (ty, place) = access(eval, ty, place, operations)?;
     let entry = underlying(eval.unit, ty)?;
+    if address_of {
+        let Place::Address(address) = place else {
+            return Err(failure(
+                "address_unavailable",
+                "the lvalue has no memory address at this PC",
+            ));
+        };
+        let mut result = Number::Pointer(address).datum();
+        if let Some(name) = name(eval.dwarf, eval.unit, &entry)? {
+            result.ty.name = Some(format!("{name} *"));
+        }
+        result.module = Some(module);
+        return Ok(result);
+    }
     let size = type_size(eval.unit, &entry, 0)?;
     let composite = matches!(
         entry.tag(),
@@ -1280,13 +1390,17 @@ fn evaluate_variable<'a>(
         _ => "other",
     };
     let encoding = entry.attr_value(gimli::DW_AT_encoding);
-    let number = Number::dwarf(
-        &bytes,
-        match encoding.as_ref() {
-            Some(AttributeValue::Encoding(encoding)) => Some(*encoding),
-            _ => None,
-        },
-    );
+    let number = if kind == "pointer" {
+        Some(Number::Pointer(word(&bytes)?))
+    } else {
+        Number::dwarf(
+            &bytes,
+            match encoding.as_ref() {
+                Some(AttributeValue::Encoding(encoding)) => Some(*encoding),
+                _ => None,
+            },
+        )
+    };
     let value = match (kind, encoding, bytes.len()) {
         ("pointer", _, _) => serde_json::json!(hex(word(&bytes)?)),
         (
@@ -1350,6 +1464,9 @@ struct Scope<'a> {
     active: bool,
     namespace: String,
     frame_base: Option<Attr<'a>>,
+    frame_contains_pc: bool,
+    ranges: std::sync::Arc<[gimli::Range]>,
+    prologue: bool,
 }
 
 #[derive(Clone)]
@@ -1357,6 +1474,9 @@ struct Candidate<'a> {
     offset: Offset,
     priority: usize,
     concrete: bool,
+    active: bool,
+    ranges: std::sync::Arc<[gimli::Range]>,
+    prologue: bool,
     frame_base: Option<Attr<'a>>,
 }
 
@@ -1405,28 +1525,61 @@ fn inline_origin_variable<'a>(
 
 type VariableVisitor<'a, 'v> = dyn FnMut(&str, bool, gimli::DwTag, &Candidate<'a>) -> bool + 'v;
 
+struct ScanBudget {
+    scanned: usize,
+    limit: usize,
+    deadline: Option<Instant>,
+}
+
+impl ScanBudget {
+    fn foreground(deadline: Instant) -> Self {
+        Self {
+            scanned: 0,
+            limit: MAX_DIES,
+            deadline: Some(deadline),
+        }
+    }
+
+    fn entry(&mut self) -> Result<()> {
+        self.scanned += 1;
+        if self.scanned > self.limit
+            || (self.scanned.is_multiple_of(128)
+                && self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline))
+        {
+            return Err(failure(
+                "limit_reached",
+                "DWARF variable lookup exceeded its capture budget",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn find_variable<'a>(
     dwarf: &Dwarf<Reader<'a>>,
     unit: &Unit<Reader<'a>>,
     target: &str,
     link_pc: Option<u64>,
-    scanned: &mut usize,
-    deadline: Instant,
+    budget: &mut ScanBudget,
     mut shadow: Option<&mut bool>,
     mut visit: Option<&mut VariableVisitor<'a, '_>>,
+    all_locals: bool,
+    function: Option<Offset>,
 ) -> Result<Option<Candidate<'a>>> {
-    let mut entries = unit.entries();
+    let mut entries = match function {
+        Some(offset) => unit.entries_at_offset(offset)?,
+        None => unit.entries(),
+    };
     let mut scopes: Vec<Scope<'a>> = Vec::new();
     let mut declarations = BTreeMap::new();
     let mut best: Option<Candidate<'a>> = None;
     let mut ambiguous = false;
     while let Some(entry) = entries.next_dfs()? {
-        *scanned += 1;
-        if *scanned > MAX_DIES || ((*scanned).is_multiple_of(128) && Instant::now() >= deadline) {
-            return Err(failure(
-                "limit_reached",
-                "DWARF variable lookup exceeded its capture budget",
-            ));
+        budget.entry()?;
+        if function.is_some_and(|offset| entry.depth() <= 0 && entry.offset() != offset) {
+            break;
         }
         let depth = usize::try_from(entry.depth())?;
         if depth > 96 {
@@ -1447,17 +1600,28 @@ fn find_variable<'a>(
                 | gimli::DW_TAG_inlined_subroutine
                 | gimli::DW_TAG_lexical_block
         ) {
-            if scope.active {
-                let mut all = dwarf.die_ranges(unit, entry)?;
-                let mut has_ranges = false;
-                let mut contains = false;
-                while let Some(range) = all.next()? {
-                    has_ranges = true;
-                    contains |= link_pc.is_some_and(|pc| (range.begin..range.end).contains(&pc));
+            let mut ranges = dwarf.die_ranges(unit, entry)?;
+            let mut bounds = Vec::new();
+            let mut contains = false;
+            let mut has_ranges = false;
+            let mut at_entry = false;
+            while let Some(range) = ranges.next()? {
+                has_ranges = true;
+                contains |= link_pc.is_some_and(|pc| (range.begin..range.end).contains(&pc));
+                at_entry |= link_pc == Some(range.begin);
+                if all_locals {
+                    bounds.push(range);
                 }
-                if has_ranges || tag != gimli::DW_TAG_lexical_block {
-                    scope.active = contains;
-                }
+            }
+            if tag == gimli::DW_TAG_subprogram {
+                scope.frame_contains_pc = scope.active && contains;
+                scope.prologue = at_entry;
+            }
+            if has_ranges || tag != gimli::DW_TAG_lexical_block {
+                scope.active &= contains;
+            }
+            if !bounds.is_empty() {
+                scope.ranges = bounds.into();
             }
             scope.local = true;
             scope.frame_base = entry
@@ -1475,6 +1639,9 @@ fn find_variable<'a>(
                         offset,
                         priority: depth + 2,
                         concrete: false,
+                        active: true,
+                        ranges: scope.ranges.clone(),
+                        prologue: scope.prologue,
                         frame_base: scope.frame_base,
                     },
                 );
@@ -1497,7 +1664,7 @@ fn find_variable<'a>(
         {
             *shadow = true;
         }
-        if scope.active
+        if (scope.active || (all_locals && scope.frame_contains_pc))
             && matches!(tag, gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter)
             && let Some(name) = name(dwarf, unit, entry)?
         {
@@ -1516,6 +1683,9 @@ fn find_variable<'a>(
                     offset: entry.offset(),
                     priority,
                     concrete: true,
+                    active: scope.active,
+                    ranges: scope.ranges.clone(),
+                    prologue: scope.prologue,
                     frame_base: scope.frame_base,
                 };
                 if let Some(visit) = visit.as_mut() {
@@ -1560,7 +1730,6 @@ struct Query<'a> {
     memory: &'a dyn crate::unwind::UnwindMemory,
     registers: Registers,
     deadline: Instant,
-    scanned: usize,
 }
 
 struct MatchValue {
@@ -1592,82 +1761,35 @@ fn load_sections<'a, T>(
 impl Query<'_> {
     fn read_image(
         &mut self,
-        obj: &object::File<'_>,
+        data: &cache::Data,
         module: &Module,
         instance: modules::Instance,
         link_pc: Option<u64>,
         cfa: Option<u64>,
     ) -> Result<Option<MatchValue>> {
-        if obj.section_by_name(".debug_info").is_none() {
-            return Ok(None);
-        }
-        let sections = load_sections(obj, |section| section)?;
-        let dwarf = sections.borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
-        let mut units = dwarf.units();
-        let mut best: Option<MatchValue> = None;
-        while let Some(header) = units.next()? {
-            if Instant::now() >= self.deadline {
-                return Err(failure(
-                    "limit_reached",
-                    "DWARF variable lookup exceeded its capture budget",
-                ));
-            }
-            let unit = dwarf.unit(header)?;
-            let Some(candidate) = find_variable(
+        let dwarf = data.borrow();
+        Ok(data
+            .lookup(
                 &dwarf,
-                &unit,
                 self.target,
                 link_pc,
-                &mut self.scanned,
+                None,
                 self.deadline,
-                None,
-                None,
+                |dwarf, unit, candidate| {
+                    let eval = Eval {
+                        dwarf,
+                        unit,
+                        memory: self.memory,
+                        regs: self.registers,
+                        link_pc,
+                        cfa,
+                        bias: instance.bias,
+                        preview_deadline: Some(self.deadline),
+                    };
+                    evaluate_candidate(&eval, &candidate, self.operations, module.path())
+                },
             )?
-            else {
-                continue;
-            };
-            if best
-                .as_ref()
-                .is_some_and(|old| old.priority >= candidate.priority)
-            {
-                if best
-                    .as_ref()
-                    .is_some_and(|old| old.priority == candidate.priority)
-                {
-                    best = Some(MatchValue {
-                        priority: candidate.priority,
-                        value: Err(failure(
-                            "ambiguous",
-                            "multiple compilation units define the variable",
-                        )),
-                    });
-                }
-                continue;
-            }
-            let eval = Eval {
-                dwarf: &dwarf,
-                unit: &unit,
-                memory: self.memory,
-                regs: self.registers,
-                link_pc,
-                cfa,
-                bias: instance.bias,
-                preview_deadline: Some(self.deadline),
-            };
-            let entry = unit.entry(candidate.offset)?;
-            let value = evaluate_variable(
-                &eval,
-                &entry,
-                candidate.frame_base,
-                self.operations,
-                module.path(),
-            );
-            best = Some(MatchValue {
-                priority: candidate.priority,
-                value,
-            });
-        }
-        Ok(best)
+            .map(|(priority, value)| MatchValue { priority, value }))
     }
 
     fn read_process(&mut self, root: &Path, selection: LiveModules<'_>) -> Result<Datum> {
@@ -1691,10 +1813,10 @@ impl Query<'_> {
             if filter.is_some_and(|f| !path_matches(&module, f) && !may_be_build_id(f)) {
                 continue;
             }
-            let Ok(bytes) = module.read_image(root, exe.as_ref(), IMAGE_LIMIT) else {
+            let Ok(cached) = cache::live_image(root, &module, exe.as_ref()) else {
                 continue;
             };
-            let Ok(image) = object::File::parse(&*bytes) else {
+            let Ok(image) = object::File::parse(cached.bytes.as_slice()) else {
                 continue;
             };
             if !modules::is_executable_module(&image)
@@ -1707,13 +1829,7 @@ impl Query<'_> {
             let current = module
                 .executable_at(pc)
                 .and_then(|map| layout.for_address(map, pc));
-            let debug = DebugFile::discover(root, &module, &image);
-            let debug = debug.as_ref().and_then(DebugFile::parse);
-            if image.section_by_name(".debug_info").is_none()
-                && debug
-                    .as_ref()
-                    .is_none_or(|obj| obj.section_by_name(".debug_info").is_none())
-            {
+            if cached.primary.is_none() && cached.separate.is_none() {
                 continue;
             }
             eligible_debug = true;
@@ -1725,7 +1841,7 @@ impl Query<'_> {
                     .and_then(|(active, link)| (active.base == instance.base).then_some(link));
                 let cfa = link_pc.and_then(|link| {
                     crate::unwind::canonical_frame_address(
-                        bytes.clone(),
+                        cached.bytes.clone(),
                         &module,
                         link,
                         pc.wrapping_sub(link),
@@ -1734,16 +1850,13 @@ impl Query<'_> {
                     )
                     .ok()
                 });
-                let found = if let Some(dwarf) = &debug {
-                    self.read_image(dwarf, &module, instance, link_pc, cfa)?
-                } else {
-                    None
-                };
-                let found = if found.is_some() {
-                    found
-                } else {
-                    self.read_image(&image, &module, instance, link_pc, cfa)?
-                };
+                let mut found = None;
+                for data in cached.separate.iter().chain(&cached.primary) {
+                    found = self.read_image(data, &module, instance, link_pc, cfa)?;
+                    if found.is_some() {
+                        break;
+                    }
+                }
                 if let Some(found) = found {
                     if found.priority > 0
                         || (matches!(selection, LiveModules::FrameFirst) && link_pc.is_some())
@@ -1867,6 +1980,160 @@ pub(crate) fn inspect_with_trace(
     Ok(live_report(pid, tid, expression, outcome))
 }
 
+pub(crate) fn inspect_request_with_trace(
+    pid: i32,
+    tid: Option<i32>,
+    request: crate::rpc::InspectRequest,
+    root: &Path,
+    trace: &mut Trace,
+) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let tid = tid.unwrap_or(pid);
+    let timeout = request.timeout_ms.unwrap_or(750);
+    let batch = !request.expressions.is_empty();
+    if !(1..=5000).contains(&timeout) {
+        return Err(crate::Diagnostic::new(
+            "INVALID_ARGUMENT",
+            "inspect timeout_ms must be in 1..=5000",
+            None,
+        )
+        .into());
+    }
+    if batch && (!request.expression.is_empty() || request.expressions.len() > 16) {
+        return Err(crate::Diagnostic::new(
+            "INVALID_ARGUMENT",
+            "Supply a single expression or at most 16 expressions",
+            None,
+        )
+        .into());
+    }
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
+    let index = request.frame_index.unwrap_or_default() as usize;
+    let context = (|| -> Result<_> {
+        trace
+            .freeze(deadline)
+            .map_err(|e| failure("read_failed", e))?;
+        if crate::machine(root)? != regs::ARCH {
+            return Err(failure(
+                "unsupported",
+                "target ABI does not match inspection server",
+            ));
+        }
+        if !trace
+            .threads
+            .get(&tid)
+            .is_some_and(|thread| thread.stop.is_some())
+        {
+            return Err(failure(
+                "read_failed",
+                "selected TID is not stopped in the target",
+            ));
+        }
+        let mut registers = regs::read(tid)
+            .map_err(|e| failure("read_failed", e))?
+            .stack;
+        if let Some(crate::trace::Stop::Software { address, .. }) = trace.threads[&tid].stop {
+            registers.set(PC, Some(address));
+        }
+        let mut metadata =
+            json!({"tid": tid, "index": index, "pc": crate::hex(registers.get(PC)?)});
+        if index > 0 {
+            let maps = modules::read(root)?;
+            let exe = fs::metadata(root.join("exe")).ok();
+            let mut found = None;
+            let mut images = crate::unwind::Images::new();
+            let stack = images.walk_registers(
+                trace,
+                registers,
+                &maps,
+                root,
+                exe.as_ref(),
+                deadline,
+                |i, regs| {
+                    if i == index {
+                        found = Some(regs);
+                    }
+                },
+            );
+            registers =
+                found.ok_or_else(|| failure("read_failed", "selected frame was not recovered"))?;
+            if let Some(frame) = stack.frames.get(index) {
+                metadata = json!(frame);
+                metadata["tid"] = tid.into();
+                metadata["index"] = index.into();
+            }
+            registers.set(PC, registers.get(PC).ok().and_then(|pc| pc.checked_sub(1)));
+        }
+        Ok((registers, metadata))
+    })();
+    let module = request.module.as_deref();
+    let selection = if request.run_id.is_some() && module.is_none() && request.instance.is_none() {
+        LiveModules::FrameFirst
+    } else {
+        LiveModules::Filter {
+            module,
+            instance: request.instance,
+        }
+    };
+    let mut evaluate = |text: &str| {
+        let outcome = match &context {
+            Ok((registers, _)) => {
+                let mut outcome =
+                    inspect_projection(text, request.expand.clone(), deadline, |text| {
+                        evaluate_live(
+                            parse_live(text, module)?,
+                            root,
+                            selection,
+                            trace,
+                            *registers,
+                            deadline,
+                        )
+                    });
+                outcome.symbolize_pointer(pid, deadline);
+                outcome
+            }
+            Err(error) => {
+                let code = error
+                    .downcast_ref::<Failure>()
+                    .map_or("read_failed", |issue| issue.0);
+                Outcome::from_result(Err(failure(code, error)))
+            }
+        };
+        json!(live_report(pid, tid, text.to_owned(), outcome))
+    };
+    let mut value = inspect_batch(&request, &mut evaluate);
+    if (batch || request.frame_index.is_some())
+        && let Ok((_, frame)) = context
+    {
+        value["frame"] = frame;
+    }
+    Ok(value)
+}
+
+pub(crate) fn inspect_batch(
+    request: &crate::rpc::InspectRequest,
+    mut evaluate: impl FnMut(&str) -> serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::json;
+    if request.expressions.is_empty() {
+        return evaluate(&request.expression);
+    }
+    let results: Vec<_> = request
+        .expressions
+        .iter()
+        .map(|text| json!({"expression": text, "value": evaluate(text)}))
+        .collect();
+    let status = if results
+        .iter()
+        .all(|result| result["value"]["status"] == "complete")
+    {
+        "complete"
+    } else {
+        "partial"
+    };
+    json!({"status": status, "results": results})
+}
+
 pub(crate) fn inspect_stopped(
     pid: i32,
     tid: i32,
@@ -1909,7 +2176,28 @@ fn inspect_projection(
             "expansion limit must be in 1..=64".into(),
         );
     }
-    let offset = options.offset as u64;
+    let mut nested_budget = 64;
+    outcome.children = Some(expand_value(
+        value,
+        expression,
+        options.offset.into(),
+        limit,
+        deadline,
+        &mut evaluate,
+        Some(&mut nested_budget),
+    ));
+    outcome
+}
+
+fn expand_value(
+    value: &Datum,
+    expression: &str,
+    offset: u64,
+    limit: u32,
+    deadline: Instant,
+    evaluate: &mut impl FnMut(&str) -> Result<Datum>,
+    mut nested_budget: Option<&mut usize>,
+) -> serde_json::Value {
     let fields: Vec<_> = value
         .ty
         .fields
@@ -1925,19 +2213,41 @@ fn inspect_projection(
         if Instant::now() >= deadline {
             break;
         }
-        let child = if value.ty.element_count.is_some() {
-            format!("{expression}[{index}]")
+        let base = if expression.trim_start().starts_with('*') {
+            format!("({expression})")
         } else {
-            format!("{expression}.{}", fields[index as usize])
+            expression.to_owned()
         };
-        items.push(serde_json::json!({"expression": child, "value": Outcome::from_result(evaluate(&child))}));
+        let child = if value.ty.element_count.is_some() {
+            format!("{base}[{index}]")
+        } else {
+            format!("{base}.{}", fields[index as usize])
+        };
+        let mut outcome = Outcome::from_result(evaluate(&child));
+        if value.ty.element_count.is_some()
+            && let Some(remaining) = nested_budget.as_deref_mut()
+            && let Some(element) = outcome
+                .result
+                .as_ref()
+                .filter(|element| !element.ty.fields.is_empty())
+        {
+            let limit = (*remaining).min(8);
+            *remaining -= limit;
+            outcome.children = Some(expand_value(
+                element,
+                &child,
+                0,
+                limit as u32,
+                deadline,
+                evaluate,
+                None,
+            ));
+        }
+        items.push(serde_json::json!({"expression": child, "value": outcome}));
         next += 1;
     }
-    outcome.children = Some(
-        serde_json::json!({"items": items, "next_offset": (next < count).then_some(next),
-        "warnings": if next < end { vec![crate::Diagnostic::new("LIMIT_REACHED", "Expansion reached the inspection deadline", None)] } else { Vec::new() }}),
-    );
-    outcome
+    serde_json::json!({"items": items, "next_offset": (next < count).then_some(next),
+        "warnings": if next < end { vec![crate::Diagnostic::new("LIMIT_REACHED", "Expansion reached the inspection deadline", None)] } else { Vec::new() }})
 }
 
 fn parse_live(expression: &str, module: Option<&str>) -> Result<expression::Expression> {
@@ -1961,7 +2271,6 @@ fn evaluate_live(
     registers: Registers,
     deadline: Instant,
 ) -> Result<Datum> {
-    let mut scanned = 0;
     let mut lookups = 0;
     parsed.evaluate(&mut |target, operations| {
         lookups += 1;
@@ -1977,17 +2286,14 @@ fn evaluate_live(
                 "inspection exceeded its capture budget",
             ));
         }
-        let mut query = Query {
+        Query {
             target,
             operations,
             memory,
             registers,
             deadline,
-            scanned,
-        };
-        let value = query.read_process(root, selection);
-        scanned = query.scanned;
-        value
+        }
+        .read_process(root, selection)
     })
 }
 

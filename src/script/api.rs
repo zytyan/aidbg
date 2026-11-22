@@ -11,7 +11,7 @@ pub struct CoreSymbols {
 
 pub(super) const DECLARATIONS: &str = concat!(
     include_str!("debugger.d.ts"),
-    "\ndeclare const dbg: DebugCoreScope;\ndeclare const console: DebugConsole;\n"
+    "\ndeclare const dbg: DebuggerScope;\ndeclare const console: DebugConsole;\n"
 );
 const EXAMPLE: &str = r#"const thread: DebugThread | undefined = dbg.threads().find(t => t.tid === 1234);
 if (thread) {
@@ -75,7 +75,9 @@ pub enum Mode {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct OpenRequest {
+    /// Open locally or upload to the server. Each store retains up to 16 open cores.
     pub path: Option<std::path::PathBuf>,
+    /// Open a retained server dump. The server can configure a lower open-core limit.
     pub dump_id: Option<String>,
     #[serde(default)]
     pub upload: bool,
@@ -135,9 +137,12 @@ pub struct CheckRequest {
 
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct RunRequest {
+    /// TypeScript source, up to 64 KiB.
     pub source: String,
     pub target_id: Option<String>,
     pub run_id: Option<String>,
+    /// Script budget in milliseconds. Defaults to 1000.
+    #[schemars(range(min = 1, max = 10000))]
     pub timeout_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(skip)]

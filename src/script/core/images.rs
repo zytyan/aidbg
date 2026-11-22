@@ -16,6 +16,8 @@ pub(super) struct SharedImage {
     unwind: OfflineImage,
     debug: Option<DebugFile>,
     layout: Layout,
+    path: PathBuf,
+    dwarf: OnceLock<std::result::Result<Option<DwarfImage>, String>>,
 }
 
 pub(super) enum Image<'a> {
@@ -53,9 +55,32 @@ impl Image<'_> {
         }
     }
 
+    pub fn dwarf(&self, target: &Target) -> Result<Option<DwarfImage>> {
+        let (image, instance) = match self {
+            Self::Main(_) => return Ok(target.dwarf.clone()),
+            Self::Shared(image, instance) => (image, instance),
+        };
+        let bias = u64::try_from(instance.bias)?;
+        let cached = image.dwarf.get_or_init(|| {
+            let load = || -> Result<Option<DwarfImage>> {
+                let object = object::File::parse(image.unwind.bytes())?;
+                let separate = image.debug.as_ref().and_then(DebugFile::parse);
+                let dwarf = separate
+                    .as_ref()
+                    .filter(|obj| obj.section_by_name(".debug_info").is_some())
+                    .unwrap_or(&object);
+                DwarfImage::load(dwarf, 0, image.path.clone())
+            };
+            load().map_err(|error| error.to_string())
+        });
+        match cached {
+            Ok(dwarf) => Ok(dwarf.clone().map(|dwarf| dwarf.relocated(bias))),
+            Err(issue) => Err(error(issue.clone())),
+        }
+    }
+
     pub fn line(&self, target: &Target, link: u64) -> Result<Option<Line>> {
-        if matches!(self, Self::Main(_))
-            && let Some(dwarf) = &target.dwarf
+        if let Some(dwarf) = self.dwarf(target)?
             && let Some(line) = dwarf.line(link)?
         {
             return Ok(Some(line));
@@ -160,6 +185,8 @@ impl Target {
             unwind: OfflineImage::new(bytes, 0)?,
             debug,
             layout,
+            path: path.to_owned(),
+            dwarf: OnceLock::new(),
         })
     }
 

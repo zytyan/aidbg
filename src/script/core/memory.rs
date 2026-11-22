@@ -1,6 +1,6 @@
 use super::*;
 
-fn read_range(
+pub(crate) fn read_range(
     request: &crate::rpc::ReadMemoryRequest,
     read: impl FnOnce(u64, &mut [u8]) -> Result<usize>,
 ) -> Result<Value> {
@@ -234,39 +234,69 @@ impl Target {
     }
 
     pub fn pointer_chain(&self, base: u64, offsets: Vec<i64>) -> Result<Value> {
-        if !(1..=32).contains(&offsets.len()) {
-            return Err(Diagnostic::new(
-                "INVALID_ARGUMENT",
-                "Expected 1 to 32 pointer offsets",
-                None,
-            )
-            .into());
-        }
-        let mut value = base;
-        let mut steps = Vec::with_capacity(offsets.len());
-        let mut warnings = self.warnings.clone();
-        for offset in offsets {
-            let Some(address) = value.checked_add_signed(offset) else {
-                warnings.push(Diagnostic::new(
-                    "ADDRESS_OVERFLOW",
-                    "Pointer chain address overflowed",
-                    None,
-                ));
-                break;
-            };
-            let mut bytes = [0u8; 8];
-            match self.read_at(address, &mut bytes) {
-                Ok(()) => value = u64::from_le_bytes(bytes),
-                Err(error) if error.is::<MissingMemory>() => {
-                    warnings.push(self.missing_memory(address));
-                    break;
-                }
-                Err(error) => return Err(error),
-            }
-            steps.push(json!({"address": hex(address), "value": hex(value)}));
-        }
-        Ok(json!({"steps": steps, "warnings": warnings}))
+        pointer_chain_with(
+            base,
+            offsets,
+            self.warnings.clone(),
+            |address, bytes| self.read_prefix(address, bytes),
+            |address| self.missing_memory(address),
+        )
     }
+}
+
+pub fn pointer_chain_live(pid: i32, base: u64, offsets: Vec<i64>) -> Result<Value> {
+    pointer_chain_with(
+        base,
+        offsets,
+        Vec::new(),
+        |address, bytes| crate::trace::read_process_prefix(pid, address, bytes, || true),
+        live_missing_memory,
+    )
+}
+
+pub(crate) fn live_missing_memory(address: u64) -> Diagnostic {
+    Diagnostic::new(
+        "MEMORY_UNAVAILABLE",
+        format!("Cannot read pointer at {}", hex(address)),
+        None,
+    )
+}
+
+pub(crate) fn pointer_chain_with(
+    base: u64,
+    offsets: Vec<i64>,
+    mut warnings: Vec<Diagnostic>,
+    mut read: impl FnMut(u64, &mut [u8]) -> Result<usize>,
+    missing: impl Fn(u64) -> Diagnostic,
+) -> Result<Value> {
+    if !(1..=32).contains(&offsets.len()) {
+        return Err(
+            Diagnostic::new("INVALID_ARGUMENT", "Expected 1 to 32 pointer offsets", None).into(),
+        );
+    }
+    let mut value = base;
+    let mut steps = Vec::with_capacity(offsets.len());
+    for offset in offsets {
+        let Some(address) = value
+            .checked_add_signed(offset)
+            .filter(|address| address.checked_add(8).is_some())
+        else {
+            warnings.push(Diagnostic::new(
+                "ADDRESS_OVERFLOW",
+                "Pointer chain address overflowed",
+                None,
+            ));
+            break;
+        };
+        let mut bytes = [0; 8];
+        if read(address, &mut bytes)? != bytes.len() {
+            warnings.push(missing(address));
+            break;
+        }
+        value = u64::from_le_bytes(bytes);
+        steps.push(json!({"address": hex(address), "value": hex(value)}));
+    }
+    Ok(json!({"steps": steps, "warnings": warnings}))
 }
 
 struct SearchRegion {
@@ -279,14 +309,6 @@ struct SearchRegion {
 pub fn search_live(pid: i32, request: &crate::rpc::SearchMemoryRequest) -> Result<Value> {
     use std::os::fd::AsRawFd;
 
-    if request.start.is_none() || request.end.is_none() {
-        return Err(Diagnostic::new(
-            "INVALID_ARGUMENT",
-            "Live search requires a bounded start/end interval",
-            None,
-        )
-        .into());
-    }
     let directory = File::open(format!("/proc/{pid}"))?;
     let root = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
     if crate::procfs::Status::read(&root)?.field("Tgid") != Some(&pid.to_string()) {

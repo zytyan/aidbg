@@ -350,7 +350,12 @@ struct BreakpointWorkflowArgs {
     run_id: Option<String>,
     run: Option<aidbg::run::RunRequest>,
     points: Vec<WorkflowPoint>,
+    /// Total script budget in milliseconds. Defaults to 1000.
+    #[schemars(range(min = 1, max = 10000))]
     timeout_ms: Option<u32>,
+    /// Default per-hit callback budget in milliseconds. Defaults to 100.
+    #[schemars(range(min = 1, max = 500))]
+    per_hit_timeout_ms: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -365,6 +370,9 @@ struct WorkflowPoint {
     tid: Option<i32>,
     #[serde(default)]
     expressions: Vec<String>,
+    /// Override the per-hit callback budget for this point.
+    #[schemars(range(min = 1, max = 500))]
+    timeout_ms: Option<u32>,
 }
 
 impl BreakpointWorkflowArgs {
@@ -394,9 +402,11 @@ impl BreakpointWorkflowArgs {
                 "(hit: BreakpointHit) => {{ for (const expr of {}) hit.printVal(expr); }}",
                 serde_json::to_string(&point.expressions)?
             );
-            let options = point
-                .tid
-                .map_or_else(|| "{}".to_owned(), |tid| format!("{{tid:{tid}}}"));
+            let timeout = point.timeout_ms.or(self.per_hit_timeout_ms).unwrap_or(100);
+            let mut options = serde_json::json!({"timeoutMs": timeout});
+            if let Some(tid) = point.tid {
+                options["tid"] = tid.into();
+            }
             let invocation = match (point.kind, point.length) {
                 (RuleKind::Hardware, None) => {
                     format!("dbg.hardwareBreakpoint({address}n,{callback},{options});")
@@ -481,11 +491,11 @@ struct BreakpointArgs {
     /// Exact path, basename or build ID of the loaded module.
     #[arg(long)]
     module: Option<String>,
-    /// Exact ELF symbol name.
-    #[arg(long, requires = "module", conflicts_with = "file")]
+    /// Exact ELF symbol name. module is optional.
+    #[arg(long, conflicts_with = "file")]
     symbol: Option<String>,
     /// Offset from the selected ELF symbol or module base.
-    #[arg(long, requires = "module", conflicts_with = "file")]
+    #[arg(long, conflicts_with = "file")]
     offset: Option<String>,
     /// Source file path or suffix, as recorded in DWARF.
     #[arg(long, requires = "line")]
@@ -521,6 +531,10 @@ struct BreakpointArgs {
     /// Registered callback export, for example $.onHit.
     #[arg(long, conflicts_with_all = ["rule_id", "rule_file"])]
     handler: Option<String>,
+    /// Keep the run stopped after a hit until run_continue. Requires run_id.
+    #[arg(long, requires = "run_id")]
+    #[serde(default)]
+    stop_after_hit: bool,
 }
 
 impl BreakpointArgs {
@@ -538,9 +552,9 @@ impl BreakpointArgs {
             (Some(address), None, None, None, None, None, None) => {
                 Location::Address(parse_address(&address)?)
             }
-            (None, Some(module), Some(symbol), instance, None, None, offset) => {
+            (None, module, Some(symbol), instance, None, None, offset) => {
                 Location::Symbol(SymbolLocation {
-                    module,
+                    module: module.unwrap_or_default(),
                     symbol,
                     instance: instance.as_deref().map(parse_address).transpose()?,
                     offset: offset.as_deref().map(parse_address).transpose()?,
@@ -567,8 +581,8 @@ impl BreakpointArgs {
                 })
             }
             _ => {
-                return Err(io::Error::other(
-                    "provide --address, --module with --symbol or --offset, or --file and --line",
+                return Err(aidbg::Diagnostic::new("INVALID_ARGUMENT",
+                    "provide address, symbol with optional module, module with offset, or file and line", None,
                 )
                 .into());
             }
@@ -600,6 +614,7 @@ impl BreakpointArgs {
             tid: self.tid,
             handler: self.handler,
             replay_export: None,
+            stop_after_hit: self.stop_after_hit,
         })
     }
 }
@@ -636,12 +651,14 @@ enum MatchMode {
 struct SymbolArgs {
     #[arg(
         long,
-        required_unless_present = "target_id",
-        conflicts_with = "target_id"
+        required_unless_present_any = ["target_id", "run_id"],
+        conflicts_with_all = ["target_id", "run_id"]
     )]
     pid: Option<i32>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "run_id")]
     target_id: Option<String>,
+    #[arg(long)]
+    run_id: Option<String>,
     #[arg(long)]
     pattern: String,
     #[arg(long, value_enum, default_value = "exact")]
@@ -655,10 +672,11 @@ struct SymbolArgs {
 
 impl SymbolArgs {
     fn message(self) -> AidbgResult<SearchSymbolsRequest> {
-        validate_target(self.pid, self.target_id.as_deref())?;
+        validate_run_selector(self.pid, self.target_id.as_deref(), self.run_id.as_deref())?;
         Ok(SearchSymbolsRequest {
             pid: self.pid.unwrap_or_default(),
             target_id: self.target_id,
+            run_id: self.run_id,
             pattern: self.pattern,
             match_mode: match self.mode {
                 MatchMode::Exact => SymbolMatch::Exact,
@@ -668,6 +686,23 @@ impl SymbolArgs {
             module: self.module,
             limit: self.limit,
         })
+    }
+}
+
+fn validate_run_selector(
+    pid: Option<i32>,
+    target_id: Option<&str>,
+    run_id: Option<&str>,
+) -> AidbgResult<()> {
+    match (pid, target_id, run_id) {
+        (None, None, Some(id)) if !id.is_empty() => Ok(()),
+        (_, _, None) => validate_target(pid, target_id),
+        _ => Err(aidbg::Diagnostic::new(
+            "INVALID_ARGUMENT",
+            "Specify exactly one of pid, target_id or run_id",
+            None,
+        )
+        .into()),
     }
 }
 
@@ -713,12 +748,14 @@ impl ResolveArgs {
 struct DisassembleArgs {
     #[arg(
         long,
-        required_unless_present = "target_id",
-        conflicts_with = "target_id"
+        required_unless_present_any = ["target_id", "run_id"],
+        conflicts_with_all = ["target_id", "run_id"]
     )]
     pid: Option<i32>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "run_id")]
     target_id: Option<String>,
+    #[arg(long)]
+    run_id: Option<String>,
     #[arg(long)]
     address: String,
     #[arg(long)]
@@ -732,10 +769,11 @@ struct DisassembleArgs {
 
 impl DisassembleArgs {
     fn message(self) -> AidbgResult<DisassembleRequest> {
-        validate_target(self.pid, self.target_id.as_deref())?;
+        validate_run_selector(self.pid, self.target_id.as_deref(), self.run_id.as_deref())?;
         Ok(DisassembleRequest {
             pid: self.pid.unwrap_or_default(),
             target_id: self.target_id,
+            run_id: self.run_id,
             address: parse_address(&self.address)?,
             before: self.before,
             after: self.after,
@@ -840,7 +878,9 @@ struct XrefTool {
 
 #[derive(Deserialize, JsonSchema)]
 struct PointerChainTool {
-    target_id: String,
+    target_id: Option<String>,
+    pid: Option<i32>,
+    run_id: Option<String>,
     base: String,
     offsets: Vec<i64>,
 }
@@ -933,14 +973,18 @@ struct InspectArgs {
     run_id: Option<String>,
     #[arg(long)]
     tid: Option<i32>,
-    #[arg(long, required_unless_present = "expressions", conflicts_with = "expressions")]
+    #[arg(
+        long,
+        required_unless_present = "expressions",
+        conflicts_with = "expressions"
+    )]
     expression: Option<String>,
-    #[arg(long, value_name = "EXPRESSION", requires = "target_id")]
+    #[arg(long, value_name = "EXPRESSION")]
     #[serde(default)]
     expressions: Vec<String>,
     #[arg(long, conflicts_with = "run_id")]
     target_id: Option<String>,
-    #[arg(long, requires = "target_id")]
+    #[arg(long)]
     frame_index: Option<u32>,
     #[arg(long)]
     module: Option<String>,
@@ -1530,13 +1574,17 @@ impl rmcp::ServerHandler for Mcp {
         use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("aidbg", aidbg::BUILD_VERSION))
-            .with_instructions("Call capabilities to find debugger tools by task and target selector.")
+            .with_instructions(
+                "Call capabilities to find debugger tools by task and target selector.",
+            )
     }
 }
 
 #[tool_router]
 impl Mcp {
-    #[tool(description = "Find debugger tools by task and target. Shows selectors, common entry points, and how to attach to an existing PID.")]
+    #[tool(
+        description = "Find debugger tools by task and target. Shows selectors, common entry points, and how to attach to an existing PID."
+    )]
     async fn capabilities(&self) -> CallToolResult {
         CallToolResult::structured(serde_json::json!({
             "targets": {
@@ -1551,7 +1599,7 @@ impl Mcp {
                     "example": {"target_id": "core-id", "tid": 123, "frame_index": 0, "expressions": ["account->id", "account->profile"]},
                     "address": "result.address, or results[].value.result.address for a core batch"
                 },
-                "memory": {"tools": ["read_memory", "search_memory", "xref"], "selectors": ["run_id", "pid", "target_id"], "compare_captures": "memory_diff"},
+                "memory": {"tools": ["read_memory", "search_memory", "xref", "pointer_chain"], "selectors": ["run_id", "pid", "target_id"], "compare_captures": "memory_diff"},
                 "breakpoints": {"tools": ["breakpoint_set", "breakpoint_list", "breakpoint_remove"], "selectors": ["run_id", "pid"], "events": "breakpoint_events"},
                 "core": {"open": "core_open", "open_by": ["path", "dump_id"], "close": "core_close"},
                 "threads": {"tool": "observe_threads", "selectors": ["run_id", "pid", "target_id"], "stack_snapshot": "snapshot", "saved_snapshot": "snapshot_query"},
@@ -1715,7 +1763,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Open a local ELF core or core.zst by path, or a retained server core by dump_id. Windows uploads local files automatically. Use upload=true on Linux for server analysis."
+        description = "Open a local ELF core or core.zst by path, or a retained server core by dump_id. Windows uploads local files automatically. Use upload=true on Linux for server analysis. Up to 16 cores can be open per store. The server may configure a lower limit."
     )]
     async fn core_open(
         &self,
@@ -1733,7 +1781,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Save a compressed Linux ELF core to a client-side path. Set resume to true with the original output path to resume a download. Returns the dump ID, coverage, and output metadata."
+        description = "Save a compressed Linux ELF core from pid or run_id to a client-side path. Paused runs remain stopped. Set resume to true with the original output path to resume a download. Returns the dump ID, coverage, and output metadata."
     )]
     async fn coredump(&self, Parameters(args): Parameters<CoredumpArgs>) -> CallToolResult {
         match save_coredump(mcp_client!(self), args).await {
@@ -1828,6 +1876,12 @@ impl Mcp {
             if !(1..=32).contains(&args.points.len()) {
                 return Err(aidbg::Diagnostic::new("INVALID_ARGUMENT", "provide 1–32 workflow points", None).into());
             }
+            if args.timeout_ms.is_some_and(|ms| !(1..=10_000).contains(&ms))
+                || args.per_hit_timeout_ms.is_some_and(|ms| !(1..=500).contains(&ms))
+                || args.points.iter().any(|point| point.timeout_ms.is_some_and(|ms| !(1..=500).contains(&ms)))
+            {
+                return Err(aidbg::Diagnostic::new("INVALID_ARGUMENT", "timeout_ms must be in 1..=10000 and per-hit timeouts in 1..=500", None).into());
+            }
             let owns_run = args.run.is_some();
             let run: Value = match (&args.run_id, args.run.take()) {
                 (Some(id), None) => {
@@ -1848,19 +1902,19 @@ impl Mcp {
                     let base = match (&point.address, &point.symbol, &point.module) {
                         (Some(address), None, None) => parse_address(address)?,
                         (None, Some(symbol), module) => {
-                            let pid = run["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok())
-                                .ok_or_else(|| io::Error::other("run has no live PID"))?;
                             let reply = client.search_symbols(request(SearchSymbolsRequest {
-                                pid, pattern: symbol.clone(), module: module.clone(),
-                                target_id: None, match_mode: SymbolMatch::Exact as i32, limit: Some(2),
+                                pid: 0, pattern: symbol.clone(), module: module.clone(),
+                                target_id: None, run_id: Some(run_id.clone()), match_mode: SymbolMatch::Exact as i32, limit: Some(4096),
                             })).await?;
                             let document: Value = serde_json::from_slice(&reply.into_inner().json)?;
-                            let matches = document["matches"].as_array().ok_or_else(|| io::Error::other("symbol search did not return matches"))?;
-                            match matches.as_slice() {
-                                [found] if document["truncated"] != true => parse_address(found["runtime_address"].as_str()
+                            let execution = matches!(point.kind, RuleKind::Hardware | RuleKind::Software);
+                            let mut matches = document["matches"].as_array().ok_or_else(|| io::Error::other("symbol search did not return matches"))?
+                                .iter().filter(|row| !execution || row["kind"] == "text");
+                            match (matches.next(), matches.next()) {
+                                (Some(found), None) if document["truncated"] != true => parse_address(found["runtime_address"].as_str()
                                     .ok_or_else(|| io::Error::other("symbol has no runtime address"))?)?,
-                                [] => return Err(aidbg::Diagnostic::new("SYMBOL_NOT_FOUND", format!("workflow symbol {symbol} is unavailable"), None).into()),
-                                _ => return Err(aidbg::Diagnostic::new("AMBIGUOUS_SYMBOL", format!("workflow symbol {symbol} has multiple matches"), Some("specify module")).into()),
+                                (None, _) if document["truncated"] != true => return Err(aidbg::Diagnostic::new("SYMBOL_NOT_FOUND", format!("symbol {symbol} is unavailable"), None).into()),
+                                _ => return Err(aidbg::Diagnostic::new("AMBIGUOUS_SYMBOL", format!("symbol {symbol} is ambiguous across loaded locations"), Some("Specify module.")).into()),
                             }
                         }
                         _ => return Err(aidbg::Diagnostic::new("INVALID_ARGUMENT", "each workflow point requires an address or symbol with optional module", None).into()),
@@ -2032,7 +2086,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Search ELF symbols in a live PID or open core target_id by exact name, glob or regex."
+        description = "Search ELF symbols in a live pid, run_id or open core target_id by exact name, glob or regex."
     )]
     async fn symbols(&self, Parameters(args): Parameters<SymbolArgs>) -> CallToolResult {
         match args.message() {
@@ -2084,7 +2138,9 @@ impl Mcp {
         )
     }
 
-    #[tool(description = "Decode an instruction window around a runtime address using Capstone.")]
+    #[tool(
+        description = "Decode an instruction window around an address in a pid, run_id or target_id."
+    )]
     async fn disassemble(&self, Parameters(args): Parameters<DisassembleArgs>) -> CallToolResult {
         match args.message() {
             Ok(message) => script_tool(self.scripts.disassemble(message).await),
@@ -2093,7 +2149,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Find hexadecimal byte patterns in a core or a bounded live process range."
+        description = "Find hexadecimal byte patterns in a live process or open core. The byte budget bounds scanning."
     )]
     async fn search_memory(
         &self,
@@ -2131,7 +2187,9 @@ impl Mcp {
         }
     }
 
-    #[tool(description = "Compare two captured byte ranges with the same address and length. Pass before and after read_memory results. Returns changed offsets and the extent of comparable bytes.")]
+    #[tool(
+        description = "Compare two captured byte ranges with the same address and length. Pass before and after read_memory results. Returns changed offsets and the extent of comparable bytes."
+    )]
     async fn memory_diff(&self, Parameters(args): Parameters<MemoryDiffTool>) -> CallToolResult {
         script_tool(args.compare())
     }
@@ -2163,7 +2221,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Follow bounded 64-bit little-endian pointer reads in a core. Each offset is added before dereferencing."
+        description = "Follow bounded 64-bit little-endian pointer reads in a pid, run_id or target_id. Each offset is added before dereferencing."
     )]
     async fn pointer_chain(
         &self,
@@ -2172,7 +2230,9 @@ impl Mcp {
         script_tool(
             async {
                 let request = rpc::PointerChainRequest {
-                    target_id: args.target_id,
+                    target_id: args.target_id.unwrap_or_default(),
+                    pid: args.pid,
+                    run_id: args.run_id,
                     base: parse_address(&args.base)?,
                     offsets: args.offsets,
                 };
@@ -2227,7 +2287,7 @@ impl Mcp {
     }
 
     #[tool(
-        description = "Read a DWARF-backed C/C++ expression by pid, run_id or core target_id. In a core, pass tid and frame_index to select a frame, or pass expressions to read several values together. Values stored in memory expose result.address."
+        description = "Read a DWARF-backed C/C++ expression by pid, run_id or core target_id. For a run or core, pass expressions to read several values together. Use tid and frame_index to select a frame. Values stored in memory expose result.address."
     )]
     async fn inspect(&self, Parameters(args): Parameters<InspectArgs>) -> CallToolResult {
         match args.message() {

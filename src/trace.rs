@@ -779,6 +779,33 @@ impl Trace {
         read_process_word(self.pid.as_raw(), addr, size)
     }
 
+    pub(crate) fn read_code_prefix(&self, address: u64, bytes: &mut [u8]) -> Result<usize> {
+        let count = read_process_prefix(self.pid.as_raw(), address, bytes, || true)?;
+        let width = if cfg!(target_arch = "aarch64") { 4 } else { 1 };
+        let end = address.saturating_add(count as u64);
+        for (&site, patch) in self.patches.range(address.saturating_sub(width - 1)..end) {
+            if modules::private_code_mapping(&self.root, site, false)?.as_ref()
+                != Some(&patch.mapping)
+            {
+                continue;
+            }
+            for (offset, byte) in patch.original.to_le_bytes()[..width as usize]
+                .iter()
+                .enumerate()
+            {
+                if let Some(index) = (site + offset as u64).checked_sub(address)
+                    && index < count as u64
+                {
+                    let expected = software::TRAP.to_le_bytes()[offset];
+                    if bytes[index as usize] == expected {
+                        bytes[index as usize] = *byte;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub fn read_memory(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         read_process_memory_exact(self.pid.as_raw(), addr, buf)
     }

@@ -16,6 +16,28 @@ static void update_watched(void)
     watched = 42;
 }
 
+struct sample {
+    unsigned value;
+    unsigned flags;
+};
+static struct sample samples[] = {{17, 1}, {42, 2}};
+static struct sample *head = samples;
+
+static void scope_marker(unsigned value)
+{
+    watched = value;
+}
+
+static void inspect_values(int parameter)
+{
+    volatile int shadow = parameter;
+    {
+        volatile int shadow = 99;
+        scope_marker((unsigned)shadow);
+    }
+    watched = (unsigned)shadow + head->value;
+}
+
 static void caught(int signal)
 {
     (void)signal;
@@ -33,6 +55,10 @@ int main(int argc, char **argv)
 {
     if (argc != 2)
         return 2;
+    if (strcmp(argv[1], "inspect") == 0) {
+        inspect_values(4);
+        return watched == 21 ? 0 : 1;
+    }
     if (strcmp(argv[1], "watch") == 0) {
         const char *label = getenv("AIDBG_TEST_LABEL");
         char line[32];

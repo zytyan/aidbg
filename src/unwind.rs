@@ -20,7 +20,7 @@ const MAX_IMAGES_TOTAL: u64 = 64 * 1024 * 1024;
 type Data = EndianArcSlice<LittleEndian>;
 
 struct Image {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     symbols: Option<Vec<u8>>,
     eh: EhFrame<Data>,
     debug: DebugFrame<Data>,
@@ -29,8 +29,8 @@ struct Image {
 }
 
 impl Image {
-    fn new(bytes: Vec<u8>, module: &Module) -> Result<Self> {
-        let obj = object::File::parse(&*bytes)?;
+    fn new(bytes: Arc<Vec<u8>>, module: &Module) -> Result<Self> {
+        let obj = object::File::parse(bytes.as_slice())?;
         if !modules::is_executable_module(&obj) {
             return Err(error("unsupported module ELF"));
         }
@@ -168,7 +168,7 @@ fn cfa_value<S: UnwindSection<Data>>(
 }
 
 pub(crate) fn canonical_frame_address(
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     module: &Module,
     link: u64,
     bias: u64,
@@ -401,8 +401,8 @@ impl Images {
                 let cap = (MAX_IMAGES_TOTAL - self.bytes).min(MAX_IMAGE);
                 let bytes = m.read_image(root, exe, cap).map_err(|e| e.to_string())?;
                 self.bytes += bytes.len() as u64;
-                let mut image = Image::new(bytes, m).map_err(|e| e.to_string())?;
-                if let Ok(obj) = object::File::parse(&*image.bytes)
+                let mut image = Image::new(Arc::new(bytes), m).map_err(|e| e.to_string())?;
+                if let Ok(obj) = object::File::parse(image.bytes.as_slice())
                     && !obj.has_debug_symbols()
                     && let Some((_, symbols)) = crate::symbols::find_external_debug(
                         Some(&root.join("root")),
@@ -429,7 +429,7 @@ impl Images {
     ) -> ModuleInfo {
         let info = m.info(id, exe, None);
         if let Some(Ok(image)) = self.data.get(&id)
-            && let Ok(obj) = object::File::parse(&*image.bytes)
+            && let Ok(obj) = object::File::parse(image.bytes.as_slice())
         {
             let kind = match obj.kind() {
                 object::ObjectKind::Dynamic => "shared_object",
@@ -451,7 +451,7 @@ impl Images {
             let Some(Ok(image)) = self.data.get(&module) else {
                 continue;
             };
-            if let Ok(obj) = object::File::parse(&*image.bytes) {
+            if let Ok(obj) = object::File::parse(image.bytes.as_slice()) {
                 let debug = image
                     .symbols
                     .as_deref()
@@ -492,7 +492,7 @@ impl Images {
             .find_map(|(id, module)| module.executable_at(pc).map(|map| (id, module, map)))?;
         let image = self.image(id, module, root, exe).ok()?;
         let (_, link) = image.layout.for_address(map, pc)?;
-        let object = object::File::parse(&*image.bytes).ok()?;
+        let object = object::File::parse(image.bytes.as_slice()).ok()?;
         let offset = link.checked_sub(image.layout.elf_base)?;
         let symbol = modules::text_symbol(&object, link)
             .filter(|(_, base)| *base >= image.layout.elf_base)
@@ -629,7 +629,7 @@ impl OfflineImage {
             maps: Vec::new(),
         };
         Ok(Self {
-            image: Image::new(bytes, &module)?,
+            image: Image::new(Arc::new(bytes), &module)?,
             bias,
         })
     }
@@ -639,7 +639,7 @@ impl OfflineImage {
     }
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.image.bytes
+        Arc::unwrap_or_clone(self.image.bytes)
     }
 
     pub(crate) fn bias(&self) -> u64 {
@@ -648,7 +648,7 @@ impl OfflineImage {
 
     fn contains_code(&self, link: u64) -> bool {
         use object::ObjectSegment;
-        let Ok(file) = object::File::parse(&*self.image.bytes) else {
+        let Ok(file) = object::File::parse(self.image.bytes.as_slice()) else {
             return false;
         };
         file.segments().any(|segment| {
@@ -662,12 +662,13 @@ pub(crate) struct OfflineFrame {
     pub regs: Registers,
     pub pc: u64,
     pub link: Option<u64>,
+    pub lookup_pc: u64,
     pub cfa: Option<u64>,
 }
 
 pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
     memory: &dyn UnwindMemory,
-    image_at: impl Fn(u64) -> Option<(I, u64, bool)>,
+    image_at: impl Fn(u64) -> Option<(I, u64)>,
     mut regs: Registers,
     mappings: &[Module],
 ) -> Vec<OfflineFrame> {
@@ -691,22 +692,21 @@ pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
             regs,
             pc,
             link: None,
+            lookup_pc: lookup,
             cfa: None,
         };
-        let step = image_at(lookup).and_then(|(image, link, main)| {
+        let step = image_at(lookup).and_then(|(image, link)| {
             let image = image.as_ref();
             if !image.contains_code(link) {
                 return None;
             }
             context.bias = lookup.wrapping_sub(link);
-            if main {
-                frame.link = Some(link);
-                frame.cfa = image
-                    .image
-                    .cfa_section(&image.image.eh, link, context)
-                    .or_else(|_| image.image.cfa_section(&image.image.debug, link, context))
-                    .ok();
-            }
+            frame.link = Some(link);
+            frame.cfa = image
+                .image
+                .cfa_section(&image.image.eh, link, context)
+                .or_else(|_| image.image.cfa_section(&image.image.debug, link, context))
+                .ok();
             image.image.step(link, context).ok()
         });
         if frame.cfa.is_none()

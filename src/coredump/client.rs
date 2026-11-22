@@ -117,8 +117,11 @@ impl From<DumpMode> for CoreMode {
 
 #[derive(Args, Deserialize, JsonSchema)]
 pub(super) struct CoredumpArgs {
-    #[arg(long, required_unless_present_any = ["resume", "dump_id"], conflicts_with_all = ["resume", "dump_id"])]
+    #[arg(long, required_unless_present_any = ["resume", "dump_id", "run_id"], conflicts_with_all = ["resume", "dump_id", "run_id"])]
     pid: Option<i32>,
+    /// Capture the process controlled by this run.
+    #[arg(long, conflicts_with_all = ["resume", "dump_id"])]
+    run_id: Option<String>,
     /// Download an existing retained core, including one saved by a signal callback.
     #[arg(long, conflicts_with = "resume")]
     dump_id: Option<String>,
@@ -326,6 +329,7 @@ fn request(args: &CoredumpArgs) -> Result<Option<CoredumpRequest>> {
             );
         }
         if args.pid.is_some()
+            || args.run_id.is_some()
             || args.mode.is_some()
             || args.timeout_ms.is_some()
             || args.buffer_mib.is_some()
@@ -338,10 +342,18 @@ fn request(args: &CoredumpArgs) -> Result<Option<CoredumpRequest>> {
         }
         return Ok(None);
     }
-    let pid = args
-        .pid
-        .filter(|pid| *pid > 0)
-        .ok_or_else(|| io::Error::other("a positive PID is required"))?;
+    let pid = match (args.pid, args.run_id.as_deref()) {
+        (Some(pid), None) if pid > 0 => pid,
+        (None, Some(id)) if !id.is_empty() => 0,
+        _ => {
+            return Err(aidbg::Diagnostic::new(
+                "INVALID_ARGUMENT",
+                "Specify exactly one positive pid or a run_id",
+                None,
+            )
+            .into());
+        }
+    };
     let mode = CoreMode::from(args.mode.unwrap_or_default());
     let timeout = args
         .timeout_ms
@@ -356,6 +368,7 @@ fn request(args: &CoredumpArgs) -> Result<Option<CoredumpRequest>> {
         timeout_ms: args.timeout_ms,
         buffer_mib: args.buffer_mib,
         block_kib: args.block_kib,
+        run_id: args.run_id.clone(),
     }))
 }
 
@@ -572,6 +585,7 @@ pub(super) async fn export_bundle(mut client: Client, args: BundleArgs) -> Resul
     let mut core = save_coredump(
         client.clone(),
         CoredumpArgs {
+            run_id: None,
             pid: None,
             dump_id: Some(args.dump_id.clone()),
             output: dump_path,
@@ -774,6 +788,8 @@ struct ReplayPoint {
     module_offset: Option<String>,
     length: Option<u32>,
     timeout_ms: u32,
+    #[serde(default)]
+    stop_after_hit: bool,
     thread: Option<String>,
     source: Option<String>,
     export: Option<String>,
@@ -987,6 +1003,7 @@ async fn restore_into(
                 timeout_ms: Some(point.timeout_ms),
                 tid,
                 rule_source: source,
+                stop_after_hit: point.stop_after_hit,
                 replay_export: point.export,
                 ..Default::default()
             },
