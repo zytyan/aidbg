@@ -7,9 +7,11 @@ use gimli::{
     UnitOffset, Value,
 };
 use std::fmt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 mod expression;
+pub(crate) mod offline;
 use expression::Number;
 
 type Reader<'a> = EndianSlice<'a, LittleEndian>;
@@ -35,6 +37,16 @@ fn failure(code: &'static str, message: impl ToString) -> Box<dyn std::error::Er
     Box::new(Failure(code, message.to_string()))
 }
 
+fn memory_failure(
+    err: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if err.is::<crate::unwind::MissingMemory>() {
+        failure("missing_page", err)
+    } else {
+        failure("read_failed", err)
+    }
+}
+
 #[derive(Debug)]
 enum Access {
     Deref,
@@ -42,12 +54,183 @@ enum Access {
     Index(u64),
 }
 
-struct Parser<'a> {
-    rest: &'a str,
-    operations: Vec<Access>,
+#[derive(Clone, Copy)]
+pub(crate) enum Discovery {
+    Locals,
+    Parameters,
+    Globals,
+    Types,
 }
 
-impl Parser<'_> {
+pub(crate) fn discover_stopped(
+    root: &Path,
+    memory: &dyn crate::unwind::UnwindMemory,
+    registers: Registers,
+    kind: Discovery,
+    pattern: &str,
+    page: (usize, usize),
+    deadline: Instant,
+) -> Result<serde_json::Value> {
+    let pc = registers.get(PC)?;
+    let exe = fs::metadata(root.join("exe")).ok();
+    let no_dwarf = || {
+        crate::Diagnostic::new(
+            "NO_DWARF",
+            "No verified DWARF image for the current frame",
+            Some("Stop in a module with matching debug information."),
+        )
+    };
+    let module = modules::read(root)?
+        .into_iter()
+        .find(|module| module.executable_at(pc).is_some())
+        .ok_or_else(no_dwarf)?;
+    let bytes = module.read_image(root, exe.as_ref(), IMAGE_LIMIT)?;
+    let image = object::File::parse(&*bytes)?;
+    let layout = Layout::new(&image, &module)?;
+    let (instance, link) = module
+        .executable_at(pc)
+        .and_then(|mapping| layout.for_address(mapping, pc))
+        .ok_or_else(no_dwarf)?;
+    let debug = DebugFile::discover(root, &module, &image);
+    let source = debug
+        .as_ref()
+        .and_then(DebugFile::parse)
+        .filter(|file| file.section_by_name(".debug_info").is_some());
+    let bias = u64::try_from(instance.bias)?;
+    let dwarf = offline::DwarfImage::load(source.as_ref().unwrap_or(&image), bias, module.path())?
+        .ok_or_else(no_dwarf)?;
+    let (offset, limit) = page;
+    let result = match kind {
+        Discovery::Locals | Discovery::Parameters => {
+            let cfa = crate::unwind::canonical_frame_address(
+                bytes, &module, link, bias, memory, registers,
+            )
+            .ok();
+            let frame = crate::unwind::OfflineFrame {
+                pc,
+                regs: registers,
+                link: Some(link),
+                cfa,
+            };
+            if matches!(kind, Discovery::Parameters) {
+                dwarf.parameters(memory, &frame, limit, deadline)
+            } else {
+                dwarf.variables(memory, Some(&frame), pattern, offset, limit, deadline)
+            }
+        }
+        Discovery::Globals => dwarf.variables(memory, None, pattern, offset, limit, deadline),
+        Discovery::Types => dwarf.types(pattern, offset, limit, deadline),
+    };
+    result.map_err(|error| {
+        if error
+            .downcast_ref::<Failure>()
+            .is_some_and(|failure| failure.0 == "limit_reached")
+        {
+            crate::Diagnostic::new(
+                "LIMIT_REACHED",
+                error.to_string(),
+                Some("Use a smaller page or increase the callback timeout."),
+            )
+            .into()
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn enrich_arguments(
+    result: Result<serde_json::Value>,
+    deadline: Instant,
+    mut symbolize: impl FnMut(u64) -> Option<serde_json::Value>,
+) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut page = match result {
+        Ok(page) => page,
+        Err(error) => {
+            return json!({"status": "unavailable", "items": [], "issue": error.to_string()});
+        }
+    };
+    page["status"] = json!(if page["next_offset"].is_null() {
+        "complete"
+    } else {
+        "partial"
+    });
+    if let Some(items) = page["items"].as_array_mut() {
+        for item in items {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let value = &mut item["value"]["result"];
+            if value["type"]["kind"] == "pointer"
+                && let Some(address) = value["value"].as_str()
+                && let Ok(address) = u64::from_str_radix(address.trim_start_matches("0x"), 16)
+                && address != 0
+                && let Some(symbol) = symbolize(address)
+            {
+                value["symbol"] = symbol;
+            }
+        }
+    }
+    page
+}
+
+pub(crate) fn stopped_arguments(
+    pid: i32,
+    root: &Path,
+    memory: &dyn crate::unwind::UnwindMemory,
+    registers: Registers,
+    deadline: Instant,
+) -> serde_json::Value {
+    let result = if Instant::now() < deadline {
+        discover_stopped(
+            root,
+            memory,
+            registers,
+            Discovery::Parameters,
+            "*",
+            (0, 8),
+            deadline,
+        )
+    } else {
+        Err(failure(
+            "limit_reached",
+            "argument capture deadline reached",
+        ))
+    };
+    enrich_arguments(result, deadline, |address| {
+        super::resolve(pid, address, &[]).ok()?.symbol_location()
+    })
+}
+
+struct Parser<'a> {
+    text: &'a str,
+    rest: &'a str,
+    operations: Vec<Access>,
+    spans: Vec<std::ops::Range<usize>>,
+    root_span: std::ops::Range<usize>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            rest: text,
+            operations: vec![],
+            spans: vec![],
+            root_span: 0..0,
+        }
+    }
+
+    fn position(&self) -> usize {
+        self.text.len() - self.rest.trim_start().len()
+    }
+
+    fn push(&mut self, op: Access, start: usize, end: usize) {
+        self.operations.push(op);
+        self.spans.push(start..end);
+    }
+
     fn eat(&mut self, prefix: &str) -> bool {
         self.rest = self.rest.trim_start();
         if let Some(rest) = self.rest.strip_prefix(prefix) {
@@ -77,9 +260,10 @@ impl Parser<'_> {
         if depth > 24 {
             return Err(error("expression nesting exceeds limit"));
         }
+        let start = self.position();
         if self.eat("*") {
             let name = self.expression(depth + 1)?;
-            self.operations.push(Access::Deref);
+            self.push(Access::Deref, start, start + 1);
             return Ok(name);
         }
         let name = if self.eat("(") {
@@ -99,16 +283,26 @@ impl Parser<'_> {
                 name.push_str("::");
                 name.push_str(&self.identifier()?);
             }
+            self.root_span = start
+                ..(start
+                    + self.text[start..self.text.len() - self.rest.len()]
+                        .trim_end()
+                        .len());
             name
         };
         loop {
+            let start = self.position();
             if self.eat("->") {
-                self.operations.push(Access::Deref);
+                self.push(Access::Deref, start, start + 2);
+                let member_start = self.position();
                 let member = self.identifier()?;
-                self.operations.push(Access::Member(member));
+                let end = member_start + member.len();
+                self.push(Access::Member(member), member_start, end);
             } else if self.eat(".") {
+                let member_start = self.position();
                 let member = self.identifier()?;
-                self.operations.push(Access::Member(member));
+                let end = member_start + member.len();
+                self.push(Access::Member(member), member_start, end);
             } else if self.eat("[") {
                 self.rest = self.rest.trim_start();
                 let end = self.rest.bytes().take_while(u8::is_ascii_digit).count();
@@ -119,7 +313,11 @@ impl Parser<'_> {
                 if !self.eat("]") {
                     return Err(error("missing closing array bracket"));
                 }
-                self.operations.push(Access::Index(index));
+                self.push(
+                    Access::Index(index),
+                    start,
+                    self.text.len() - self.rest.len(),
+                );
             } else {
                 return Ok(name);
             }
@@ -139,6 +337,8 @@ struct Type {
     fields: Vec<Field>,
     #[serde(skip_serializing_if = "Option::is_none")]
     element_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<Vec<u64>>,
 }
 
 #[derive(Serialize)]
@@ -148,6 +348,12 @@ struct Field {
     offset: Option<u64>,
     byte_size: Option<usize>,
     base_class: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<Vec<u64>>,
 }
 
 #[derive(Serialize)]
@@ -158,6 +364,10 @@ struct Datum {
     bytes: String,
     value: serde_json::Value,
     module: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbol: Option<serde_json::Value>,
     #[serde(skip)]
     number: Option<Number>,
 }
@@ -167,20 +377,98 @@ pub struct Report {
     pid: i32,
     tid: i32,
     expression: String,
+    #[serde(flatten)]
+    outcome: Outcome,
+    cleanup: Cleanup,
+}
+
+#[derive(Serialize)]
+struct Outcome {
     status: &'static str,
     result: Option<Datum>,
     issue: Option<String>,
-    cleanup: Cleanup,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    hint: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<serde_json::Value>,
+}
+
+impl Outcome {
+    fn from_result(result: Result<Datum>) -> Self {
+        match result {
+            Ok(mut value) => {
+                if value.ty.byte_size == 8 && (value.value.is_i64() || value.value.is_u64()) {
+                    value.value = serde_json::Value::String(value.value.to_string());
+                }
+                Self {
+                    status: "complete",
+                    result: Some(value),
+                    issue: None,
+                    code: None,
+                    message: None,
+                    hint: None,
+                    children: None,
+                }
+            }
+            Err(e) => {
+                let status = e.downcast_ref::<Failure>().map_or("unsupported", |f| f.0);
+                Self::failed(status, status.to_ascii_uppercase(), e.to_string())
+            }
+        }
+    }
+
+    fn symbolize_pointer(&mut self, pid: i32, deadline: Instant) {
+        if Instant::now() >= deadline {
+            return;
+        }
+        let Some(value) = self
+            .result
+            .as_mut()
+            .filter(|value| value.ty.kind == "pointer")
+        else {
+            return;
+        };
+        if let Some(address) = value
+            .value
+            .as_str()
+            .and_then(|text| u64::from_str_radix(text.trim_start_matches("0x"), 16).ok())
+            .filter(|address| *address != 0)
+        {
+            value.symbol = super::resolve(pid, address, &[])
+                .ok()
+                .and_then(|resolved| resolved.symbol_location());
+        }
+    }
+
+    fn failed(status: &'static str, code: String, message: String) -> Self {
+        Self {
+            status,
+            result: None,
+            issue: Some(message.clone()),
+            code: Some(code),
+            children: None,
+            message: Some(message),
+            hint: match status {
+                "null_pointer" => Some("Inspect the pointer before dereferencing it."),
+                "out_of_bounds" => Some("Use an index within the array's DWARF bounds."),
+                _ => None,
+            },
+        }
+    }
 }
 
 struct Eval<'a, 'read> {
     dwarf: &'read Dwarf<Reader<'a>>,
     unit: &'read Unit<Reader<'a>>,
-    trace: &'read Trace<'read>,
+    memory: &'read dyn crate::unwind::UnwindMemory,
     regs: Registers,
     link_pc: Option<u64>,
     cfa: Option<u64>,
     bias: i128,
+    preview_deadline: Option<Instant>,
 }
 
 impl<'a> Eval<'a, '_> {
@@ -226,9 +514,9 @@ impl<'a> Eval<'a, '_> {
                     base_type,
                 } if base_type.0 == 0 => {
                     let word = self
-                        .trace
+                        .memory
                         .read_word(address, size.into())
-                        .map_err(|e| failure("read_failed", e))?;
+                        .map_err(memory_failure)?;
                     evaluation.resume_with_memory(Value::Generic(word))?
                 }
                 EvaluationResult::RequiresRegister {
@@ -311,9 +599,9 @@ impl<'a> Eval<'a, '_> {
                         .checked_add(bytes.len() as u64)
                         .ok_or_else(|| error("value range overflows"))?;
                     let word = self
-                        .trace
+                        .memory
                         .read_word(address, size)
-                        .map_err(|e| failure("read_failed", e))?;
+                        .map_err(memory_failure)?;
                     bytes.extend_from_slice(&word.to_le_bytes()[..size]);
                 }
                 Ok(bytes)
@@ -322,6 +610,7 @@ impl<'a> Eval<'a, '_> {
     }
 }
 
+#[derive(Clone)]
 enum Place {
     Address(u64),
     Bytes(Vec<u8>),
@@ -416,21 +705,15 @@ fn underlying<'a>(unit: &Unit<Reader<'a>>, mut offset: Offset) -> Result<Die<'a>
     Err(error("DWARF type alias chain too deep"))
 }
 
-fn array_length(unit: &Unit<Reader<'_>>, array: &Die<'_>) -> Result<u64> {
+fn array_dimensions(unit: &Unit<Reader<'_>>, array: &Die<'_>) -> Result<Vec<u64>> {
     let mut cursor = unit.entries_at_offset(array.offset())?;
-    cursor.next_dfs()?;
-    let mut count = None;
+    let root_depth = cursor.next_dfs()?.map_or(0, |root| root.depth());
+    let mut dimensions = Vec::new();
     while let Some(child) = cursor.next_dfs()? {
-        if child.depth() <= array.depth() {
+        if child.depth() <= root_depth {
             break;
         }
-        if child.depth() == array.depth() + 1 && child.tag() == gimli::DW_TAG_subrange_type {
-            if count.is_some() {
-                return Err(failure(
-                    "unsupported",
-                    "multidimensional array layout is unsupported",
-                ));
-            }
+        if child.depth() == root_depth + 1 && child.tag() == gimli::DW_TAG_subrange_type {
             let lower = child
                 .attr_value(gimli::DW_AT_lower_bound)
                 .and_then(|v| v.udata_value())
@@ -438,7 +721,7 @@ fn array_length(unit: &Unit<Reader<'_>>, array: &Die<'_>) -> Result<u64> {
             if lower != 0 {
                 return Err(failure("unsupported", "nonzero array lower bound"));
             }
-            count = child
+            let count = child
                 .attr_value(gimli::DW_AT_count)
                 .and_then(|v| v.udata_value())
                 .or_else(|| {
@@ -446,13 +729,32 @@ fn array_length(unit: &Unit<Reader<'_>>, array: &Die<'_>) -> Result<u64> {
                         .attr_value(gimli::DW_AT_upper_bound)?
                         .udata_value()?
                         .checked_add(1)
-                });
-            if count.is_none() {
-                return Err(failure("unsupported", "array bound is not constant"));
+                })
+                .ok_or_else(|| failure("unsupported", "array bound is not constant"))?;
+            if dimensions.len() >= 16 {
+                return Err(failure(
+                    "limit_reached",
+                    "array has more than 16 dimensions",
+                ));
             }
+            dimensions.push(count);
         }
     }
-    count.ok_or_else(|| failure("unsupported", "array bound missing"))
+    if dimensions.is_empty() {
+        return Err(failure("unsupported", "array bound missing"));
+    }
+    Ok(dimensions)
+}
+
+fn array_length(unit: &Unit<Reader<'_>>, array: &Die<'_>) -> Result<u64> {
+    let dimensions = array_dimensions(unit, array)?;
+    match dimensions.as_slice() {
+        [count] => Ok(*count),
+        _ => Err(failure(
+            "unsupported",
+            "multidimensional array indexing is unsupported",
+        )),
+    }
 }
 
 fn type_size<'a>(unit: &Unit<Reader<'a>>, entry: &Die<'a>, depth: usize) -> Result<usize> {
@@ -471,9 +773,13 @@ fn type_size<'a>(unit: &Unit<Reader<'a>>, entry: &Die<'a>, depth: usize) -> Resu
         | gimli::DW_TAG_rvalue_reference_type => Ok(unit.encoding().address_size as usize),
         gimli::DW_TAG_array_type => {
             let element = underlying(unit, typedef_target(unit, entry)?)?;
-            type_size(unit, &element, depth + 1)?
-                .checked_mul(usize::try_from(array_length(unit, entry)?)?)
-                .ok_or_else(|| error("array size overflow"))
+            let size = type_size(unit, &element, depth + 1)?;
+            array_dimensions(unit, entry)?
+                .into_iter()
+                .try_fold(size, |size, count| {
+                    size.checked_mul(usize::try_from(count)?)
+                        .ok_or_else(|| error("array size overflow"))
+                })
         }
         _ => Err(failure("unsupported", "type size missing")),
     }
@@ -492,15 +798,19 @@ fn member_offset(entry: &Die<'_>, aggregate: &Die<'_>) -> Result<u64> {
     }
 }
 
-fn fields<'a>(eval: &Eval<'a, '_>, entry: &Die<'a>) -> Result<Vec<Field>> {
-    let mut cursor = eval.unit.entries_at_offset(entry.offset())?;
-    cursor.next_dfs()?;
+fn fields<'a>(
+    dwarf: &Dwarf<Reader<'a>>,
+    unit: &Unit<Reader<'a>>,
+    entry: &Die<'a>,
+) -> Result<Vec<Field>> {
+    let mut cursor = unit.entries_at_offset(entry.offset())?;
+    let root_depth = cursor.next_dfs()?.map_or(0, |root| root.depth());
     let mut fields = Vec::new();
     while let Some(child) = cursor.next_dfs()? {
-        if child.depth() <= entry.depth() {
+        if child.depth() <= root_depth {
             break;
         }
-        if child.depth() != entry.depth() + 1
+        if child.depth() != root_depth + 1
             || !matches!(
                 child.tag(),
                 gimli::DW_TAG_member | gimli::DW_TAG_inheritance
@@ -514,20 +824,54 @@ fn fields<'a>(eval: &Eval<'a, '_>, entry: &Die<'a>) -> Result<Vec<Field>> {
                 "type layout has more than 128 fields",
             ));
         }
-        let ty = typedef_target(eval.unit, child)
+        let ty = typedef_target(unit, child)
             .ok()
-            .and_then(|ty| underlying(eval.unit, ty).ok());
+            .and_then(|ty| underlying(unit, ty).ok());
+        let array = ty
+            .as_ref()
+            .filter(|ty| ty.tag() == gimli::DW_TAG_array_type);
+        let element_type = array
+            .and_then(|ty| typedef_target(unit, ty).ok())
+            .and_then(|element| unit.entry(element).ok())
+            .and_then(|element| name(dwarf, unit, &element).ok().flatten());
         fields.push(Field {
-            name: name(eval.dwarf, eval.unit, child)?,
+            name: name(dwarf, unit, child)?,
             type_name: ty
                 .as_ref()
-                .and_then(|ty| name(eval.dwarf, eval.unit, ty).ok().flatten()),
+                .and_then(|ty| name(dwarf, unit, ty).ok().flatten()),
             offset: member_offset(child, entry).ok(),
-            byte_size: ty.as_ref().and_then(|ty| type_size(eval.unit, ty, 0).ok()),
+            byte_size: ty.as_ref().and_then(|ty| type_size(unit, ty, 0).ok()),
             base_class: child.tag() == gimli::DW_TAG_inheritance,
+            element_type,
+            element_count: array.and_then(|ty| array_length(unit, ty).ok()),
+            dimensions: array.and_then(|ty| array_dimensions(unit, ty).ok()),
         });
     }
     Ok(fields)
+}
+
+fn unknown_member<'a>(eval: &Eval<'a, '_>, aggregate: &Die<'a>, field: &str) -> String {
+    let mut candidates: Vec<_> = fields(eval.dwarf, eval.unit, aggregate)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|member| !member.base_class)
+        .filter_map(|member| member.name)
+        .collect();
+    candidates.sort_by_key(|name| {
+        let common = name
+            .bytes()
+            .zip(field.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        (std::cmp::Reverse(common), name.len().abs_diff(field.len()))
+    });
+    candidates.dedup();
+    candidates.truncate(5);
+    let mut message = format!("member {field} not found");
+    if !candidates.is_empty() {
+        message.push_str(&format!(". Did you mean {}?", candidates.join(", ")));
+    }
+    message
 }
 
 fn find_member<'a>(
@@ -535,11 +879,21 @@ fn find_member<'a>(
     aggregate: &Die<'a>,
     field: &str,
     depth: usize,
+    with_offset: bool,
 ) -> Result<Option<(Offset, u64)>> {
     if depth > 12 {
         return Err(failure(
             "unsupported",
             "inheritance hierarchy exceeds limit",
+        ));
+    }
+    if matches!(
+        aggregate.attr_value(gimli::DW_AT_declaration),
+        Some(AttributeValue::Flag(true))
+    ) {
+        return Err(failure(
+            "unsupported",
+            "member lookup has an incomplete DWARF type",
         ));
     }
     let mut cursor = eval.unit.entries_at_offset(aggregate.offset())?;
@@ -557,7 +911,11 @@ fn find_member<'a>(
         {
             return Ok(Some((
                 typedef_target(eval.unit, entry)?,
-                member_offset(entry, aggregate)?,
+                if with_offset {
+                    member_offset(entry, aggregate)?
+                } else {
+                    0
+                },
             )));
         }
         if entry.tag() == gimli::DW_TAG_inheritance {
@@ -568,13 +926,17 @@ fn find_member<'a>(
     for offset in bases {
         let inheritance = eval.unit.entry(offset)?;
         let base = underlying(eval.unit, typedef_target(eval.unit, &inheritance)?)?;
-        if let Some((ty, delta)) = find_member(eval, &base, field, depth + 1)? {
+        if let Some((ty, delta)) = find_member(eval, &base, field, depth + 1, with_offset)? {
             if found.is_some() {
                 return Err(failure("ambiguous", "inherited member is ambiguous"));
             }
-            let offset = member_offset(&inheritance, aggregate)?
-                .checked_add(delta)
-                .ok_or_else(|| error("member offset overflow"))?;
+            let offset = if with_offset {
+                member_offset(&inheritance, aggregate)?
+                    .checked_add(delta)
+                    .ok_or_else(|| error("member offset overflow"))?
+            } else {
+                0
+            };
             found = Some((ty, offset));
         }
     }
@@ -593,9 +955,73 @@ fn word(bytes: &[u8]) -> Result<u64> {
 fn pointer<'a>(eval: &Eval<'a, '_>, place: &Place, entry: &Die<'a>) -> Result<u64> {
     let address = word(&eval.bytes(place, type_size(eval.unit, entry, 0)?)?)?;
     if address == 0 {
-        return Err(failure("read_failed", "null pointer dereference"));
+        return Err(failure("null_pointer", "null pointer dereference"));
     }
     Ok(address)
+}
+
+enum ArrayStorage<'a> {
+    Elements(Die<'a>, u64),
+    Empty,
+}
+
+fn array_storage<'a>(
+    eval: &Eval<'a, '_>,
+    entry: &Die<'a>,
+    with_offset: bool,
+) -> Result<Option<ArrayStorage<'a>>> {
+    if entry.tag() == gimli::DW_TAG_array_type {
+        return Ok(Some(ArrayStorage::Elements(
+            eval.unit.entry(entry.offset())?,
+            0,
+        )));
+    }
+    if !matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+    ) {
+        return Ok(None);
+    }
+    let Some(name) = name(eval.dwarf, eval.unit, entry)? else {
+        return Ok(None);
+    };
+    let name = name.strip_prefix("std::").unwrap_or(&name);
+    if !name.starts_with("array<") {
+        return Ok(None);
+    }
+    let storage = match find_member(eval, entry, "_M_elems", 0, with_offset)? {
+        Some(storage) => Some(storage),
+        None => find_member(eval, entry, "__elems_", 0, with_offset)?,
+    };
+    if let Some((storage, offset)) = storage {
+        let storage = underlying(eval.unit, storage)?;
+        if storage.tag() == gimli::DW_TAG_array_type {
+            return Ok(Some(ArrayStorage::Elements(storage, offset)));
+        }
+    }
+    Ok(name
+        .trim_end_matches('>')
+        .rsplit_once(',')
+        .is_some_and(|(_, count)| count.trim() == "0")
+        .then_some(ArrayStorage::Empty))
+}
+
+fn index_type<'a>(
+    eval: &Eval<'a, '_>,
+    entry: &Die<'a>,
+    index: u64,
+    with_offset: bool,
+) -> Result<Option<(Offset, u64)>> {
+    if entry.tag() == gimli::DW_TAG_pointer_type {
+        return Ok(Some((typedef_target(eval.unit, entry)?, 0)));
+    }
+    match array_storage(eval, entry, with_offset)? {
+        Some(ArrayStorage::Elements(array, offset)) if index < array_length(eval.unit, &array)? => {
+            Ok(Some((typedef_target(eval.unit, &array)?, offset)))
+        }
+        Some(_) => Err(failure("out_of_bounds", "array index out of bounds")),
+        None => Ok(None),
+    }
 }
 
 fn access(
@@ -611,21 +1037,21 @@ fn access(
                 place = Place::Address(pointer(eval, &place, &entry)?);
                 ty = typedef_target(eval.unit, &entry)?;
             }
-            Access::Index(index)
-                if matches!(
-                    entry.tag(),
-                    gimli::DW_TAG_array_type | gimli::DW_TAG_pointer_type
-                ) =>
-            {
+            Access::Index(index) => {
+                let (element, offset) =
+                    index_type(eval, &entry, *index, true)?.ok_or_else(|| {
+                        failure(
+                            "unsupported",
+                            "expression operation does not match the DWARF type",
+                        )
+                    })?;
                 if entry.tag() == gimli::DW_TAG_pointer_type {
                     place = Place::Address(pointer(eval, &place, &entry)?);
-                } else if *index >= array_length(eval.unit, &entry)? {
-                    return Err(failure("read_failed", "array index out of bounds"));
                 }
-                ty = typedef_target(eval.unit, &entry)?;
+                ty = element;
                 let element = underlying(eval.unit, ty)?;
                 let size = type_size(eval.unit, &element, 0)? as u64;
-                place = place.advance(
+                place = place.advance(offset)?.advance(
                     index
                         .checked_mul(size)
                         .ok_or_else(|| error("array offset overflow"))?,
@@ -639,8 +1065,8 @@ fn access(
                         | gimli::DW_TAG_union_type
                 ) =>
             {
-                let (member, offset) = find_member(eval, &entry, field, 0)?
-                    .ok_or_else(|| failure("not_found", format!("member {field} not found")))?;
+                let (member, offset) = find_member(eval, &entry, field, 0, true)?
+                    .ok_or_else(|| failure("not_found", unknown_member(eval, &entry, field)))?;
                 place = place.advance(offset)?;
                 ty = member;
             }
@@ -663,12 +1089,126 @@ fn access(
     Ok((ty, place))
 }
 
+fn char_pointer<'a>(eval: &Eval<'a, '_>, ty: &Die<'a>) -> Option<()> {
+    if ty.tag() != gimli::DW_TAG_pointer_type {
+        return None;
+    }
+    let target = underlying(eval.unit, typedef_target(eval.unit, ty).ok()?).ok()?;
+    (target.tag() == gimli::DW_TAG_base_type
+        && name(eval.dwarf, eval.unit, &target)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("char"))
+    .then_some(())
+}
+
+fn string_preview<'a>(
+    eval: &Eval<'a, '_>,
+    entry: &Die<'a>,
+    place: &Place,
+    bytes: &[u8],
+) -> Option<serde_json::Value> {
+    let deadline = eval.preview_deadline?;
+    let (address, length) = if char_pointer(eval, entry).is_some() {
+        (word(bytes).ok()?, None)
+    } else if matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+    ) {
+        let name = name(eval.dwarf, eval.unit, entry).ok()??;
+        let name = name.strip_prefix("std::").unwrap_or(&name);
+        let name = name.strip_prefix("__cxx11::").unwrap_or(name);
+        let read_member = |ty, place, field| {
+            let (ty, place) = access(eval, ty, place, &[Access::Member(field)]).ok()?;
+            Some((underlying(eval.unit, ty).ok()?, place))
+        };
+        let (pointer, pointer_place, length_member) = if name.starts_with("basic_string_view<char,")
+        {
+            let (pointer, place) = read_member(entry.offset(), place.clone(), "_M_str".into())?;
+            (pointer, place, "_M_len")
+        } else if name.starts_with("basic_string<char,") {
+            let (storage, place) =
+                read_member(entry.offset(), place.clone(), "_M_dataplus".into())?;
+            let (pointer, place) = read_member(storage.offset(), place, "_M_p".into())?;
+            (pointer, place, "_M_string_length")
+        } else {
+            return None;
+        };
+        char_pointer(eval, &pointer)?;
+        let (length_ty, length_place) =
+            read_member(entry.offset(), place.clone(), length_member.into())?;
+        if length_ty.tag() != gimli::DW_TAG_base_type
+            || !matches!(
+                length_ty.attr_value(gimli::DW_AT_encoding),
+                Some(AttributeValue::Encoding(gimli::DW_ATE_unsigned))
+            )
+        {
+            return None;
+        }
+        let length = word(
+            &eval
+                .bytes(&length_place, type_size(eval.unit, &length_ty, 0).ok()?)
+                .ok()?,
+        )
+        .ok()?;
+        let address = word(
+            &eval
+                .bytes(&pointer_place, type_size(eval.unit, &pointer, 0).ok()?)
+                .ok()?,
+        )
+        .ok()?;
+        (address, Some(length))
+    } else {
+        return None;
+    };
+    let mut preview = Vec::new();
+    let mut status = "complete";
+    let limit = length.unwrap_or(MAX_VALUE as u64).min(MAX_VALUE as u64);
+    if address == 0 && length != Some(0) {
+        status = "null_pointer";
+    } else {
+        while (preview.len() as u64) < limit {
+            if Instant::now() >= deadline {
+                status = "limit_reached";
+                break;
+            }
+            let Some(next) = address.checked_add(preview.len() as u64) else {
+                status = "read_failed";
+                break;
+            };
+            match eval.memory.read_word(next, 1) {
+                Ok(0) if length.is_none() => break,
+                Ok(byte) => preview.push(byte as u8),
+                Err(error) => {
+                    status = if error.is::<crate::unwind::MissingMemory>() {
+                        "missing_page"
+                    } else {
+                        "read_failed"
+                    };
+                    break;
+                }
+            }
+        }
+        if status == "complete"
+            && length.unwrap_or(limit + 1) > preview.len() as u64
+            && preview.len() as u64 == limit
+        {
+            status = "truncated";
+        }
+    }
+    Some(serde_json::json!({
+        "address": hex(address), "length": length,
+        "text": String::from_utf8_lossy(&preview), "bytes": id_hex(&preview), "status": status,
+    }))
+}
+
 fn evaluate_variable<'a>(
     eval: &Eval<'a, '_>,
     entry: &Die<'a>,
     frame_base: Option<Attr<'a>>,
     operations: &[Access],
-    module: &Module,
+    module: PathBuf,
 ) -> Result<Datum> {
     let ty = typedef_target(eval.unit, entry)?;
     let place = if let Some(attr) = resolved_attr(eval.unit, entry, gimli::DW_AT_location, 0)? {
@@ -721,7 +1261,14 @@ fn evaluate_variable<'a>(
     let (ty, place) = access(eval, ty, place, operations)?;
     let entry = underlying(eval.unit, ty)?;
     let size = type_size(eval.unit, &entry, 0)?;
-    let bytes = eval.bytes(&place, size)?;
+    let composite = matches!(
+        entry.tag(),
+        gimli::DW_TAG_array_type
+            | gimli::DW_TAG_structure_type
+            | gimli::DW_TAG_class_type
+            | gimli::DW_TAG_union_type
+    );
+    let bytes = eval.bytes(&place, if composite { size.min(MAX_VALUE) } else { size })?;
     let kind = match entry.tag() {
         gimli::DW_TAG_pointer_type => "pointer",
         gimli::DW_TAG_base_type => "scalar",
@@ -762,6 +1309,11 @@ fn evaluate_variable<'a>(
         ("scalar" | "enum", _, 1..=8) => serde_json::json!(word(&bytes)?),
         _ => serde_json::Value::Null,
     };
+    let dimensions = match array_storage(eval, &entry, false)? {
+        Some(ArrayStorage::Elements(array, _)) => Some(array_dimensions(eval.unit, &array)?),
+        Some(ArrayStorage::Empty) => Some(vec![0]),
+        None => None,
+    };
     Ok(Datum {
         ty: Type {
             name: name(eval.dwarf, eval.unit, &eval.unit.entry(ty)?)?
@@ -769,23 +1321,25 @@ fn evaluate_variable<'a>(
             kind,
             byte_size: size,
             fields: if matches!(kind, "struct" | "class" | "union") {
-                fields(eval, &entry)?
+                fields(eval.dwarf, eval.unit, &entry)?
             } else {
                 Vec::new()
             },
-            element_count: if kind == "array" {
-                Some(array_length(eval.unit, &entry)?)
-            } else {
-                None
-            },
+            element_count: dimensions.as_deref().and_then(|dims| match dims {
+                [count] => Some(*count),
+                _ => None,
+            }),
+            dimensions,
         },
         address: match place {
             Place::Address(address) => Some(hex(address)),
             _ => None,
         },
+        preview: string_preview(eval, &entry, &place, &bytes),
+        symbol: None,
         bytes: id_hex(&bytes),
         value,
-        module: Some(module.path()),
+        module: Some(module),
         number,
     })
 }
@@ -798,6 +1352,7 @@ struct Scope<'a> {
     frame_base: Option<Attr<'a>>,
 }
 
+#[derive(Clone)]
 struct Candidate<'a> {
     offset: Offset,
     priority: usize,
@@ -848,6 +1403,8 @@ fn inline_origin_variable<'a>(
     Ok(None)
 }
 
+type VariableVisitor<'a, 'v> = dyn FnMut(&str, bool, gimli::DwTag, &Candidate<'a>) -> bool + 'v;
+
 fn find_variable<'a>(
     dwarf: &Dwarf<Reader<'a>>,
     unit: &Unit<Reader<'a>>,
@@ -855,6 +1412,8 @@ fn find_variable<'a>(
     link_pc: Option<u64>,
     scanned: &mut usize,
     deadline: Instant,
+    mut shadow: Option<&mut bool>,
+    mut visit: Option<&mut VariableVisitor<'a, '_>>,
 ) -> Result<Option<Candidate<'a>>> {
     let mut entries = unit.entries();
     let mut scopes: Vec<Scope<'a>> = Vec::new();
@@ -931,6 +1490,13 @@ fn find_variable<'a>(
             scope.namespace.push_str(&namespace);
             scope.namespace.push_str("::");
         }
+        if let Some(shadow) = shadow.as_deref_mut()
+            && scope.local
+            && matches!(tag, gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter)
+            && name(dwarf, unit, entry)?.as_deref() == Some(target)
+        {
+            *shadow = true;
+        }
         if scope.active
             && matches!(tag, gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter)
             && let Some(name) = name(dwarf, unit, entry)?
@@ -944,9 +1510,7 @@ fn find_variable<'a>(
                 Some(AttributeValue::Flag(true))
             ) {
                 declarations.insert(entry.offset().0, qualified);
-            } else if (scope.local && name == target)
-                || (!scope.local && qualified == target.strip_prefix("::").unwrap_or(target))
-            {
+            } else {
                 let priority = if scope.local { depth + 1 } else { 0 };
                 let candidate = Candidate {
                     offset: entry.offset(),
@@ -954,7 +1518,20 @@ fn find_variable<'a>(
                     concrete: true,
                     frame_base: scope.frame_base,
                 };
-                prefer(&mut best, &mut ambiguous, candidate);
+                if let Some(visit) = visit.as_mut() {
+                    if !visit(
+                        if scope.local { &name } else { &qualified },
+                        scope.local,
+                        tag,
+                        &candidate,
+                    ) {
+                        break;
+                    }
+                } else if (scope.local && name == target)
+                    || (!scope.local && qualified == target.strip_prefix("::").unwrap_or(target))
+                {
+                    prefer(&mut best, &mut ambiguous, candidate);
+                }
             }
         }
         scopes.push(scope);
@@ -968,10 +1545,19 @@ fn find_variable<'a>(
     Ok(best)
 }
 
+#[derive(Clone, Copy)]
+enum LiveModules<'a> {
+    Filter {
+        module: Option<&'a str>,
+        instance: Option<u64>,
+    },
+    FrameFirst,
+}
+
 struct Query<'a> {
     target: &'a str,
     operations: &'a [Access],
-    trace: &'a Trace<'a>,
+    memory: &'a dyn crate::unwind::UnwindMemory,
     registers: Registers,
     deadline: Instant,
     scanned: usize,
@@ -980,6 +1566,27 @@ struct Query<'a> {
 struct MatchValue {
     priority: usize,
     value: Result<Datum>,
+}
+
+fn load_sections<'a, T>(
+    obj: &object::File<'a>,
+    convert: impl Fn(std::borrow::Cow<'a, [u8]>) -> T,
+) -> Result<DwarfSections<T>> {
+    let mut total = 0;
+    DwarfSections::load(|id| -> Result<_> {
+        let Some(section) = obj.section_by_name(id.name()) else {
+            return Ok(convert(std::borrow::Cow::Borrowed(&[][..])));
+        };
+        let size = section.compressed_data()?.uncompressed_size;
+        if size > 32 * 1024 * 1024 - total {
+            return Err(failure(
+                "limit_reached",
+                "variable DWARF section budget exceeded",
+            ));
+        }
+        total += size;
+        Ok(convert(section.uncompressed_data()?))
+    })
 }
 
 impl Query<'_> {
@@ -994,21 +1601,7 @@ impl Query<'_> {
         if obj.section_by_name(".debug_info").is_none() {
             return Ok(None);
         }
-        let mut total = 0;
-        let sections = DwarfSections::load(|id| -> Result<_> {
-            let Some(section) = obj.section_by_name(id.name()) else {
-                return Ok(std::borrow::Cow::Borrowed(&[][..]));
-            };
-            let size = section.compressed_data()?.uncompressed_size;
-            if size > 32 * 1024 * 1024 - total {
-                return Err(failure(
-                    "limit_reached",
-                    "variable DWARF section budget exceeded",
-                ));
-            }
-            total += size;
-            Ok(section.uncompressed_data()?)
-        })?;
+        let sections = load_sections(obj, |section| section)?;
         let dwarf = sections.borrow(|bytes| EndianSlice::new(bytes, LittleEndian));
         let mut units = dwarf.units();
         let mut best: Option<MatchValue> = None;
@@ -1027,6 +1620,8 @@ impl Query<'_> {
                 link_pc,
                 &mut self.scanned,
                 self.deadline,
+                None,
+                None,
             )?
             else {
                 continue;
@@ -1052,15 +1647,21 @@ impl Query<'_> {
             let eval = Eval {
                 dwarf: &dwarf,
                 unit: &unit,
-                trace: self.trace,
+                memory: self.memory,
                 regs: self.registers,
                 link_pc,
                 cfa,
                 bias: instance.bias,
+                preview_deadline: Some(self.deadline),
             };
             let entry = unit.entry(candidate.offset)?;
-            let value =
-                evaluate_variable(&eval, &entry, candidate.frame_base, self.operations, module);
+            let value = evaluate_variable(
+                &eval,
+                &entry,
+                candidate.frame_base,
+                self.operations,
+                module.path(),
+            );
             best = Some(MatchValue {
                 priority: candidate.priority,
                 value,
@@ -1069,12 +1670,11 @@ impl Query<'_> {
         Ok(best)
     }
 
-    fn read_process(
-        &mut self,
-        root: &Path,
-        filter: Option<&str>,
-        selected_instance: Option<u64>,
-    ) -> Result<Datum> {
+    fn read_process(&mut self, root: &Path, selection: LiveModules<'_>) -> Result<Datum> {
+        let (filter, selected_instance) = match selection {
+            LiveModules::Filter { module, instance } => (module, instance),
+            LiveModules::FrameFirst => (None, None),
+        };
         let pc = self.registers.get(PC)?;
         let exe = fs::metadata(root.join("exe")).ok();
         let mut modules = modules::read(root)?;
@@ -1129,7 +1729,7 @@ impl Query<'_> {
                         &module,
                         link,
                         pc.wrapping_sub(link),
-                        self.trace,
+                        self.memory,
                         self.registers,
                     )
                     .ok()
@@ -1145,7 +1745,9 @@ impl Query<'_> {
                     self.read_image(&image, &module, instance, link_pc, cfa)?
                 };
                 if let Some(found) = found {
-                    if found.priority > 0 {
+                    if found.priority > 0
+                        || (matches!(selection, LiveModules::FrameFirst) && link_pc.is_some())
+                    {
                         return found.value;
                     }
                     if global.is_some() {
@@ -1180,25 +1782,56 @@ pub fn inspect(
     expression: String,
     module: Option<&str>,
     instance: Option<u64>,
+    timeout_ms: Option<u32>,
+    expand: Option<crate::rpc::InspectExpansion>,
 ) -> Result<Report> {
-    if expression.is_empty()
-        || expression.len() > 512
-        || module.is_some_and(|name| name.len() > 4096)
-    {
-        return Err(error(
-            "expected an expression of 1–512 bytes and a module filter of at most 4096 bytes",
-        ));
-    }
-    let parsed = expression::Expression::parse(&expression)?;
     let process = Process::open(pid)?;
-    let tid = tid.unwrap_or(pid);
     let mut trace = Trace::new(pid, &process.root, start_ticks(&process.root)?);
-    let deadline = Instant::now() + Duration::from_millis(750);
-    let result = (|| -> Result<Datum> {
+    let mut report = inspect_with_trace(
+        pid,
+        tid,
+        expression,
+        module,
+        instance,
+        timeout_ms,
+        expand,
+        &process.root,
+        &mut trace,
+    )?;
+    report.cleanup = trace.close();
+    if !report.cleanup.ok() {
+        report.outcome.status = "cleanup_failed";
+    }
+    Ok(report)
+}
+
+pub(crate) fn inspect_with_trace(
+    pid: i32,
+    tid: Option<i32>,
+    expression: String,
+    module: Option<&str>,
+    instance: Option<u64>,
+    timeout_ms: Option<u32>,
+    expand: Option<crate::rpc::InspectExpansion>,
+    root: &Path,
+    trace: &mut Trace,
+) -> Result<Report> {
+    let tid = tid.unwrap_or(pid);
+    let timeout = timeout_ms.unwrap_or(750);
+    if !(1..=5000).contains(&timeout) {
+        return Err(crate::Diagnostic::new(
+            "INVALID_ARGUMENT",
+            "inspect timeout_ms must be in 1..=5000",
+            None,
+        )
+        .into());
+    }
+    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout));
+    let result = (|| -> Result<Outcome> {
         trace
             .freeze(deadline)
             .map_err(|e| failure("read_failed", e))?;
-        if crate::machine(&process.root)? != regs::ARCH {
+        if crate::machine(root)? != regs::ARCH {
             return Err(failure(
                 "unsupported",
                 "target ABI does not match inspection server",
@@ -1217,48 +1850,153 @@ pub fn inspect(
         let registers = regs::read(tid)
             .map_err(|e| failure("read_failed", e))?
             .stack;
-        let mut scanned = 0;
-        let mut lookups = 0;
-        parsed.evaluate(&mut |target, operations| {
-            lookups += 1;
-            if lookups > 16 {
-                return Err(failure(
-                    "limit_reached",
-                    "expression exceeds 16 variable lookups",
-                ));
-            }
-            let mut query = Query {
-                target,
-                operations,
-                trace: &trace,
+        let mut outcome = inspect_projection(&expression, expand, deadline, |text| {
+            evaluate_live(
+                parse_live(text, module)?,
+                root,
+                LiveModules::Filter { module, instance },
+                trace,
                 registers,
                 deadline,
-                scanned,
-            };
-            let value = query.read_process(&process.root, module, instance);
-            scanned = query.scanned;
-            value
-        })
+            )
+        });
+        outcome.symbolize_pointer(pid, deadline);
+        Ok(outcome)
     })();
-    let cleanup = trace.close();
-    let (mut status, result, issue) = match result {
-        Ok(value) => ("complete", Some(value), None),
-        Err(e) => (
-            e.downcast_ref::<Failure>().map_or("unsupported", |e| e.0),
-            None,
-            Some(e.to_string()),
-        ),
+    let outcome = result.unwrap_or_else(|error| Outcome::from_result(Err(error)));
+    Ok(live_report(pid, tid, expression, outcome))
+}
+
+pub(crate) fn inspect_stopped(
+    pid: i32,
+    tid: i32,
+    expression: String,
+    root: &Path,
+    memory: &dyn crate::unwind::UnwindMemory,
+    registers: Registers,
+    deadline: Instant,
+    expand: Option<crate::rpc::InspectExpansion>,
+) -> Report {
+    let mut outcome = inspect_projection(&expression, expand, deadline, |text| {
+        evaluate_live(
+            parse_live(text, None)?,
+            root,
+            LiveModules::FrameFirst,
+            memory,
+            registers,
+            deadline,
+        )
+    });
+    outcome.symbolize_pointer(pid, deadline);
+    live_report(pid, tid, expression, outcome)
+}
+
+fn inspect_projection(
+    expression: &str,
+    expand: Option<crate::rpc::InspectExpansion>,
+    deadline: Instant,
+    mut evaluate: impl FnMut(&str) -> Result<Datum>,
+) -> Outcome {
+    let mut outcome = Outcome::from_result(evaluate(expression));
+    let (Some(options), Some(value)) = (expand, outcome.result.as_ref()) else {
+        return outcome;
     };
-    if !cleanup.ok() {
-        status = "cleanup_failed";
+    let limit = options.limit.unwrap_or(16);
+    if !(1..=64).contains(&limit) {
+        return Outcome::failed(
+            "invalid_argument",
+            "INVALID_ARGUMENT".into(),
+            "expansion limit must be in 1..=64".into(),
+        );
     }
-    Ok(Report {
+    let offset = options.offset as u64;
+    let fields: Vec<_> = value
+        .ty
+        .fields
+        .iter()
+        .filter(|field| !field.base_class)
+        .filter_map(|field| field.name.as_deref())
+        .collect();
+    let count = value.ty.element_count.unwrap_or(fields.len() as u64);
+    let end = count.min(offset + u64::from(limit));
+    let mut items = Vec::new();
+    let mut next = offset;
+    for index in offset..end {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let child = if value.ty.element_count.is_some() {
+            format!("{expression}[{index}]")
+        } else {
+            format!("{expression}.{}", fields[index as usize])
+        };
+        items.push(serde_json::json!({"expression": child, "value": Outcome::from_result(evaluate(&child))}));
+        next += 1;
+    }
+    outcome.children = Some(
+        serde_json::json!({"items": items, "next_offset": (next < count).then_some(next),
+        "warnings": if next < end { vec![crate::Diagnostic::new("LIMIT_REACHED", "Expansion reached the inspection deadline", None)] } else { Vec::new() }}),
+    );
+    outcome
+}
+
+fn parse_live(expression: &str, module: Option<&str>) -> Result<expression::Expression> {
+    if expression.is_empty()
+        || expression.len() > 512
+        || module.is_some_and(|name| name.len() > 4096)
+    {
+        return Err(failure(
+            "invalid_expression",
+            "expected an expression of 1–512 bytes and a module filter of at most 4096 bytes",
+        ));
+    }
+    expression::Expression::parse(expression).map_err(|e| failure("invalid_expression", e))
+}
+
+fn evaluate_live(
+    parsed: expression::Expression,
+    root: &Path,
+    selection: LiveModules<'_>,
+    memory: &dyn crate::unwind::UnwindMemory,
+    registers: Registers,
+    deadline: Instant,
+) -> Result<Datum> {
+    let mut scanned = 0;
+    let mut lookups = 0;
+    parsed.evaluate(&mut |target, operations| {
+        lookups += 1;
+        if lookups > 16 {
+            return Err(failure(
+                "limit_reached",
+                "expression exceeds 16 variable lookups",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(failure(
+                "limit_reached",
+                "inspection exceeded its capture budget",
+            ));
+        }
+        let mut query = Query {
+            target,
+            operations,
+            memory,
+            registers,
+            deadline,
+            scanned,
+        };
+        let value = query.read_process(root, selection);
+        scanned = query.scanned;
+        value
+    })
+}
+
+fn live_report(pid: i32, tid: i32, expression: String, outcome: Outcome) -> Report {
+    Report {
         pid,
         tid,
         expression,
-        status,
-        result,
-        issue,
-        cleanup,
-    })
+        outcome,
+        cleanup: Cleanup::default(),
+    }
 }

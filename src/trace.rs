@@ -13,7 +13,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{IoSlice, IoSliceMut};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy)]
 pub enum Stop {
     Interrupt,
+    ExecBoundary,
     Group(Signal),
     Delivery(Signal),
+    UnnamedDelivery(i32),
     Event(Signal, i32),
     Breakpoint {
         slots: u64,
@@ -69,6 +71,11 @@ impl Stop {
                 signal: libc::SIGTRAP,
                 event: None,
             },
+            Self::ExecBoundary => StopInfo {
+                kind: "exec_boundary",
+                signal: libc::SIGTRAP,
+                event: None,
+            },
             Self::Group(sig) => StopInfo {
                 kind: "group_stop",
                 signal: sig as i32,
@@ -77,6 +84,11 @@ impl Stop {
             Self::Delivery(sig) => StopInfo {
                 kind: "signal_delivery",
                 signal: sig as i32,
+                event: None,
+            },
+            Self::UnnamedDelivery(signal) => StopInfo {
+                kind: "signal_delivery",
+                signal,
                 event: None,
             },
             Self::Event(sig, event) => StopInfo {
@@ -88,7 +100,14 @@ impl Stop {
     }
 }
 
+fn next_thread_identity() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Thread {
+    pub(crate) identity: u64,
     pub before: Option<Status>,
     pub stop: Option<Stop>,
     requested: bool,
@@ -120,17 +139,53 @@ impl Cleanup {
     }
 }
 
-pub struct Trace<'a> {
+pub struct Trace {
     pub threads: BTreeMap<i32, Thread>,
     pub observed: BTreeMap<i32, Option<Status>>,
     pub started: Option<Instant>,
     pid: Pid,
-    root: &'a Path,
+    root: PathBuf,
     start_ticks: u64,
     monitored: bool,
+    launched: bool,
+    pub(crate) exit: Option<LaunchExit>,
     patches: BTreeMap<u64, Patch>,
     pub foreign_software: bool,
     _same_thread: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LaunchExit {
+    Code(i32),
+    Signal(i32),
+}
+
+enum Wait {
+    Named(WaitStatus),
+    Delivery(i32),
+    Terminated(i32),
+}
+
+fn wait_for_task(tid: i32, launched: bool) -> nix::Result<Wait> {
+    let flags = WaitPidFlag::__WALL | WaitPidFlag::WNOHANG;
+    let pid = Pid::from_raw(tid);
+    if !launched {
+        return waitpid(pid, Some(flags)).map(Wait::Named);
+    }
+    let mut raw = 0;
+    if Errno::result(unsafe { libc::waitpid(tid, &mut raw, flags.bits()) })? == 0 {
+        return Ok(Wait::Named(WaitStatus::StillAlive));
+    }
+    // Nix only represents standard signals. Pass real-time signals through.
+    match WaitStatus::from_raw(pid, raw) {
+        Err(Errno::EINVAL) if libc::WIFSTOPPED(raw) => Ok(Wait::Delivery(libc::WSTOPSIG(raw))),
+        Err(Errno::EINVAL) if libc::WIFSIGNALED(raw) => Ok(Wait::Terminated(libc::WTERMSIG(raw))),
+        result => result.map(Wait::Named),
+    }
+}
+
+fn forward_signal(request: libc::c_uint, tid: i32, signal: i32) -> nix::Result<()> {
+    Errno::result(unsafe { libc::ptrace(request as _, tid, 0_usize, signal as usize) }).map(|_| ())
 }
 
 struct Patch {
@@ -138,16 +193,18 @@ struct Patch {
     mapping: modules::CodeMapping,
 }
 
-impl<'a> Trace<'a> {
-    pub fn new(pid: i32, root: &'a Path, start_ticks: u64) -> Self {
+impl Trace {
+    pub fn new(pid: i32, root: &Path, start_ticks: u64) -> Self {
         Self {
             threads: BTreeMap::new(),
             observed: BTreeMap::new(),
             started: None,
             pid: Pid::from_raw(pid),
-            root,
+            root: root.to_path_buf(),
             start_ticks,
             monitored: false,
+            launched: false,
+            exit: None,
             patches: BTreeMap::new(),
             foreign_software: false,
             _same_thread: PhantomData,
@@ -156,6 +213,36 @@ impl<'a> Trace<'a> {
 
     pub fn monitor(&mut self) {
         self.monitored = true;
+    }
+
+    pub(crate) fn seize_launched(&mut self, trace_exit: bool) -> Result<()> {
+        ptrace::seize(
+            self.pid,
+            ptrace::Options::PTRACE_O_TRACEEXEC
+                | ptrace::Options::PTRACE_O_TRACECLONE
+                | ptrace::Options::PTRACE_O_TRACEFORK
+                | ptrace::Options::PTRACE_O_TRACEVFORK
+                | ptrace::Options::PTRACE_O_EXITKILL
+                | if trace_exit {
+                    ptrace::Options::PTRACE_O_TRACEEXIT
+                } else {
+                    ptrace::Options::empty()
+                },
+        )?;
+        self.monitored = true;
+        self.launched = true;
+        self.threads.insert(
+            self.pid.as_raw(),
+            Thread {
+                identity: next_thread_identity(),
+                before: Status::read(&self.root).ok(),
+                stop: None,
+                requested: false,
+                newborn: false,
+                stepping: false,
+            },
+        );
+        Ok(())
     }
 
     pub fn freeze(&mut self, deadline: Instant) -> Result<()> {
@@ -172,10 +259,10 @@ impl<'a> Trace<'a> {
             if Instant::now() >= deadline {
                 return Err(error("thread freeze deadline"));
             }
-            if start_ticks(self.root)? != self.start_ticks {
+            if start_ticks(&self.root)? != self.start_ticks {
                 return Err(error("target identity changed"));
             }
-            let ids = task_ids(self.root)?;
+            let ids = task_ids(&self.root)?;
             for tid in ids {
                 check()?;
                 if self.threads.contains_key(&tid) {
@@ -184,14 +271,20 @@ impl<'a> Trace<'a> {
                 if Instant::now() >= deadline {
                     return Err(error("thread freeze deadline"));
                 }
-                let task = task_path(self.root, tid);
+                let task = task_path(&self.root, tid);
                 let before = Status::read(&task).ok();
                 self.observed.insert(tid, before);
                 // Do not seize a recycled TID that no longer belongs to this process.
                 if !task.is_dir() {
                     continue;
                 }
-                let options = if self.monitored {
+                let options = if self.launched {
+                    ptrace::Options::PTRACE_O_TRACEEXEC
+                        | ptrace::Options::PTRACE_O_TRACECLONE
+                        | ptrace::Options::PTRACE_O_TRACEFORK
+                        | ptrace::Options::PTRACE_O_TRACEVFORK
+                        | ptrace::Options::PTRACE_O_EXITKILL
+                } else if self.monitored {
                     ptrace::Options::PTRACE_O_TRACECLONE
                         | ptrace::Options::PTRACE_O_TRACEEXEC
                         | ptrace::Options::PTRACE_O_TRACEFORK
@@ -205,6 +298,7 @@ impl<'a> Trace<'a> {
                         self.threads.insert(
                             tid,
                             Thread {
+                                identity: next_thread_identity(),
                                 before: self.observed.remove(&tid).flatten(),
                                 stop: None,
                                 requested: false,
@@ -229,14 +323,14 @@ impl<'a> Trace<'a> {
             }
             self.request_stops()?;
             self.wait_for_stops_checked(deadline, check)?;
-            let after = task_ids(self.root)?;
+            let after = task_ids(&self.root)?;
             if !after.is_empty()
                 && after.len() == self.threads.len()
                 && after
                     .iter()
                     .all(|tid| self.threads.get(tid).is_some_and(|t| t.stop.is_some()))
             {
-                if start_ticks(self.root)? != self.start_ticks {
+                if start_ticks(&self.root)? != self.start_ticks {
                     return Err(error("target identity changed"));
                 }
                 return Ok(());
@@ -293,19 +387,16 @@ impl<'a> Trace<'a> {
             if thread.stop.is_some() {
                 continue;
             }
-            let status = waitpid(
-                Pid::from_raw(tid),
-                Some(WaitPidFlag::__WALL | WaitPidFlag::WNOHANG),
-            );
+            let status = wait_for_task(tid, self.launched);
             thread.stop = match status {
-                Ok(WaitStatus::PtraceEvent(_, sig, libc::PTRACE_EVENT_STOP)) => {
-                    Some(if sig == Signal::SIGTRAP {
+                Ok(Wait::Named(WaitStatus::PtraceEvent(_, sig, libc::PTRACE_EVENT_STOP))) => Some(
+                    if sig == Signal::SIGTRAP || (self.launched && thread.newborn) {
                         Stop::Interrupt
                     } else {
                         Stop::Group(sig)
-                    })
-                }
-                Ok(WaitStatus::PtraceEvent(_, sig, event)) => {
+                    },
+                ),
+                Ok(Wait::Named(WaitStatus::PtraceEvent(_, sig, event))) => {
                     if matches!(
                         event,
                         libc::PTRACE_EVENT_CLONE
@@ -321,7 +412,7 @@ impl<'a> Trace<'a> {
                     }
                     Some(Stop::Event(sig, event))
                 }
-                Ok(WaitStatus::Stopped(_, Signal::SIGTRAP))
+                Ok(Wait::Named(WaitStatus::Stopped(_, Signal::SIGTRAP)))
                     if self.monitored || thread.stepping =>
                 {
                     let info = ptrace::getsiginfo(Pid::from_raw(tid)).ok();
@@ -373,12 +464,28 @@ impl<'a> Trace<'a> {
                         _ => Some(Stop::Delivery(Signal::SIGTRAP)),
                     }
                 }
-                Ok(WaitStatus::Stopped(_, sig)) => Some(Stop::Delivery(sig)),
-                Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {
+                Ok(Wait::Named(WaitStatus::Stopped(_, sig))) => Some(Stop::Delivery(sig)),
+                Ok(Wait::Delivery(sig)) => Some(Stop::UnnamedDelivery(sig)),
+                Ok(
+                    status @ (Wait::Named(WaitStatus::Exited(..) | WaitStatus::Signaled(..))
+                    | Wait::Terminated(_)),
+                ) => {
+                    if self.launched && tid == self.pid.as_raw() {
+                        self.exit = match status {
+                            Wait::Named(WaitStatus::Exited(_, code)) => {
+                                Some(LaunchExit::Code(code))
+                            }
+                            Wait::Named(WaitStatus::Signaled(_, signal, _)) => {
+                                Some(LaunchExit::Signal(signal as i32))
+                            }
+                            Wait::Terminated(signal) => Some(LaunchExit::Signal(signal)),
+                            _ => unreachable!(),
+                        };
+                    }
                     exited.push(tid);
                     None
                 }
-                Err(Errno::ECHILD | Errno::ESRCH) if !task_path(self.root, tid).is_dir() => {
+                Err(Errno::ECHILD | Errno::ESRCH) if !task_path(&self.root, tid).is_dir() => {
                     exited.push(tid);
                     None
                 }
@@ -393,21 +500,22 @@ impl<'a> Trace<'a> {
                 thread.stepping = false;
             }
         }
-        for tid in children {
-            self.threads.entry(tid).or_insert_with(|| Thread {
-                before: Status::read(&task_path(self.root, tid)).ok(),
-                stop: None,
-                requested: false,
-                newborn: true,
-                stepping: false,
-            });
-        }
         for tid in exited {
             if let Some(t) = self.threads.remove(&tid)
                 && !self.monitored
             {
                 self.observed.insert(tid, t.before);
             }
+        }
+        for tid in children {
+            self.threads.entry(tid).or_insert_with(|| Thread {
+                identity: next_thread_identity(),
+                before: Status::read(&task_path(&self.root, tid)).ok(),
+                stop: None,
+                requested: false,
+                newborn: true,
+                stepping: false,
+            });
         }
         if let Some(e) = failure {
             return Err(e);
@@ -425,6 +533,7 @@ impl<'a> Trace<'a> {
                     .map(|_| ())
             }
             Stop::Delivery(signal) => ptrace::cont(pid, Some(signal)),
+            Stop::UnnamedDelivery(signal) => forward_signal(libc::PTRACE_CONT as _, tid, signal),
             _ => ptrace::cont(pid, None),
         };
         match result {
@@ -446,7 +555,7 @@ impl<'a> Trace<'a> {
     pub fn detach_foreign_children(&mut self) -> Result<()> {
         let mut foreign = Vec::new();
         for (&tid, thread) in &self.threads {
-            if thread.newborn && thread.stop.is_some() && !task_path(self.root, tid).is_dir() {
+            if thread.newborn && thread.stop.is_some() && !task_path(&self.root, tid).is_dir() {
                 if !self.patches.is_empty() {
                     // A fork can inherit patched bytes. vfork or a foreign
                     // CLONE_VM task can also share the parent's address space.
@@ -469,14 +578,19 @@ impl<'a> Trace<'a> {
         self.threads
             .iter()
             .find_map(|(&tid, thread)| {
-                (thread.stop.is_some() && task_path(self.root, tid).is_dir()).then_some(tid)
+                (thread.stop.is_some() && task_path(&self.root, tid).is_dir()).then_some(tid)
             })
             .ok_or_else(|| error("no stopped thread for software breakpoint"))
     }
 
+    pub(crate) fn clear_patches(&mut self) {
+        self.patches.clear();
+        self.foreign_software = false;
+    }
+
     pub fn patch(&mut self, address: u64) -> Result<()> {
         let tid = self.stopped_tid()?;
-        let mapping = modules::private_code_mapping(self.root, address, true)?
+        let mapping = modules::private_code_mapping(&self.root, address, true)?
             .ok_or_else(|| error("software breakpoints require a private executable mapping"))?;
         let original = software::read_instruction(tid, address)?;
         if original == software::TRAP {
@@ -491,9 +605,39 @@ impl<'a> Trace<'a> {
 
     pub fn unpatch(&mut self, address: u64) -> Result<()> {
         let tid = self.stopped_tid()?;
-        self.restore_byte(tid, address, &self.patches[&address], self.root)?;
+        self.restore_byte(tid, address, &self.patches[&address], &self.root)?;
         self.patches.remove(&address);
         Ok(())
+    }
+
+    pub(crate) fn with_unpatched<T>(
+        &mut self,
+        capture: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let mut restored = Vec::new();
+        let result = (|| {
+            if !self.patches.is_empty() {
+                let tid = self.stopped_tid()?;
+                for (&address, patch) in &self.patches {
+                    self.restore_byte(tid, address, patch, &self.root)?;
+                    restored.push(address);
+                }
+            }
+            capture(self)
+        })();
+        let mut failure = None;
+        for address in restored {
+            if let Err(issue) = self.rearm_software(address) {
+                failure.get_or_insert(issue);
+            }
+        }
+        if let Some(issue) = failure {
+            self.close();
+            return Err(error(format!(
+                "failed to restore software breakpoints after coredump: {issue}"
+            )));
+        }
+        result
     }
 
     fn restore_byte(&self, tid: i32, address: u64, patch: &Patch, root: &Path) -> Result<()> {
@@ -526,7 +670,7 @@ impl<'a> Trace<'a> {
 
     pub fn step_software(&mut self, tid: i32, address: u64, deadline: Instant) -> Result<bool> {
         let patch = &self.patches[&address];
-        self.restore_byte(tid, address, patch, self.root)?;
+        self.restore_byte(tid, address, patch, &self.root)?;
         software::set_pc(tid, address)?;
         loop {
             self.step_one(tid, deadline)?;
@@ -566,7 +710,7 @@ impl<'a> Trace<'a> {
         if let Ok(tid) = self.stopped_tid() {
             // The old instruction may have unmapped or changed its own page.
             let patch = &self.patches[&address];
-            if modules::private_code_mapping(self.root, address, true)?.as_ref()
+            if modules::private_code_mapping(&self.root, address, true)?.as_ref()
                 != Some(&patch.mapping)
                 || software::read_instruction(tid, address)? != patch.original
             {
@@ -589,17 +733,40 @@ impl<'a> Trace<'a> {
             .ok_or_else(|| error("unknown thread"))?;
         if !matches!(
             thread.stop,
-            Some(Stop::Interrupt | Stop::Step | Stop::Software { .. } | Stop::Breakpoint { .. })
+            Some(
+                Stop::Interrupt
+                    | Stop::ExecBoundary
+                    | Stop::Step
+                    | Stop::Software { .. }
+                    | Stop::Breakpoint { .. }
+            )
         ) {
             return Err(error(
                 "thread has no debugger stop eligible for single-step",
             ));
         }
+        let exec_pc = matches!(thread.stop, Some(Stop::ExecBoundary))
+            .then(|| software::pc(tid))
+            .transpose()?;
         ptrace::step(Pid::from_raw(tid), None)?;
         thread.stop = None;
         thread.stepping = true;
         self.wait_for_stops(deadline)?;
-        Ok(self.threads.get(&tid).and_then(|thread| thread.stop))
+        let stop = self.threads.get(&tid).and_then(|thread| thread.stop);
+        // Some kernels first report the synthetic trap from completing exec.
+        // User-directed traps and traps from executed instructions are retained.
+        if let Some(pc) = exec_pc
+            && matches!(stop, Some(Stop::Delivery(Signal::SIGTRAP)))
+            && software::pc(tid)? == pc
+            && ptrace::getsiginfo(Pid::from_raw(tid)).is_ok_and(|info| {
+                matches!(info.si_code, libc::TRAP_BRKPT | libc::SI_KERNEL)
+                    || (info.si_code == libc::SI_USER && unsafe { info.si_pid() } == 0)
+            })
+        {
+            self.threads.get_mut(&tid).unwrap().stop = Some(Stop::Interrupt);
+            return self.step_one(tid, deadline);
+        }
+        Ok(stop)
     }
 
     pub fn exec_observed(&self) -> bool {
@@ -609,29 +776,11 @@ impl<'a> Trace<'a> {
     }
 
     pub fn read_word(&self, addr: u64, size: usize) -> Result<u64> {
-        if !(1..=8).contains(&size) {
-            return Err(error("invalid remote read range"));
-        }
-        let mut buf = [0_u8; 8];
-        self.read_memory(addr, &mut buf[..size])?;
-        Ok(u64::from_le_bytes(buf))
+        read_process_word(self.pid.as_raw(), addr, size)
     }
 
     pub fn read_memory(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
-        let size = buf.len();
-        if addr.checked_add(size as u64).is_none() {
-            return Err(error("invalid remote read range"));
-        }
-        let local = &mut [IoSliceMut::new(buf)];
-        let remote = [uio::RemoteIoVec {
-            base: usize::try_from(addr)?,
-            len: size,
-        }];
-        let got = uio::process_vm_readv(self.pid, local, &remote)?;
-        if got != size {
-            return Err(error(format!("short remote read: {got}/{size}")));
-        }
-        Ok(())
+        read_process_memory_exact(self.pid.as_raw(), addr, buf)
     }
 
     pub fn write_memory(&self, addr: u64, buf: &[u8]) -> Result<()> {
@@ -665,7 +814,7 @@ impl<'a> Trace<'a> {
             if !self.patches.is_empty() && !self.exec_observed() && !self.threads.is_empty() {
                 cleanup.software_restore_error = self
                     .stopped_tid()
-                    .and_then(|tid| self.restore_bytes(tid, self.root))
+                    .and_then(|tid| self.restore_bytes(tid, &self.root))
                     .err()
                     .map(|e| format!("restore software breakpoints: {e}"));
             }
@@ -708,7 +857,7 @@ impl<'a> Trace<'a> {
                 if row.outcome != "detached" || row.preserved_group_stop {
                     continue;
                 }
-                row.state_after_detach = Status::read(&task_path(self.root, row.tid))
+                row.state_after_detach = Status::read(&task_path(&self.root, row.tid))
                     .ok()
                     .and_then(|s| s.state());
                 row.preserved_group_stop =
@@ -737,7 +886,8 @@ impl<'a> Trace<'a> {
             };
             let stop = thread.stop.expect("selected stopped thread");
             let signal = match stop {
-                Stop::Delivery(sig) => Some(sig),
+                Stop::Delivery(sig) => Some(sig as i32),
+                Stop::UnnamedDelivery(sig) => Some(sig),
                 _ => None,
             };
             let rewind = if let Stop::Software { address, .. } = stop {
@@ -754,7 +904,7 @@ impl<'a> Trace<'a> {
                 };
             let foreign_cleanup = if thread.newborn
                 && !self.patches.is_empty()
-                && !task_path(self.root, tid).is_dir()
+                && !task_path(&self.root, tid).is_dir()
             {
                 self.restore_bytes(tid, Path::new(&format!("/proc/{tid}")))
                     .err()
@@ -762,15 +912,16 @@ impl<'a> Trace<'a> {
                 None
             };
             let recovery = rewind.or(disarm).or(foreign_cleanup);
-            let (outcome, detail) = match ptrace::detach(Pid::from_raw(tid), signal) {
-                Ok(()) if recovery.is_none() => ("detached", None),
-                Ok(()) => (
-                    "failed",
-                    recovery.map(|e| format!("detached after breakpoint recovery failed: {e}")),
-                ),
-                Err(Errno::ESRCH) if !task_path(self.root, tid).is_dir() => ("exited", None),
-                Err(e) => ("failed", Some(format!("PTRACE_DETACH: {e}"))),
-            };
+            let (outcome, detail) =
+                match forward_signal(libc::PTRACE_DETACH as _, tid, signal.unwrap_or(0)) {
+                    Ok(()) if recovery.is_none() => ("detached", None),
+                    Ok(()) => (
+                        "failed",
+                        recovery.map(|e| format!("detached after breakpoint recovery failed: {e}")),
+                    ),
+                    Err(Errno::ESRCH) if !task_path(&self.root, tid).is_dir() => ("exited", None),
+                    Err(e) => ("failed", Some(format!("PTRACE_DETACH: {e}"))),
+                };
             result.threads.push(CleanupThread {
                 tid,
                 outcome,
@@ -778,17 +929,78 @@ impl<'a> Trace<'a> {
                 group_stop_before_detach: matches!(stop, Stop::Group(_)),
                 preserved_group_stop: false,
                 state_after_detach: None,
-                forwarded_signal: (outcome == "detached")
-                    .then_some(signal)
-                    .flatten()
-                    .map(|s| s as i32),
+                forwarded_signal: (outcome == "detached").then_some(signal).flatten(),
             });
         }
     }
 }
 
-impl Drop for Trace<'_> {
+impl Drop for Trace {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+pub(crate) fn read_process_word(pid: i32, address: u64, size: usize) -> Result<u64> {
+    if !(1..=8).contains(&size) {
+        return Err(error("invalid remote read range"));
+    }
+    let mut bytes = [0; 8];
+    read_process_memory_exact(pid, address, &mut bytes[..size])?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_process_memory_exact(pid: i32, address: u64, bytes: &mut [u8]) -> Result<()> {
+    let got = read_process_memory(pid, address, bytes)?;
+    if got != bytes.len() {
+        return Err(error(format!("short remote read: {got}/{}", bytes.len())));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_process_memory(pid: i32, address: u64, bytes: &mut [u8]) -> Result<usize> {
+    let size = bytes.len();
+    if address.checked_add(size as u64).is_none() {
+        return Err(error("invalid remote read range"));
+    }
+    let local = &mut [IoSliceMut::new(bytes)];
+    let remote = [uio::RemoteIoVec {
+        base: usize::try_from(address)?,
+        len: size,
+    }];
+    Ok(uio::process_vm_readv(Pid::from_raw(pid), local, &remote)?)
+}
+
+pub(crate) fn read_process_prefix(
+    pid: i32,
+    address: u64,
+    bytes: &mut [u8],
+    allowed: impl Fn() -> bool,
+) -> Result<usize> {
+    if address.checked_add(bytes.len() as u64).is_none() {
+        return Err(error("invalid remote read range"));
+    }
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|size| *size > 0)
+        .unwrap_or(4096);
+    let mut offset = 0;
+    while offset < bytes.len() && allowed() {
+        let current = address + offset as u64;
+        let end = bytes
+            .len()
+            .min(offset + (page_size - current % page_size) as usize);
+        let got = match read_process_memory(pid, current, &mut bytes[offset..end]) {
+            Ok(got) => got,
+            Err(issue) if issue.downcast_ref::<Errno>() == Some(&Errno::EFAULT) || offset > 0 => {
+                break;
+            }
+            Err(issue) => return Err(issue),
+        };
+        offset += got;
+        if offset != end {
+            break;
+        }
+    }
+    Ok(offset)
 }

@@ -1,10 +1,11 @@
-use super::{CaptureLimit, CaptureTimings, Coverage};
+use super::{CaptureLimit, CaptureTimings, Coverage, VVAR_UNAVAILABLE};
 use crate::modules::{self, Backing, Layout, Mapping, Module};
 use crate::rpc::CoreMode;
 use crate::trace::Trace;
 use crate::{Result, error};
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
 use nix::unistd::Pid;
+use nix::{libc, sys::ptrace};
 use object::{Object, ObjectSegment, SegmentFlags, read::ReadCache};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -18,7 +19,9 @@ use std::time::Instant;
 #[derive(Serialize)]
 pub(super) struct Image {
     #[serde(flatten)]
-    identity: modules::ModuleIdentity,
+    pub(super) identity: modules::ModuleIdentity,
+    #[serde(skip)]
+    pub(super) debug_link: Option<Vec<u8>>,
     #[serde(skip)]
     data: Vec<Range<u64>>,
     #[serde(skip)]
@@ -45,6 +48,7 @@ impl FileVersion {
 
 struct ElfImage {
     build_id: Option<Vec<u8>>,
+    debug_link: Option<Vec<u8>>,
     loads: Vec<modules::LoadSegment>,
     writable: Vec<(u64, u64)>,
 }
@@ -64,6 +68,11 @@ impl PreparedImage {
             .filter(modules::is_executable_module)
             .map(|elf| ElfImage {
                 build_id: elf.build_id().ok().flatten().map(<[u8]>::to_vec),
+                debug_link: elf
+                    .gnu_debuglink()
+                    .ok()
+                    .flatten()
+                    .map(|(name, _)| name.to_vec()),
                 loads: if mode.includes_data() {
                     modules::load_segments(&elf).collect()
                 } else {
@@ -136,6 +145,7 @@ impl ImageCache {
             check()?;
             let mut image = Image {
                 identity: module.identity(None),
+                debug_link: None,
                 data: Vec::new(),
                 headers: Vec::new(),
             };
@@ -163,6 +173,7 @@ impl ImageCache {
             match prepared {
                 Ok(PreparedImage { elf: Some(elf), .. }) => {
                     image.identity = module.identity(elf.build_id.as_deref());
+                    image.debug_link.clone_from(&elf.debug_link);
                     if mode.needs_elf_memory() {
                         image.headers.extend(
                             module
@@ -336,11 +347,15 @@ fn private_file_pages(
 
 struct Plan {
     read: Vec<Range<u64>>,
-    omitted: Vec<Range<u64>>,
+    omitted: Vec<(Range<u64>, &'static str)>,
+}
+
+fn is_vvar(backing: &Backing) -> bool {
+    matches!(backing.path.as_slice(), b"[vvar]" | b"[vvar_vclock]")
 }
 
 fn plan(
-    trace: &Trace<'_>,
+    trace: &Trace,
     root: &Path,
     mode: CoreMode,
     page: u64,
@@ -493,7 +508,12 @@ fn plan(
             union(ranges)
         };
         if usage.is_some_and(|s| s.unsafe_to_read) {
-            omitted.extend(ranges);
+            let reason = if is_vvar(backing) {
+                VVAR_UNAVAILABLE
+            } else {
+                "unsafe_to_fault"
+            };
+            omitted.extend(ranges.into_iter().map(|range| (range, reason)));
         } else {
             read.extend(ranges);
         }
@@ -531,11 +551,103 @@ impl Captured {
     }
 }
 
+#[derive(Default)]
+struct ReadFallback {
+    mem: Option<Option<File>>,
+    pagemap: Option<Option<File>>,
+    file_lengths: BTreeMap<Backing, Option<u64>>,
+    stopped: Option<Pid>,
+}
+
+impl ReadFallback {
+    fn read_mem(&mut self, root: &Path, address: u64, output: &mut [u8]) -> usize {
+        let Some(file) = self
+            .mem
+            .get_or_insert_with(|| File::open(root.join("mem")).ok())
+        else {
+            return 0;
+        };
+        loop {
+            match file.read_at(output, address) {
+                Ok(n) => return n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return 0,
+            }
+        }
+    }
+
+    fn peek(&self, address: u64, mut output: &mut [u8]) -> usize {
+        let Some(tid) = self.stopped else {
+            return 0;
+        };
+        let word_len = size_of::<libc::c_long>();
+        let mut copied = 0;
+        while !output.is_empty() {
+            let address = address + copied as u64;
+            let offset = (address % word_len as u64) as usize;
+            let aligned = (address - offset as u64) as ptrace::AddressType;
+            let Ok(word) = ptrace::read(tid, aligned) else {
+                break;
+            };
+            let count = output.len().min(word_len - offset);
+            output[..count].copy_from_slice(&word.to_ne_bytes()[offset..offset + count]);
+            copied += count;
+            output = &mut output[count..];
+        }
+        copied
+    }
+
+    fn is_unbacked_protected_page(
+        &mut self,
+        root: &Path,
+        backing: &Backing,
+        map: &Mapping,
+        page: u64,
+        address: u64,
+    ) -> bool {
+        if map.perms != "---p" || backing.inode == 0 || backing.path.ends_with(b" (deleted)") {
+            return false;
+        }
+        let length = *self.file_lengths.entry(backing.clone()).or_insert_with(|| {
+            Module {
+                backing: backing.clone(),
+                maps: vec![map.clone()],
+            }
+            .open(root, false)
+            .ok()?
+            .metadata()
+            .ok()
+            .map(|m| m.len())
+        });
+        let page_start = address / page * page;
+        let Some(offset) = map.file_offset(page_start) else {
+            return false;
+        };
+        // A mapping may extend past EOF. Preserve the last partial file page
+        // and any page with resident or swapped contents.
+        if length.is_none_or(|length| offset / page < length.div_ceil(page)) {
+            return false;
+        }
+        let Some(pagemap) = self
+            .pagemap
+            .get_or_insert_with(|| File::open(root.join("pagemap")).ok())
+        else {
+            return false;
+        };
+        let mut entry = [0; 8];
+        pagemap
+            .read_exact_at(&mut entry, (page_start / page) * 8)
+            .is_ok()
+            && u64::from_ne_bytes(entry) & ((1 << 63) | (1 << 62)) == 0
+    }
+}
+
 fn read_batch(
     pid: Pid,
     page: u64,
-    mem: &mut Option<Option<File>>,
+    fallback: &mut ReadFallback,
     root: &Path,
+    maps: &[(Backing, Mapping)],
     remote: &mut [RemoteIoVec],
     buffer: &mut [u8],
     captured: &mut Captured,
@@ -574,23 +686,33 @@ fn read_batch(
             let range = &mut remote[first];
             let address = range.base as u64;
             let remainder = range.len.min((page - address % page) as usize);
-            let fallback = mem.get_or_insert_with(|| File::open(root.join("mem")).ok());
-            let got = fallback
-                .as_ref()
-                .and_then(|file| {
-                    file.read_at(&mut buffer[filled..filled + remainder], address)
-                        .ok()
-                })
-                .unwrap_or(0);
+            let output = &mut buffer[filled..filled + remainder];
+            let mut got = fallback.read_mem(root, address, output);
+            let i = maps.partition_point(|(_, map)| map.end <= address);
+            let (backing, map) = &maps[i];
+            let unbacked =
+                got == 0 && fallback.is_unbacked_protected_page(root, backing, map, page, address);
+            if got < remainder && !unbacked && !map.perms.starts_with('r') && !is_vvar(backing) {
+                got += fallback.peek(address + got as u64, &mut output[got..]);
+            }
             if got != 0 {
                 captured.record(address, got);
                 filled += got;
             }
-            if got < remainder {
+            if unbacked {
+                push_range(
+                    &mut coverage.unbacked_protected_ranges,
+                    address..address + remainder as u64,
+                );
+            } else if got < remainder {
                 coverage.missing(
                     address + got as u64,
                     address + remainder as u64,
-                    "unreadable",
+                    if is_vvar(backing) {
+                        VVAR_UNAVAILABLE
+                    } else {
+                        "unreadable"
+                    },
                 );
             }
             range.base += remainder;
@@ -603,7 +725,7 @@ fn read_batch(
 }
 
 pub(super) fn capture(
-    trace: &Trace<'_>,
+    trace: &Trace,
     pid: i32,
     root: &Path,
     mode: CoreMode,
@@ -628,7 +750,10 @@ pub(super) fn capture(
     let mut captured = Captured::default();
     let block_bytes = buffer.len();
     let mut batch = Vec::with_capacity(64);
-    let mut mem = None;
+    let mut fallback = ReadFallback {
+        stopped: stacks.first().map(|&(tid, _)| Pid::from_raw(tid)),
+        ..ReadFallback::default()
+    };
     let pid = Pid::from_raw(pid);
     let mut ranges = plan.read.into_iter().peekable();
     while ranges.peek().is_some() {
@@ -656,8 +781,9 @@ pub(super) fn capture(
         let read = read_batch(
             pid,
             page,
-            &mut mem,
+            &mut fallback,
             root,
+            maps,
             &mut batch,
             &mut buffer,
             &mut captured,
@@ -672,8 +798,8 @@ pub(super) fn capture(
             timings.buffering += super::micros(started);
         }
     }
-    for range in plan.omitted {
-        coverage.missing(range.start, range.end, "unsafe_to_fault");
+    for (range, reason) in plan.omitted {
+        coverage.missing(range.start, range.end, reason);
     }
     coverage.missing.sort_unstable_by_key(|gap| gap.start);
     Ok(captured)

@@ -1,0 +1,15 @@
+[
+  {"id": "D01", "executable": "D01", "expect": {"stdout": "account=7 quota=64\naccount=9 quota=64\n", "exit": 0}},
+  {"id": "D02", "executable": "D02", "expect": {"stdout": "10 20 30 40\n", "exit": 0}},
+  {"id": "D03", "executable": "D03", "expect": {"stdout": "total=20\n", "exit": 0}},
+  {"id": "D04", "executable": "D04", "expect": {"stdout_lines_unordered": ["refresh started", "reconcile started"], "stdout_suffix": "completed\n", "exit": 0}},
+  {"id": "D05", "executable": "D05", "expect": {"stdout": "bytes=70000 blocks=18\n", "exit": 0}},
+  {"id": "D06", "executable": "D06", "expect": {"stdout": "before=5\nafter=7\n", "exit": 0}},
+  {"id": "D07", "executable": "D07", "expect": {"stdout": "10 30\n", "exit": 0}},
+  {"id": "D08", "executable": "D08", "expect": {"stdout": "samples=0,0,0,0 markers=101,202\n", "exit": 0}},
+  {"id": "D09", "executable": "D09", "expect": {"stdout": "fetch=1\nparse=1\nsave=1\n", "exit": 0}},
+  {"id": "D10", "executable": "D10", "expect": {"stdout": "north south\n", "exit": 0}},
+  {"id": "D13", "executable": "D13", "expect": {"stdout": "score=23\n", "exit": 0}, "variants": ["asan39/D13", "memcheck/D13"]},
+  {"id": "D14", "executable": "D14", "expect": {"stdout": "queued\n", "exit": 0}, "variants": ["asan39/D14", "memcheck/D14"]},
+  {"id": "D15", "executable": "D15", "expect": {"stdout": "report rejected\n", "exit": 0}, "variants": ["asan39/D15", "memcheck/D15"]}
+]

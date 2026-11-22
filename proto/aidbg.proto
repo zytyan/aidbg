@@ -3,15 +3,40 @@ syntax = "proto3";
 package aidbg;
 
 service Debugger {
+  rpc ServerInfo (ServerInfoRequest) returns (DocumentReply);
+  rpc ScriptApi (ScriptDocumentRequest) returns (DocumentReply);
+  rpc ScriptCheck (ScriptDocumentRequest) returns (DocumentReply);
+  rpc ScriptRun (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunTarget (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunStatus (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunList (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunPause (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunContinue (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RunCancel (ScriptDocumentRequest) returns (DocumentReply);
+  rpc CoreOpen (ScriptDocumentRequest) returns (DocumentReply);
+  rpc CoreClose (ScriptDocumentRequest) returns (DocumentReply);
+  rpc SearchMemory (SearchMemoryRequest) returns (DocumentReply);
+  rpc ReadMemory (ReadMemoryRequest) returns (DocumentReply);
+  rpc ObserveThreads (ScriptDocumentRequest) returns (DocumentReply);
+  rpc PointerChain (PointerChainRequest) returns (DocumentReply);
   rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
   rpc QuerySnapshot (QuerySnapshotRequest) returns (SnapshotReply);
   rpc Coredump (CoredumpRequest) returns (stream CoredumpChunk);
   rpc StartCoredump (StartCoredumpRequest) returns (CoredumpJob);
   rpc GetCoredump (GetCoredumpRequest) returns (CoredumpJob);
   rpc DownloadCoredump (DownloadCoredumpRequest) returns (stream CoredumpChunk);
+  rpc RetainCoredump (RetainCoredumpRequest) returns (CoredumpJob);
+  rpc UploadArtifact (stream ArtifactChunk) returns (DocumentReply);
+  rpc DownloadCoreImages (ScriptDocumentRequest) returns (stream CoredumpChunk);
+  rpc RuleDefine (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RuleList (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RuleUpdate (ScriptDocumentRequest) returns (DocumentReply);
+  rpc RuleRemove (ScriptDocumentRequest) returns (DocumentReply);
   rpc InstallBreakpoint (InstallBreakpointRequest) returns (DocumentReply);
+  rpc UpdateBreakpoint (UpdateBreakpointRequest) returns (DocumentReply);
   rpc RemoveBreakpoint (RemoveBreakpointRequest) returns (DocumentReply);
   rpc BreakpointEvents (BreakpointEventsRequest) returns (DocumentReply);
+  rpc BreakpointList (BreakpointCapabilitiesRequest) returns (DocumentReply);
   rpc SearchSymbols (SearchSymbolsRequest) returns (DocumentReply);
   rpc ResolveAddress (ResolveAddressRequest) returns (DocumentReply);
   rpc Disassemble (DisassembleRequest) returns (DocumentReply);
@@ -23,7 +48,58 @@ service Debugger {
   rpc PlanPatch (PatchRequest) returns (DocumentReply);
   rpc Emulate (EmulateRequest) returns (DocumentReply);
   rpc StepWatch (StepWatchRequest) returns (DocumentReply);
+  rpc StepRun (StepRunRequest) returns (DocumentReply);
   rpc TargetCall (TargetCallRequest) returns (DocumentReply);
+}
+
+message RetainCoredumpRequest {
+  string dump_id = 1;
+  uint64 retention_secs = 2;
+}
+
+message ArtifactHeader {
+  enum Kind {
+    CORE = 0;
+    EXECUTABLE = 1;
+    DEBUG_SYMBOLS = 2;
+  }
+  Kind kind = 1;
+  uint64 size = 2;
+}
+
+message ArtifactChunk {
+  oneof part {
+    ArtifactHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message StepRunRequest {
+  string run_id = 1;
+  optional int32 tid = 2;
+  optional uint32 max_steps = 3;
+  optional uint32 timeout_ms = 4;
+  enum Mode {
+    STEP = 0;
+    NEXT = 1;
+    OUT = 2;
+  }
+  Mode mode = 5;
+}
+
+message ReadMemoryRequest {
+  optional string target_id = 1;
+  optional int32 pid = 2;
+  optional string run_id = 3;
+  uint64 address = 4;
+  uint32 length = 5;
+}
+
+// Script requests share the JSON schema used by CLI and MCP.
+message ServerInfoRequest {}
+
+message ScriptDocumentRequest {
+  bytes json = 1;
 }
 
 message StepWatchRequest {
@@ -68,6 +144,7 @@ message SnapshotRequest {
   int32 pid = 1;
   FreezeMode freeze = 2;
   Selection selection = 3;
+  optional string run_id = 4;
 }
 
 message QuerySnapshotRequest {
@@ -150,6 +227,20 @@ message SymbolLocation {
   string module = 1;
   string symbol = 2;
   optional uint64 instance = 3;
+  optional uint64 offset = 4;
+}
+
+message SourceLocation {
+  string file = 1;
+  uint64 line = 2;
+  optional string module = 3;
+  optional uint64 instance = 4;
+}
+
+message ModuleOffsetLocation {
+  string module = 1;
+  uint64 offset = 2;
+  optional uint64 instance = 3;
 }
 
 enum BreakpointKind {
@@ -157,6 +248,7 @@ enum BreakpointKind {
   SOFTWARE = 1;
   WRITE = 2;
   READ_WRITE = 3;
+  READ = 4;
 }
 
 message InstallBreakpointRequest {
@@ -164,16 +256,31 @@ message InstallBreakpointRequest {
   oneof location {
     uint64 address = 2;
     SymbolLocation symbol = 3;
+    SourceLocation source = 13;
+    ModuleOffsetLocation module_offset = 14;
   }
   CaptureScope scope = 4;
   optional uint32 timeout_ms = 5;
   BreakpointKind kind = 6;
   optional uint32 length = 7;
+  optional string rule_source = 8;
+  optional string run_id = 9;
+  optional uint64 rule_id = 10;
+  optional int32 tid = 11;
+  optional string handler = 12;
+  optional string replay_export = 15;
 }
 
 message RemoveBreakpointRequest {
   int32 pid = 1;
   uint64 breakpoint_id = 2;
+  optional string run_id = 3;
+}
+
+message UpdateBreakpointRequest {
+  uint64 breakpoint_id = 1;
+  optional uint64 address = 2;
+  optional uint64 rule_id = 3;
 }
 
 message BreakpointEventsRequest {
@@ -193,11 +300,13 @@ message SearchSymbolsRequest {
   SymbolMatch match_mode = 3;
   optional string module = 4;
   optional uint32 limit = 5;
+  optional string target_id = 6;
 }
 
 message ResolveAddressRequest {
   int32 pid = 1;
   uint64 address = 2;
+  optional string target_id = 3;
 }
 
 message DisassembleRequest {
@@ -206,9 +315,34 @@ message DisassembleRequest {
   optional uint32 before = 3;
   optional uint32 after = 4;
   optional uint64 start = 5;
+  optional string target_id = 6;
 }
 
-message BreakpointCapabilitiesRequest { optional int32 pid = 1; }
+message SearchMemoryRequest {
+  string target_id = 1;
+  bytes pattern = 2;
+  optional uint64 start = 3;
+  optional uint64 end = 4;
+  optional uint32 limit = 5;
+  optional uint32 max_scan_bytes = 6;
+  optional uint32 alignment = 7;
+  optional uint64 pointer_value = 8;
+  bool instruction_references = 9;
+  optional int32 pid = 10;
+  optional string run_id = 11;
+  optional uint64 resume_from = 12;
+}
+
+message PointerChainRequest {
+  string target_id = 1;
+  uint64 base = 2;
+  repeated sint64 offsets = 3;
+}
+
+message BreakpointCapabilitiesRequest {
+  optional int32 pid = 1;
+  optional string run_id = 2;
+}
 
 message ProfileRequest {
   int32 pid = 1;
@@ -239,6 +373,17 @@ message InspectRequest {
   string expression = 3;
   optional string module = 4;
   optional uint64 instance = 5;
+  optional string run_id = 6;
+  optional uint32 timeout_ms = 7;
+  InspectExpansion expand = 8;
+  optional string target_id = 9;
+  optional uint32 frame_index = 10;
+  repeated string expressions = 11;
+}
+
+message InspectExpansion {
+  uint32 offset = 1;
+  optional uint32 limit = 2;
 }
 
 message AssembleRequest {
@@ -257,6 +402,8 @@ message PatchRequest {
   bytes original = 3;
   string source = 4;
   repeated AddressRange existing = 5;
+  optional string target_id = 6;
+  optional uint32 original_length = 7;
 }
 
 message MemoryCopy {
@@ -272,6 +419,13 @@ message ObjectProbe {
   uint32 guard_bytes = 4;
 }
 
+message CoreMemoryCopy {
+  uint64 address = 1;
+  uint32 length = 2;
+  bool writable = 3;
+  repeated MemoryCopy overlays = 4;
+}
+
 message EmulateRequest {
   uint64 address = 1;
   bytes code = 2;
@@ -281,4 +435,8 @@ message EmulateRequest {
   repeated ObjectProbe objects = 6;
   optional uint32 instruction_limit = 7;
   optional uint32 timeout_ms = 8;
+  optional string target_id = 9;
+  optional string frame = 10;
+  optional uint32 code_length = 11;
+  repeated CoreMemoryCopy core_memory = 12;
 }

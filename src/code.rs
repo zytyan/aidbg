@@ -10,7 +10,7 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::ops::Range;
 use std::ptr;
 
-const MAX_CODE: usize = 64 * 1024;
+pub(crate) const MAX_CODE: usize = 64 * 1024;
 
 struct Keystone(Handle);
 
@@ -165,6 +165,7 @@ pub fn patch(request: rpc::PatchRequest) -> Result<Patch> {
         mut original,
         source,
         existing,
+        ..
     } = request;
     if original.is_empty() || original.len() > MAX_CODE || existing.len() > 256 {
         return Err(error(

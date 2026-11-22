@@ -351,6 +351,7 @@ pub fn emulate(request: rpc::EmulateRequest) -> Result<Report> {
         objects,
         instruction_limit,
         timeout_ms,
+        ..
     } = request;
     let limit = instruction_limit.unwrap_or(1000) as usize;
     let timeout = timeout_ms.unwrap_or(100);

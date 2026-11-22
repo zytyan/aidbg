@@ -114,6 +114,9 @@ def check_running(socket):
         names = [f["function"] for f in lead["stack"]["frames"]]
         assert any(n and n.split(".")[0] == "library_leaf" for n in names), names
         assert "library_wait" in names and "main" in names, names
+        for name, source in (("library_wait", "shared.c"), ("main", "fixture.c")):
+            frame = next(f for f in lead["stack"]["frames"] if f["function"] == name)
+            assert Path(frame["file"]).name == source and frame["line"] > 0, frame
         assert all(f["method"] == "cfi" for f in lead["stack"]["frames"][1:]), names
         assert any(m["kind"] == "shared_object" and m["path"].endswith("libfixture.so") for m in x["modules"])
         main_id = next(m["id"] for m in x["modules"] if m["kind"] == "main")
@@ -260,12 +263,22 @@ def check_mcp(socket, snapshot_id):
             }})
             message({"method": "notifications/initialized"})
             listed = message({"id": 2, "method": "tools/list"})
-            assert {t["name"] for t in listed["tools"]} == {
-        "snapshot", "snapshot_query", "coredump", "breakpoint_set", "breakpoint_remove",
-        "breakpoint_events", "breakpoint_capabilities", "symbols", "resolve_address", "disassemble",
-        "perf", "symbol_override_set", "symbol_override_remove", "symbol_override_list", "inspect",
-        "assemble", "plan_patch", "emulate", "watch_step", "target_call",
-    }
+            actual = {tool["name"] for tool in listed["tools"]}
+            expected = {
+                "capabilities", "connect", "run", "run_list", "run_status", "run_pause",
+                "run_continue", "run_cancel", "step", "next", "step_out",
+                "snapshot", "snapshot_query", "coredump", "breakpoint_set", "breakpoint_remove",
+                "breakpoint_events", "breakpoint_capabilities", "breakpoint_list",
+                "breakpoint_update", "breakpoint_workflow", "restore_breakpoints",
+                "symbols", "resolve_address", "observe_threads",
+                "rule_define", "rule_list", "rule_update", "rule_remove",
+                "disassemble", "perf", "symbol_override_set", "symbol_override_remove",
+                "symbol_override_list", "inspect", "assemble", "plan_patch", "emulate",
+                "watch_step", "target_call", "script_api", "script_check", "script_run",
+                "core_open", "core_close", "core_retain", "export_bundle", "read_memory",
+                "search_memory", "memory_diff", "xref", "pointer_chain",
+            }
+            assert actual == expected, {"missing": expected - actual, "unexpected": actual - expected}
             result = message({"id": 3, "method": "tools/call", "params": {
                 "name": "snapshot_query", "arguments": {
                     "snapshot_id": snapshot_id, "fields": ["process.pid"],

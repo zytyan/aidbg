@@ -61,8 +61,8 @@ pub struct ModuleInfo {
 #[derive(Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(crate) struct ModuleIdentity {
     path: String,
-    device: String,
-    inode: String,
+    pub(crate) device: String,
+    pub(crate) inode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) build_id: Option<String>,
 }
@@ -598,6 +598,23 @@ pub fn signed_hex(value: i128) -> String {
 pub fn symbol(obj: &object::File<'_>, pc: u64) -> Option<crate::cpp_names::Names> {
     let (name, _) = text_symbol(obj, pc)?;
     Some(crate::cpp_names::names(name))
+}
+
+pub(crate) fn data_symbol<'data>(
+    obj: &object::File<'data>,
+    address: u64,
+) -> Option<(&'data str, u64)> {
+    let symbol = obj
+        .symbols()
+        .chain(obj.dynamic_symbols())
+        .filter(|symbol| symbol.kind() == SymbolKind::Data && symbol.is_definition())
+        .filter(|symbol| {
+            address
+                .checked_sub(symbol.address())
+                .is_some_and(|offset| offset < symbol.size().max(1))
+        })
+        .max_by_key(|symbol| symbol.address())?;
+    Some((symbol.name().ok()?, symbol.address()))
 }
 
 pub(crate) fn text_symbol<'data>(obj: &object::File<'data>, pc: u64) -> Option<(&'data str, u64)> {

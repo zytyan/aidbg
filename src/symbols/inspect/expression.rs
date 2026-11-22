@@ -88,11 +88,14 @@ impl Number {
                 byte_size: size,
                 fields: vec![],
                 element_count: None,
+                dimensions: None,
             },
             address: None,
             bytes: id_hex(&bits.to_le_bytes()[..size]),
             value,
             module: None,
+            preview: None,
+            symbol: None,
             number: Some(self),
         }
     }
@@ -331,10 +334,7 @@ impl Expression {
                 Box::new(Self::parse_at(text[1..].trim_start(), depth + 1)?),
             ));
         }
-        let mut parser = Parser {
-            rest: text,
-            operations: Vec::new(),
-        };
+        let mut parser = Parser::new(text);
         let name = parser.expression(0)?;
         if !parser.rest.trim().is_empty() {
             return Err(error(

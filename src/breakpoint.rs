@@ -1,4 +1,11 @@
 use crate::procfs::{Status, epoch_ms, start_ticks};
+use crate::script::breakpoint::{
+    Callback, CallbackResult, Engine, HitState, Limits, Realm, WatchState,
+};
+use crate::script::{
+    LiveReplayPoint, LiveRunResult,
+    live::{self, ExportModule},
+};
 use crate::trace::{Cleanup, Stop, Trace};
 use crate::{Result, Snapshot, error, hex, machine, modules, regs, rpc::FreezeMode};
 use crate::{symbols, unwind};
@@ -8,7 +15,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::rc::Rc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
+};
+
+mod rules;
+mod step;
+pub use rules::CallbackSource;
+use rules::{AttachedCallback, ExportCache, Update};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,6 +62,14 @@ struct Program {
 }
 
 impl Program {
+    fn snapshot(scope: Scope, budget_ms: u32) -> Result<Self> {
+        let operand = match scope {
+            Scope::Thread => 0,
+            Scope::Process => 1,
+        };
+        Self::load(&[SNAPSHOT, operand, RETURN], budget_ms)
+    }
+
     fn load(code: &[u8], budget_ms: u32) -> Result<Self> {
         let scope = match code {
             [SNAPSHOT, 0, RETURN] => Scope::Thread,
@@ -114,6 +139,19 @@ pub enum Location {
         symbol: String,
         instance: Option<u64>,
     },
+    Source {
+        file: PathBuf,
+        line: u64,
+        module: Option<String>,
+        instance: Option<u64>,
+    },
+    ModuleOffset {
+        module: String,
+        offset: u64,
+        execution: bool,
+        instance: Option<u64>,
+        symbol: Option<String>,
+    },
 }
 
 struct PreparedLocation {
@@ -146,6 +184,48 @@ impl PreparedLocation {
                     start: Some(start),
                 })
             }
+            Location::Source {
+                file,
+                line,
+                module,
+                instance,
+            } => {
+                let procdir = File::open(format!("/proc/{pid}"))?;
+                let root = PathBuf::from(format!("/proc/self/fd/{}", procdir.as_raw_fd()));
+                let start = start_ticks(&root)?;
+                let site =
+                    symbols::breakpoint_line(&root, &file, line, module.as_deref(), instance)?;
+                Ok(Self {
+                    address: site.address,
+                    site: Some(site),
+                    start: Some(start),
+                })
+            }
+            Location::ModuleOffset {
+                module,
+                offset,
+                execution,
+                instance,
+                symbol,
+            } => {
+                let procdir = File::open(format!("/proc/{pid}"))?;
+                let root = PathBuf::from(format!("/proc/self/fd/{}", procdir.as_raw_fd()));
+                let start = start_ticks(&root)?;
+                let (instance, offset) = if let Some(symbol) = symbol {
+                    let (instance, offset) =
+                        symbols::symbol_module_offset(pid, &module, &symbol, instance, offset)?;
+                    (Some(instance), offset)
+                } else {
+                    (instance, offset)
+                };
+                let address =
+                    symbols::resolve_module_offset(&root, &module, offset, execution, instance)?;
+                Ok(Self {
+                    address,
+                    site: None,
+                    start: Some(start),
+                })
+            }
         }
     }
 
@@ -161,31 +241,65 @@ impl PreparedLocation {
 pub enum Kind {
     Hardware,
     Software,
-    Watch { length: usize, read_write: bool },
+    Watch { length: usize, access: WatchAccess },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+impl WatchAccess {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::ReadWrite => "read_write",
+        }
+    }
+    fn write_observed(self) -> Option<bool> {
+        match self {
+            Self::Read => Some(false),
+            Self::Write => Some(true),
+            Self::ReadWrite => None,
+        }
+    }
+}
 impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Hardware => "hardware_execution",
             Self::Software => "software_execution",
             Self::Watch {
-                read_write: false, ..
+                access: WatchAccess::Read,
+                ..
+            } => "hardware_read",
+            Self::Watch {
+                access: WatchAccess::Write,
+                ..
             } => "hardware_write",
             Self::Watch {
-                read_write: true, ..
+                access: WatchAccess::ReadWrite,
+                ..
             } => "hardware_read_write",
         }
     }
 }
 
 #[derive(Serialize)]
-struct WatchObservation {
+pub struct WatchObservation {
     length: usize,
     access: &'static str,
-    write_observed: Option<bool>,
-    value_before: Option<String>,
-    value_after: Option<String>,
+    pub write_observed: Option<bool>,
+    #[serde(serialize_with = "watch_hex")]
+    value_before: Option<u64>,
+    #[serde(serialize_with = "watch_hex")]
+    value_after: Option<u64>,
+    #[serde(serialize_with = "watch_decimal")]
+    value_before_decimal: Option<u64>,
+    #[serde(serialize_with = "watch_decimal")]
+    value_after_decimal: Option<u64>,
     value_changed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reported_address: Option<String>,
@@ -193,14 +307,28 @@ struct WatchObservation {
     attribution: Option<&'static str>,
 }
 
-pub fn capabilities() -> serde_json::Value {
+fn watch_hex<S: serde::Serializer>(
+    value: &Option<u64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value.map(hex).serialize(serializer)
+}
+
+fn watch_decimal<S: serde::Serializer>(
+    value: &Option<u64>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    value.map(|value| value.to_string()).serialize(serializer)
+}
+
+fn capabilities() -> serde_json::Value {
     let x86 = cfg!(target_arch = "x86_64");
     serde_json::json!({
         "architecture": regs::ARCH,
         "hardware_execution": true,
         "software_execution": true,
         "shared_execution_and_watch_slots": if x86 { SLOTS } else { 0 },
-        "watch_access": ["write", "read_write"],
+        "watch_access": if x86 { vec!["write", "read_write"] } else { vec!["read", "write", "read_write"] },
         "watch_lengths": [1, 2, 4, 8],
         "watch_alignment": "address must be aligned to length",
         "execution_alignment": if x86 { 1 } else { 4 },
@@ -208,6 +336,47 @@ pub fn capabilities() -> serde_json::Value {
         "watch_slots": if x86 { Some(SLOTS) } else { None },
         "software_value_change": true,
     })
+}
+
+pub fn probe_capabilities() -> Result<serde_json::Value> {
+    #[cfg(target_arch = "x86_64")]
+    return Ok(capabilities());
+    #[cfg(target_arch = "aarch64")]
+    {
+        use nix::{
+            libc,
+            sys::{
+                signal::{Signal, kill},
+                wait::waitpid,
+            },
+            unistd::Pid,
+        };
+        // The child performs only an async-signal-safe syscall until reaped.
+        let pid = Errno::result(unsafe { libc::fork() })?;
+        if pid == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        let result = capabilities_for(pid);
+        let pid = Pid::from_raw(pid);
+        let _ = kill(pid, Signal::SIGKILL);
+        while matches!(waitpid(pid, None), Err(Errno::EINTR)) {}
+        result
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_counts(exec: usize, watch: usize) -> serde_json::Value {
+    let mut result = capabilities();
+    result["execution_slots"] = exec.into();
+    result["watch_slots"] = watch.into();
+    result["hardware_execution"] = (exec > 0).into();
+    if watch == 0 {
+        result["watch_access"] = serde_json::json!([]);
+        result["watch_lengths"] = serde_json::json!([]);
+    }
+    result
 }
 
 pub fn capabilities_for(pid: i32) -> Result<serde_json::Value> {
@@ -234,15 +403,7 @@ pub fn capabilities_for(pid: i32) -> Result<serde_json::Value> {
             return Err(error("could not detach capability probe cleanly"));
         }
         let (exec, watch) = counts?;
-        let mut result = capabilities();
-        result["execution_slots"] = exec.into();
-        result["watch_slots"] = watch.into();
-        result["hardware_execution"] = (exec > 0).into();
-        if watch == 0 {
-            result["watch_access"] = serde_json::json!([]);
-            result["watch_lengths"] = serde_json::json!([]);
-        }
-        Ok(result)
+        Ok(with_counts(exec, watch))
     }
 }
 
@@ -252,21 +413,46 @@ struct Rule {
     address: u64,
     program: Program,
     kind: Kind,
+    thread: Option<(i32, u64)>,
+}
+
+impl Rule {
+    fn applies(self, tid: i32, identity: u64) -> bool {
+        self.thread.is_none_or(|thread| thread == (tid, identity))
+    }
 }
 
 #[derive(Serialize)]
 pub struct Installed {
     pub kind: &'static str,
     pub breakpoint_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_revision: Option<u64>,
     pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callback: Option<Limits>,
+    #[serde(skip)]
+    pub active: Weak<()>,
 }
 
 #[derive(Serialize)]
 pub struct Event {
     pub breakpoint_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_revision: Option<u64>,
     pub pid: i32,
     pub tid: i32,
     pub address: String,
+    pub instruction_pc: String,
+    pub pc_relation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_context: Option<serde_json::Value>,
     pub scope: &'static str,
     pub observed_unix_ms: u64,
     pub pause_ms: u64,
@@ -274,7 +460,9 @@ pub struct Event {
     pub resume_status: &'static str,
     pub detail: Option<String>,
     pub kind: &'static str,
-    watch: Option<WatchObservation>,
+    pub watch: Option<WatchObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    callback: Option<CallbackResult>,
 }
 
 pub struct Capture {
@@ -292,16 +480,100 @@ impl Capture {
     }
 }
 
-pub type Publish = Arc<dyn Fn(Event, Capture) + Send + Sync>;
+pub type Publish = Arc<dyn Fn(Event, Option<Capture>) + Send + Sync>;
+
+struct Outcome {
+    stop_context: Option<serde_json::Value>,
+    pending: Option<(Result<HitState>, Instant)>,
+    rule: Option<(u64, u64)>,
+    snapshot: Option<Capture>,
+    callback: Option<CallbackResult>,
+}
+
+// Keep every hit through architecture-specific stepping, even when no event
+// will be published. A skipped watchpoint still affects attribution.
+type CapturedHit = (Hit, Outcome);
 type Slots = [Option<Rule>; SLOTS];
 
+fn live_result(
+    breakpoint_ids: Vec<u64>,
+    result: Result<serde_json::Value>,
+    output: Vec<serde_json::Value>,
+) -> LiveRunResult {
+    match result {
+        Ok(return_value) => LiveRunResult {
+            status: "complete",
+            stop_reason: "completed",
+            breakpoint_ids,
+            issue: None,
+            return_value,
+            output,
+            active: Vec::new(),
+        },
+        Err(issue) => LiveRunResult {
+            status: "failed",
+            stop_reason: "runtime_error",
+            breakpoint_ids: Vec::new(),
+            issue: Some(issue.to_string()),
+            return_value: serde_json::Value::Null,
+            output,
+            active: Vec::new(),
+        },
+    }
+}
+
+struct ScriptCommand {
+    js: String,
+    source: Arc<str>,
+    replay_points: Vec<LiveReplayPoint>,
+    budget: Duration,
+    ids: Arc<AtomicU64>,
+    reply: mpsc::Sender<Result<LiveRunResult>>,
+}
+
 enum Command {
+    Script(ScriptCommand),
+    Inspect(
+        crate::rpc::InspectRequest,
+        mpsc::Sender<Result<symbols::InspectReport>>,
+    ),
     Install {
         id: u64,
         location: PreparedLocation,
         program: Program,
         kind: Kind,
+        tid: Option<i32>,
+        callback: Option<CallbackSource>,
+        sender: Weak<mpsc::SyncSender<Command>>,
         reply: mpsc::Sender<Result<Installed>>,
+    },
+    Update {
+        id: u64,
+        address: Option<u64>,
+        callback: Option<CallbackSource>,
+        sender: Weak<mpsc::SyncSender<Command>>,
+        reply: mpsc::Sender<Result<Installed>>,
+    },
+    CaptureCore {
+        mode: crate::rpc::CoreMode,
+        options: crate::coredump::CaptureOptions,
+        directory: PathBuf,
+        reply: mpsc::Sender<Result<crate::coredump::Dump>>,
+    },
+    Capabilities(mpsc::Sender<Result<serde_json::Value>>),
+    List(mpsc::Sender<Vec<Installed>>),
+    ReadMemory(
+        crate::rpc::ReadMemoryRequest,
+        mpsc::Sender<Result<serde_json::Value>>,
+    ),
+    Step(
+        crate::rpc::StepRunRequest,
+        mpsc::Sender<Result<serde_json::Value>>,
+    ),
+    StageRule {
+        id: u64,
+        update: Arc<Update>,
+        reply: mpsc::Sender<Result<()>>,
     },
     Remove {
         id: u64,
@@ -309,25 +581,114 @@ enum Command {
     },
 }
 
+#[derive(Clone)]
+pub struct Control(Arc<mpsc::SyncSender<Command>>);
+
+#[derive(Clone)]
+pub struct WeakControl(Weak<mpsc::SyncSender<Command>>);
+
+impl WeakControl {
+    pub fn upgrade(&self) -> Option<Control> {
+        self.0.upgrade().map(Control)
+    }
+}
+
+pub struct Commands(mpsc::Receiver<Command>);
+
+impl Control {
+    pub fn read_memory(&self, request: crate::rpc::ReadMemoryRequest) -> Result<serde_json::Value> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::ReadMemory(request, reply))?;
+        result
+            .recv()
+            .map_err(|_| error("run ended during memory read"))?
+    }
+
+    pub fn step(&self, request: crate::rpc::StepRunRequest) -> Result<serde_json::Value> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Step(request, reply))?;
+        result.recv().map_err(|_| error("run ended during step"))?
+    }
+    pub fn list(&self) -> Result<Vec<Installed>> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::List(reply))?;
+        result
+            .recv()
+            .map_err(|_| error("breakpoint session ended during list"))
+    }
+
+    pub fn capabilities(&self) -> Result<serde_json::Value> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Capabilities(reply))?;
+        result
+            .recv()
+            .map_err(|_| error("breakpoint session ended during capability probe"))?
+    }
+
+    pub fn capture_core(
+        &self,
+        mode: crate::rpc::CoreMode,
+        options: crate::coredump::CaptureOptions,
+        directory: PathBuf,
+    ) -> Result<crate::coredump::Dump> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::CaptureCore {
+            mode,
+            options,
+            directory,
+            reply,
+        })?;
+        result
+            .recv()
+            .map_err(|_| error("breakpoint session ended during coredump"))?
+    }
+
+    pub fn downgrade(&self) -> WeakControl {
+        WeakControl(Arc::downgrade(&self.0))
+    }
+
+    pub fn update(
+        &self,
+        id: u64,
+        address: Option<u64>,
+        callback: Option<CallbackSource>,
+    ) -> Result<Installed> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Update {
+            id,
+            address,
+            callback,
+            sender: Arc::downgrade(&self.0),
+            reply,
+        })?;
+        result
+            .recv()
+            .map_err(|_| error("breakpoint session ended during update"))?
+    }
+
+    pub fn channel() -> (Self, Commands) {
+        let (tx, rx) = mpsc::sync_channel(8);
+        (Self(Arc::new(tx)), Commands(rx))
+    }
+}
+
 pub struct Worker {
-    pid: i32,
-    tx: Option<mpsc::Sender<Command>>,
+    control: Option<Control>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Worker {
     pub fn start(pid: i32, publish: Publish) -> Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let (control, commands) = Control::channel();
         let thread = thread::Builder::new()
             .name(format!("aidbg-trace-{pid}"))
             .spawn(move || {
-                if let Err(e) = Session::run(pid, publish, rx) {
+                if let Err(e) = Session::run(pid, publish, commands) {
                     eprintln!("aidbg: breakpoint session for {pid}: {e}");
                 }
             })?;
         Ok(Self {
-            pid,
-            tx: Some(tx),
+            control: Some(control),
             thread: Some(thread),
         })
     }
@@ -336,31 +697,69 @@ impl Worker {
         self.thread.as_ref().is_some_and(|t| t.is_finished())
     }
 
+    pub fn control(&self) -> &Control {
+        self.control.as_ref().expect("live worker")
+    }
+}
+
+impl Control {
     pub fn install(
         &self,
+        pid: i32,
         id: u64,
         location: Location,
         scope: Scope,
         budget_ms: u32,
         kind: Kind,
+        tid: Option<i32>,
+        callback: Option<CallbackSource>,
     ) -> Result<Installed> {
-        let operand = match scope {
-            Scope::Thread => 0,
-            Scope::Process => 1,
-        };
-        let program = Program::load(&[SNAPSHOT, operand, RETURN], budget_ms)?;
-        let location = PreparedLocation::resolve(self.pid, location)?;
+        let program = Program::snapshot(scope, budget_ms)?;
+        let location = PreparedLocation::resolve(pid, location)?;
         let (reply, result) = mpsc::channel();
         self.send(Command::Install {
             id,
             location,
             program,
             kind,
+            tid,
+            callback,
+            sender: Arc::downgrade(&self.0),
             reply,
         })?;
         result
             .recv()
             .map_err(|_| error("breakpoint session ended during install"))?
+    }
+
+    pub fn script_run(
+        &self,
+        js: String,
+        source: String,
+        replay_points: Vec<LiveReplayPoint>,
+        budget: Duration,
+        ids: Arc<AtomicU64>,
+    ) -> Result<LiveRunResult> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Script(ScriptCommand {
+            js,
+            source: source.into(),
+            replay_points,
+            budget,
+            ids,
+            reply,
+        }))?;
+        result
+            .recv()
+            .map_err(|_| error("debugger session ended during live script"))?
+    }
+
+    fn stage_rule(&self, id: u64, update: Arc<Update>) -> Result<()> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::StageRule { id, update, reply })?;
+        result
+            .recv()
+            .map_err(|_| error("breakpoint session ended during rule update"))?
     }
 
     pub fn remove(&self, id: u64) -> Result<Option<Cleanup>> {
@@ -371,45 +770,107 @@ impl Worker {
             .map_err(|_| error("breakpoint session ended during removal"))?
     }
 
+    pub fn inspect(&self, request: crate::rpc::InspectRequest) -> Result<symbols::InspectReport> {
+        let (reply, result) = mpsc::channel();
+        self.send(Command::Inspect(request, reply))?;
+        result
+            .recv()
+            .map_err(|_| error("debugger session ended during inspection"))?
+    }
+
     fn send(&self, command: Command) -> Result<()> {
-        self.tx
-            .as_ref()
-            .expect("live worker")
-            .send(command)
-            .map_err(|_| error("breakpoint session has ended"))
+        self.0.try_send(command).map_err(|e| match e {
+            mpsc::TrySendError::Full(_) => error("debugger command queue is full"),
+            mpsc::TrySendError::Disconnected(_) => error("debugger session has ended"),
+        })
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.tx.take();
+        self.control.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-struct Session<'a> {
+pub(crate) struct Session<'a> {
     pid: i32,
     root: &'a Path,
     start: u64,
-    trace: Trace<'a>,
-    slots: Slots,
+    pub(crate) trace: Trace,
+    pub(crate) paused: bool,
+    launched: bool,
+    hardware: BTreeMap<u64, Rule>,
     software: BTreeMap<u64, Rule>,
     watch_values: BTreeMap<u64, Option<u64>>,
+    callbacks: BTreeMap<u64, AttachedCallback>,
+    active: BTreeMap<u64, Arc<()>>,
+    live_sources: BTreeMap<u64, LiveSource>,
+    exports: ExportCache,
+    engine: Option<Rc<Engine>>,
     publish: Publish,
+    live_script: Option<LiveScript>,
+}
+
+struct LiveScript {
+    output: Vec<serde_json::Value>,
+    waiting: live::AwaitEvents,
+    reply: mpsc::Sender<Result<LiveRunResult>>,
+    ids: Vec<u64>,
+    events: Vec<(Event, Option<Capture>)>,
+    overflow: bool,
+    was_paused: bool,
+    deadline: Instant,
+}
+
+struct LiveSource {
+    key: u64,
+    source: Arc<str>,
+    ordinal: usize,
+    requested_address: u64,
 }
 
 struct Hit {
     tid: i32,
+    pc: u64,
     rule: Rule,
     observed: Instant,
     unix_ms: u64,
     watch: Option<WatchObservation>,
 }
 
-impl Session<'_> {
-    fn run(pid: i32, publish: Publish, commands: mpsc::Receiver<Command>) -> Result<()> {
+impl<'a> Session<'a> {
+    pub(crate) fn new(
+        pid: i32,
+        root: &'a Path,
+        start: u64,
+        trace: Trace,
+        publish: Publish,
+        launched: bool,
+    ) -> Self {
+        Self {
+            pid,
+            root,
+            start,
+            trace,
+            paused: false,
+            launched,
+            hardware: BTreeMap::new(),
+            software: BTreeMap::new(),
+            watch_values: BTreeMap::new(),
+            callbacks: BTreeMap::new(),
+            active: BTreeMap::new(),
+            live_sources: BTreeMap::new(),
+            exports: ExportCache::default(),
+            engine: None,
+            publish,
+            live_script: None,
+        }
+    }
+
+    fn run(pid: i32, publish: Publish, commands: Commands) -> Result<()> {
         // Open and validate from this tracer thread before attaching to any task.
         let procdir = File::open(format!("/proc/{pid}"));
         let target = (|| -> Result<_> {
@@ -427,7 +888,7 @@ impl Session<'_> {
         let (_procdir, root, start) = match target {
             Ok(target) => target,
             Err(e) => {
-                if let Ok(Command::Install { reply, .. }) = commands.recv() {
+                if let Ok(Command::Install { reply, .. }) = commands.0.recv() {
                     let _ = reply.send(Err(e));
                 }
                 return Ok(());
@@ -436,16 +897,7 @@ impl Session<'_> {
 
         let mut trace = Trace::new(pid, &root, start);
         trace.monitor();
-        let mut session = Session {
-            pid,
-            root: &root,
-            start,
-            trace,
-            slots: [None; SLOTS],
-            software: BTreeMap::new(),
-            watch_values: BTreeMap::new(),
-            publish,
-        };
+        let mut session = Session::new(pid, &root, start, trace, publish, false);
         loop {
             session.trace.poll()?;
             session.trace.detach_foreign_children()?;
@@ -453,26 +905,13 @@ impl Session<'_> {
                 return Ok(());
             }
             session.handle_stops()?;
-            if !session.empty() && session.trace.threads.is_empty() {
+            let detached = session.remove_exhausted()?;
+            if detached || (!session.empty() && session.trace.threads.is_empty()) {
                 return Ok(());
             }
-            match commands.recv_timeout(POLL_INTERVAL) {
-                Ok(Command::Install {
-                    id,
-                    location,
-                    program,
-                    kind,
-                    reply,
-                }) => {
-                    let result = session.install(id, location, program, kind);
-                    let _ = reply.send(result);
-                    if session.empty() {
-                        return Ok(());
-                    }
-                }
-                Ok(Command::Remove { id, reply }) => {
-                    let result = session.remove(id);
-                    let _ = reply.send(result);
+            match commands.0.recv_timeout(POLL_INTERVAL) {
+                Ok(command) => {
+                    session.command(command);
                     if session.empty() {
                         return Ok(());
                     }
@@ -483,8 +922,183 @@ impl Session<'_> {
         }
     }
 
-    fn empty(&self) -> bool {
-        self.slots.iter().all(Option::is_none) && self.software.is_empty()
+    pub(crate) fn service(&mut self, commands: &Commands, paused: &AtomicBool) {
+        if self.live_script.is_some() {
+            return;
+        }
+        if let Ok(command) = commands.0.try_recv() {
+            match command {
+                Command::Script(command) => self.script_run(command, paused),
+                command => self.command(command),
+            }
+        }
+    }
+
+    fn command(&mut self, command: Command) {
+        self.refresh_callbacks();
+        match command {
+            Command::Script(command) => {
+                let _ = command
+                    .reply
+                    .send(Err(error("live scripts require a run target")));
+            }
+            Command::Install {
+                id,
+                location,
+                program,
+                kind,
+                tid,
+                callback,
+                sender,
+                reply,
+            } => {
+                let result = self.install(id, location, program, kind, tid, callback, sender);
+                let _ = reply.send(result);
+            }
+            Command::Update {
+                id,
+                address,
+                callback,
+                sender,
+                reply,
+            } => {
+                let _ = reply.send(self.update(id, address, callback, sender));
+            }
+            Command::CaptureCore {
+                mode,
+                options,
+                directory,
+                reply,
+            } => {
+                let _ = reply.send(self.capture_core(mode, options, &directory));
+            }
+            Command::Capabilities(reply) => {
+                #[cfg(target_arch = "aarch64")]
+                let result = {
+                    let mut counts = None;
+                    self.control(|session| {
+                        counts = Some(hardware::counts(session.pid)?);
+                        Ok(())
+                    })
+                    .map(|()| {
+                        let (exec, watch) = counts.expect("capacity was probed");
+                        with_counts(exec, watch)
+                    })
+                };
+                #[cfg(target_arch = "x86_64")]
+                let result = Ok(capabilities());
+                let result = result.map(|mut document| {
+                    let slots: Vec<_> = self
+                        .trace
+                        .threads
+                        .iter()
+                        .map(|(&tid, thread)| {
+                            let mut execution = 0;
+                            let mut watch = 0;
+                            for rule in self
+                                .hardware
+                                .values()
+                                .filter(|rule| rule.applies(tid, thread.identity))
+                            {
+                                if matches!(rule.kind, Kind::Watch { .. }) {
+                                    watch += 1;
+                                } else {
+                                    execution += 1;
+                                }
+                            }
+                            serde_json::json!({"tid": tid, "execution": execution, "watch": watch,
+                            "shared": cfg!(target_arch = "x86_64").then_some(execution + watch)})
+                        })
+                        .collect();
+                    document["used_slots"] = slots.into();
+                    document
+                });
+                let _ = reply.send(result);
+            }
+            Command::List(reply) => {
+                let mut points: Vec<_> = self
+                    .hardware
+                    .values()
+                    .chain(self.software.values())
+                    .map(|rule| self.installed(*rule))
+                    .collect();
+                points.sort_by_key(|point| point.breakpoint_id);
+                let _ = reply.send(points);
+            }
+            Command::ReadMemory(request, reply) => {
+                let _ = reply.send(crate::script::read_live(self.pid, &request));
+            }
+            Command::Step(request, reply) => {
+                let _ = reply.send(self.step(request));
+            }
+            Command::StageRule { id, update, reply } => {
+                let result = match self.callbacks.get_mut(&id) {
+                    Some(callback) => callback.stage(update, |request| {
+                        let engine = self
+                            .engine
+                            .as_ref()
+                            .cloned()
+                            .ok_or_else(|| error("live script runtime ended"))?;
+                        self.exports.callback(engine, request)
+                    }),
+                    None => Ok(()),
+                };
+                let result = if self.runtime_poisoned() {
+                    self.control(|_| Ok(())).and(result)
+                } else {
+                    result
+                };
+                let _ = reply.send(result);
+            }
+            Command::Remove { id, reply } => {
+                let _ = reply.send(self.remove(id));
+            }
+            Command::Inspect(request, reply) => {
+                let result = symbols::inspect_with_trace(
+                    self.pid,
+                    request.tid,
+                    request.expression,
+                    request.module.as_deref(),
+                    request.instance,
+                    request.timeout_ms,
+                    request.expand,
+                    self.root,
+                    &mut self.trace,
+                );
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    pub(crate) fn reset_address_space(&mut self) -> Result<()> {
+        self.trace.clear_patches();
+        self.hardware.clear();
+        self.software.clear();
+        self.watch_values.clear();
+        self.callbacks.clear();
+        self.active.clear();
+        self.live_sources.clear();
+        self.exports.clear();
+        self.engine = None;
+        self.program_stopped(&self.hardware)
+    }
+
+    pub(crate) fn retire_inherited_patches(&mut self) -> Result<()> {
+        self.trace.freeze(Instant::now() + CONTROL_BUDGET)?;
+        self.trace.rewind_software_stops()?;
+        let ids = self.software.values().map(|rule| rule.id).collect();
+        self.disarm_stopped(&ids)?;
+        for thread in self.trace.threads.values_mut() {
+            if matches!(thread.stop, Some(Stop::Software { .. })) {
+                thread.stop = Some(Stop::Interrupt);
+            }
+        }
+        self.trace.foreign_software = false;
+        Ok(())
+    }
+
+    pub(crate) fn empty(&self) -> bool {
+        self.hardware.is_empty() && self.software.is_empty()
     }
 
     fn install(
@@ -493,146 +1107,695 @@ impl Session<'_> {
         location: PreparedLocation,
         program: Program,
         kind: Kind,
+        tid: Option<i32>,
+        source: Option<CallbackSource>,
+        sender: Weak<mpsc::SyncSender<Command>>,
+    ) -> Result<Installed> {
+        let mut installed = None;
+        self.control(|session| {
+            let callback = session.attach(id, source, &program, sender)?;
+            installed = Some(session.install_stopped(id, location, program, kind, tid, callback)?);
+            Ok(())
+        })?;
+        Ok(installed.expect("installation ran at a safe stop"))
+    }
+
+    fn attach(
+        &mut self,
+        id: u64,
+        source: Option<CallbackSource>,
+        program: &Program,
+        sender: Weak<mpsc::SyncSender<Command>>,
+    ) -> Result<Option<AttachedCallback>> {
+        source
+            .map(|source| {
+                source.attach(id, sender, program.budget.as_millis() as u32, |request| {
+                    let engine = self.shared_engine()?;
+                    self.exports.callback(engine, request)
+                })
+            })
+            .transpose()
+    }
+
+    fn capture_core(
+        &mut self,
+        mode: crate::rpc::CoreMode,
+        options: crate::coredump::CaptureOptions,
+        directory: &Path,
+    ) -> Result<crate::coredump::Dump> {
+        let mut result = None;
+        self.control(|session| {
+            let mut points = Vec::new();
+            let mut sources = BTreeMap::new();
+            for rule in session.hardware.values().chain(session.software.values()) {
+                let mut point = symbols::resolve(session.pid, rule.address, &[])?.replay_location();
+                let callback = session.callbacks.get(&rule.id);
+                if let Some(callback) = callback
+                    && let Some((source, export)) = callback.replay_source()
+                {
+                    let (id, revision) = callback.version().expect("registered source");
+                    let key = format!("{id}-{revision}");
+                    sources.insert(key.clone(), source);
+                    point["source"] = key.into();
+                    point["export"] = serde_json::json!(export);
+                } else if let Some(live) = session.live_sources.get(&rule.id) {
+                    let key = format!("live-{}", live.key);
+                    sources.insert(key.clone(), &live.source);
+                    point["source"] = key.into();
+                    point["live"] = serde_json::json!({
+                        "ordinal": live.ordinal,
+                        "requested_address": hex(live.requested_address),
+                    });
+                }
+                point["breakpoint_id"] = rule.id.into();
+                point["address"] = hex(rule.address).into();
+                point["kind"] = rule.kind.name().into();
+                point["scope"] = rule.program.scope.name().into();
+                point["timeout_ms"] = (rule.program.budget.as_millis() as u64).into();
+                if let Kind::Watch { length, .. } = rule.kind {
+                    point["length"] = length.into();
+                }
+                if let Some((tid, _)) = rule.thread {
+                    point["thread"] = if tid == session.pid {
+                        "leader"
+                    } else {
+                        "specific"
+                    }
+                    .into();
+                }
+                points.push(point);
+            }
+            let replay = serde_json::json!({"breakpoints": points, "rules": sources});
+            if serde_json::to_vec(&replay)?.len() > 1024 * 1024 {
+                return Err(error("breakpoint replay metadata exceeds 1 MiB"));
+            }
+            let pid = session.pid;
+            let dump = session.trace.with_unpatched(|trace| {
+                crate::coredump::prepare_with_trace(
+                    pid,
+                    mode,
+                    options,
+                    directory,
+                    &|| false,
+                    || {},
+                    Some((trace, None)),
+                )
+            });
+            let mut dump = dump?;
+            dump.summary.breakpoint_replay = Some(replay);
+            result = Some(dump);
+            Ok(())
+        })?;
+        Ok(result.expect("coredump ran at a safe stop"))
+    }
+
+    fn shared_engine(&mut self) -> Result<Rc<Engine>> {
+        if let Some(engine) = &self.engine {
+            if engine.poisoned() {
+                return Err(error("live script runtime is being disarmed"));
+            }
+            return Ok(Rc::clone(engine));
+        }
+        let engine = Engine::new()?;
+        self.engine = Some(Rc::clone(&engine));
+        Ok(engine)
+    }
+
+    fn script_run(&mut self, command: ScriptCommand, paused: &AtomicBool) {
+        let ScriptCommand {
+            js,
+            source,
+            replay_points,
+            budget,
+            ids,
+            reply,
+        } = command;
+        let replaying = !replay_points.is_empty();
+        let replay_count = replay_points.len();
+        let mut replay_points: BTreeMap<_, _> = replay_points
+            .into_iter()
+            .map(|point| (point.ordinal, point))
+            .collect();
+        let mut breakpoint_ids = Vec::new();
+        let mut evaluation = None;
+        let mut output = Vec::new();
+        let setup = self.control(|session| {
+            if replaying
+                && (!session.paused
+                    || replay_count != replay_points.len()
+                    || replay_count > SLOTS + 32)
+            {
+                return Err(error(
+                    "breakpoint replay requires a paused target and distinct install positions",
+                ));
+            }
+            // A failed setup can leave QuickJS jobs queued. Isolate its engine
+            // so they cannot affect callbacks installed by an earlier script.
+            let realm = Realm::new(Engine::new()?)?;
+            let mut ordinal = 0;
+            let target = crate::script::breakpoint::StoppedTarget {
+                pid: session.pid,
+                root: session.root.to_path_buf(),
+                tids: session.trace.threads.keys().copied().collect(),
+            };
+            let result = live::evaluate(
+                &realm,
+                &js,
+                replaying,
+                budget,
+                target,
+                &mut output,
+                |request| {
+                    ordinal += 1;
+                    let requested_address = request.address;
+                    let (location, tid) = if replaying {
+                        let Some(point) = replay_points.remove(&ordinal) else {
+                            return Ok(0);
+                        };
+                        if point.requested_address != requested_address
+                            || point.kind != request.kind.name()
+                            || point.module.is_empty()
+                            || point.module.len() > 4096
+                        {
+                            return Err(error(
+                                "the live script no longer matches its recorded breakpoint",
+                            ));
+                        }
+                        (
+                            Location::ModuleOffset {
+                                module: point.module,
+                                offset: point.offset,
+                                execution: !matches!(request.kind, Kind::Watch { .. }),
+                                instance: None,
+                                symbol: None,
+                            },
+                            point.leader_only.then_some(session.pid),
+                        )
+                    } else {
+                        (Location::Address(requested_address), request.tid)
+                    };
+                    let id = ids.fetch_add(1, Ordering::Relaxed) + 1;
+                    let location = PreparedLocation::resolve(session.pid, location)?;
+                    let program = Program::snapshot(Scope::Thread, request.timeout_ms)?;
+                    let callback = request.handler.map(|handler| {
+                        AttachedCallback::inline(Callback::new(
+                            handler,
+                            Rc::clone(&realm),
+                            Limits {
+                                max_hits: None,
+                                pause_budget_ms: request.timeout_ms,
+                            },
+                        ))
+                    });
+                    session.install_stopped(id, location, program, request.kind, tid, callback)?;
+                    breakpoint_ids.push(id);
+                    session.live_sources.insert(
+                        id,
+                        LiveSource {
+                            key: breakpoint_ids[0],
+                            source: Arc::clone(&source),
+                            ordinal,
+                            requested_address,
+                        },
+                    );
+                    Ok(id)
+                },
+            )
+            .and_then(|evaluation| {
+                if replaying && (breakpoint_ids.len() != replay_count || !replay_points.is_empty())
+                {
+                    return Err(error(
+                        "the live script did not reinstall every recorded breakpoint",
+                    ));
+                }
+                Ok(evaluation)
+            });
+            match result {
+                Ok(result) => {
+                    evaluation = Some(result);
+                    Ok(())
+                }
+                Err(issue) => {
+                    let installed = breakpoint_ids.drain(..).collect();
+                    if let Err(rollback) = session.disarm_stopped(&installed) {
+                        session.close_breakpoints();
+                        return Err(error(format!(
+                            "{issue}; live breakpoint rollback failed: {rollback}"
+                        )));
+                    }
+                    Err(issue)
+                }
+            }
+        });
+        let result = match setup.map(|()| evaluation.expect("live script ran")) {
+            Ok(live::Evaluation::Continue(waiting)) => {
+                self.live_script = Some(LiveScript {
+                    output,
+                    waiting,
+                    reply,
+                    ids: breakpoint_ids,
+                    events: Vec::new(),
+                    overflow: false,
+                    was_paused: self.paused,
+                    deadline: Instant::now() + budget,
+                });
+                self.paused = false;
+                paused.store(false, Ordering::Relaxed);
+                return;
+            }
+            Ok(live::Evaluation::ContinueReturning(value)) => {
+                self.paused = false;
+                paused.store(false, Ordering::Relaxed);
+                Ok(value)
+            }
+            Ok(live::Evaluation::Complete(value)) => Ok(value),
+            Err(issue) => Err(issue),
+        };
+        let mut result = live_result(breakpoint_ids, result, output);
+        result.active = result
+            .breakpoint_ids
+            .iter()
+            .filter_map(|id| {
+                self.active
+                    .get(id)
+                    .map(|active| (*id, Arc::downgrade(active)))
+            })
+            .collect();
+        let _ = reply.send(Ok(result));
+    }
+
+    pub(crate) fn finish_live_script(&mut self, paused: &AtomicBool, cancelled: bool) {
+        let Some(script) = self.live_script.as_ref() else {
+            return;
+        };
+        let exited = self.trace.exit.is_some();
+        let exec = self.trace.exec_observed();
+        let failure = if cancelled {
+            Some("run ended while the live script was waiting for events")
+        } else if exec {
+            Some("target address space changed")
+        } else if script.overflow {
+            Some("live script event limit exceeded")
+        } else if !exited && Instant::now() >= script.deadline {
+            Some("live script timed out waiting for target exit")
+        } else {
+            None
+        };
+        if !exited && failure.is_none() {
+            return;
+        }
+        let rollback = if failure.is_some() && !exited && !exec && !cancelled {
+            let installed = script.ids.iter().copied().collect();
+            self.paused = script.was_paused;
+            paused.store(self.paused, Ordering::Relaxed);
+            self.control(|session| session.disarm_stopped(&installed))
+                .err()
+        } else {
+            None
+        };
+        let script = self.live_script.take().expect("pending live script");
+        let result = if let Some(issue) = failure {
+            if let Some(rollback) = rollback {
+                self.close_breakpoints();
+                Err(error(format!(
+                    "{issue}; live breakpoint rollback failed: {rollback}"
+                )))
+            } else {
+                Err(error(issue))
+            }
+        } else {
+            script
+                .events
+                .iter()
+                .map(|(event, _)| serde_json::to_value(event))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+                .and_then(|events| script.waiting.finish(&events))
+        };
+        let result = match result {
+            Ok(value) => {
+                for (event, capture) in script.events {
+                    (self.publish)(event, capture);
+                }
+                Ok(value)
+            }
+            Err(issue) => Err(issue),
+        };
+        let _ = script
+            .reply
+            .send(Ok(live_result(script.ids, result, script.output)));
+    }
+
+    fn install_stopped(
+        &mut self,
+        id: u64,
+        location: PreparedLocation,
+        program: Program,
+        kind: Kind,
+        tid: Option<i32>,
+        callback: Option<AttachedCallback>,
     ) -> Result<Installed> {
         if location.start.is_some_and(|start| start != self.start) {
             return Err(error("target identity changed during symbol resolution"));
-        }
-        let address = location.address;
-        let rule = Rule {
-            id,
-            address,
-            program,
-            kind,
-        };
-        if self.software.contains_key(&address)
-            || self
-                .slots
-                .iter()
-                .flatten()
-                .any(|rule| rule.address == address)
-        {
-            return Err(error("a breakpoint already exists at this address"));
-        }
-        if let Kind::Watch { length, .. } = kind
-            && (!matches!(length, 1 | 2 | 4 | 8) || !address.is_multiple_of(length as u64))
-        {
-            return Err(error(
-                "watchpoint length must be 1, 2, 4, or 8 and the address must be aligned to length",
-            ));
         }
         if kind == Kind::Software && self.software.len() == 32 {
             return Err(error(
                 "software breakpoint slots exhausted (32 per session)",
             ));
         }
-        let slot = if kind == Kind::Software {
-            None
-        } else {
-            Some(
-                self.slots
-                    .iter()
-                    .position(Option::is_none)
-                    .ok_or_else(|| error("hardware breakpoint slots exhausted"))?,
-            )
+        let thread = tid
+            .map(|tid| {
+                self.trace
+                    .threads
+                    .get(&tid)
+                    .filter(|_| crate::procfs::task_path(self.root, tid).is_dir())
+                    .map(|thread| (tid, thread.identity))
+                    .ok_or_else(|| {
+                        error(format!(
+                            "thread {tid} is not a tracked thread of the target"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let rule = Rule {
+            id,
+            address: location.address,
+            program,
+            kind,
+            thread,
         };
+        self.place_stopped(rule, &location, None)?;
+        if let Some(callback) = callback {
+            self.callbacks.insert(id, callback);
+        }
+        self.active.insert(id, Arc::new(()));
+        Ok(self.installed(rule))
+    }
+
+    fn installed(&self, rule: Rule) -> Installed {
+        let callback = self.callbacks.get(&rule.id);
+        let limits = callback.map(|callback| callback.runtime.limits);
+        let version = callback.and_then(AttachedCallback::version);
+        Installed {
+            kind: rule.kind.name(),
+            breakpoint_id: rule.id,
+            address: hex(rule.address),
+            tid: rule.thread.map(|(tid, _)| tid),
+            callback: limits,
+            rule_id: version.map(|(id, _)| id),
+            rule_revision: version.map(|(_, revision)| revision),
+            active: Arc::downgrade(&self.active[&rule.id]),
+        }
+    }
+
+    fn update(
+        &mut self,
+        id: u64,
+        address: Option<u64>,
+        source: Option<CallbackSource>,
+        sender: Weak<mpsc::SyncSender<Command>>,
+    ) -> Result<Installed> {
+        let mut updated = None;
         self.control(|session| {
-            let mut initial_watch_value = None;
-            match kind {
-                Kind::Hardware if !location.valid(session.root)? => {
-                    return Err(error(
-                        "breakpoint address no longer matches an executable mapping",
-                    ));
-                }
-                Kind::Software => {
-                    if !location.valid(session.root)? {
-                        return Err(error("software breakpoint mapping changed"));
-                    }
-                    session.trace.patch(address)?;
-                    session.software.insert(address, rule);
-                }
-                Kind::Watch { length, .. } => {
-                    let end = address
-                        .checked_add(length as u64 - 1)
-                        .ok_or_else(|| error("invalid watchpoint range"))?;
-                    modules::mapping_at(session.root, address)?
-                        .filter(|m| m.contains(end))
-                        .ok_or_else(|| error("watchpoint range is outside a mapped region"))?;
-                    initial_watch_value = Some(session.trace.read_word(address, length).ok());
-                }
-                _ => (),
+            let old = session
+                .hardware
+                .get(&id)
+                .or_else(|| session.software.values().find(|rule| rule.id == id))
+                .copied()
+                .ok_or_else(|| {
+                    crate::Diagnostic::new("BREAKPOINT_NOT_FOUND", "breakpoint ID not found", None)
+                })?;
+            let rule = Rule {
+                address: address.unwrap_or(old.address),
+                ..old
+            };
+            let replacement = session.attach(id, source, &rule.program, sender)?;
+            if rule.address != old.address {
+                let location =
+                    PreparedLocation::resolve(session.pid, Location::Address(rule.address))?;
+                session.place_stopped(rule, &location, Some(old.address))?;
             }
-            if let Some(slot) = slot {
-                let mut proposed = session.slots;
-                proposed[slot] = Some(rule);
-                session.replace_hardware(proposed)?;
+            let previous = session
+                .callbacks
+                .get(&id)
+                .and_then(AttachedCallback::version)
+                .map_or(0, |(_, revision)| revision);
+            if let Some(callback) = replacement {
+                session.live_sources.remove(&id);
+                session.callbacks.insert(id, callback);
             }
-            if let Some(value) = initial_watch_value {
-                session.watch_values.insert(id, value);
+            if let Some(callback) = session.callbacks.get_mut(&id) {
+                callback.follow_revision(previous);
             }
+            updated = Some(session.installed(rule));
             Ok(())
         })?;
-        Ok(Installed {
-            kind: kind.name(),
-            breakpoint_id: id,
-            address: hex(address),
-        })
+        Ok(updated.expect("update ran at a safe stop"))
+    }
+
+    fn place_stopped(
+        &mut self,
+        rule: Rule,
+        location: &PreparedLocation,
+        previous_address: Option<u64>,
+    ) -> Result<()> {
+        let address = rule.address;
+        if self.software.contains_key(&address)
+            || self.hardware.values().any(|other| {
+                other.address == address
+                    && (rule.kind != Kind::Hardware
+                        || other.kind != Kind::Hardware
+                        || rule.thread.is_none()
+                        || other.thread.is_none()
+                        || rule.thread == other.thread)
+            })
+        {
+            return Err(error("a breakpoint already exists at this address"));
+        }
+        let watch_length = if let Kind::Watch { length, access } = rule.kind {
+            if cfg!(target_arch = "x86_64") && access == WatchAccess::Read {
+                return Err(crate::Diagnostic::new(
+                    "UNSUPPORTED_WATCH_ACCESS",
+                    "Hardware read-only watchpoints are unavailable on this architecture",
+                    Some("Query breakpoint_capabilities for supported access modes."),
+                )
+                .into());
+            }
+            if !matches!(length, 1 | 2 | 4 | 8) || !address.is_multiple_of(length as u64) {
+                return Err(error(
+                    "watchpoint length must be 1, 2, 4, or 8 and the address must be aligned to length",
+                ));
+            }
+            let end = address
+                .checked_add(length as u64 - 1)
+                .ok_or_else(|| error("invalid watchpoint range"))?;
+            if modules::mapping_at(self.root, address)?.is_none_or(|map| !map.contains(end)) {
+                return Err(error("watchpoint range is outside a mapped region"));
+            }
+            Some(length)
+        } else {
+            if !location.valid(self.root)? {
+                return Err(error(
+                    "breakpoint address no longer matches an executable mapping",
+                ));
+            }
+            None
+        };
+        if rule.kind == Kind::Software {
+            self.trace.patch(address)?;
+            if let Some(previous) = previous_address {
+                if let Err(issue) = self.trace.unpatch(previous) {
+                    if let Err(rollback) = self.trace.unpatch(address) {
+                        self.close_breakpoints();
+                        return Err(error(format!(
+                            "{issue}; software breakpoint rollback failed: {rollback}"
+                        )));
+                    }
+                    return Err(issue);
+                }
+                self.software.remove(&previous);
+            }
+            self.software.insert(address, rule);
+        } else {
+            let mut proposed = self.hardware.clone();
+            proposed.insert(rule.id, rule);
+            self.replace_hardware(proposed)?;
+        }
+        if let Some(length) = watch_length {
+            self.watch_values
+                .insert(rule.id, self.trace.read_word(address, length).ok());
+        }
+        Ok(())
     }
 
     fn remove(&mut self, id: u64) -> Result<Option<Cleanup>> {
         let software = self.software.values().find(|rule| rule.id == id).copied();
-        let slot = self
-            .slots
-            .iter()
-            .position(|entry| entry.is_some_and(|rule| rule.id == id));
-        if software.is_none() && slot.is_none() {
+        let hardware = self.hardware.contains_key(&id);
+        if software.is_none() && !hardware {
             return Err(error("breakpoint ID not found"));
         }
-        if self.software.len() + self.slots.iter().flatten().count() == 1 {
-            let cleanup = self.trace.close();
-            self.software.clear();
-            self.slots = [None; SLOTS];
-            self.watch_values.clear();
-            return Ok(Some(cleanup));
+        if !self.launched && self.software.len() + self.hardware.len() == 1 {
+            return Ok(Some(self.close_breakpoints()));
         }
-        self.control(|session| {
-            if let Some(rule) = software {
-                session.trace.unpatch(rule.address)?;
-                session.software.remove(&rule.address);
-            }
-            if let Some(slot) = slot {
-                let mut proposed = session.slots;
-                proposed[slot] = None;
-                session.replace_hardware(proposed)?;
-                session.watch_values.remove(&id);
-            }
-            Ok(())
-        })?;
+        self.control(|session| session.disarm_stopped(&BTreeSet::from([id])))?;
         Ok(None)
     }
 
-    fn replace_hardware(&mut self, proposed: Slots) -> Result<()> {
-        if let Err(e) = self.program_stopped(&proposed) {
-            if let Err(rollback) = self.program_stopped(&self.slots) {
-                self.trace.close();
-                self.software.clear();
-                self.slots = [None; SLOTS];
-                return Err(error(format!(
-                    "{e}; hardware breakpoint rollback failed: {rollback}"
-                )));
-            }
-            return Err(e);
+    fn disarm_stopped(&mut self, ids: &BTreeSet<u64>) -> Result<()> {
+        if ids.iter().any(|id| self.hardware.contains_key(id)) {
+            let mut proposed = self.hardware.clone();
+            proposed.retain(|id, _| !ids.contains(id));
+            self.replace_hardware(proposed)?;
         }
-        self.slots = proposed;
+        let patches: Vec<_> = self
+            .software
+            .values()
+            .filter(|rule| ids.contains(&rule.id))
+            .map(|rule| rule.address)
+            .collect();
+        for address in patches {
+            self.trace.unpatch(address)?;
+            self.software.remove(&address);
+        }
+        self.watch_values.retain(|id, _| !ids.contains(id));
+        self.callbacks.retain(|id, _| !ids.contains(id));
+        self.active.retain(|id, _| !ids.contains(id));
+        self.live_sources.retain(|id, _| !ids.contains(id));
+        Ok(())
+    }
+
+    fn runtime_poisoned(&self) -> bool {
+        self.engine.as_ref().is_some_and(|engine| engine.poisoned())
+            || self
+                .callbacks
+                .values()
+                .any(|callback| callback.runtime.poisoned_group())
+    }
+
+    fn discard_poisoned_runtime(&mut self) -> Result<()> {
+        if self.runtime_poisoned() {
+            let ids = self
+                .callbacks
+                .iter()
+                .filter_map(|(&id, callback)| callback.runtime.poisoned_group().then_some(id))
+                .collect();
+            self.disarm_stopped(&ids)?;
+            if self.engine.as_ref().is_some_and(|engine| engine.poisoned()) {
+                self.exports.clear();
+                self.engine = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_exhausted(&mut self) -> Result<bool> {
+        if self.runtime_poisoned() {
+            self.control(|_| Ok(()))?;
+        }
+        let ids: BTreeSet<_> = self
+            .callbacks
+            .iter()
+            .filter(|(_, callback)| callback.runtime.exhausted())
+            .map(|(&id, _)| id)
+            .chain(
+                self.hardware
+                    .values()
+                    .chain(self.software.values())
+                    .filter(|rule| {
+                        rule.thread.is_some_and(|(tid, identity)| {
+                            self.trace
+                                .threads
+                                .get(&tid)
+                                .is_none_or(|thread| thread.identity != identity)
+                        })
+                    })
+                    .map(|rule| rule.id),
+            )
+            .collect();
+        for id in ids {
+            match self.remove(id) {
+                Ok(Some(cleanup)) => {
+                    if !cleanup.ok() {
+                        return Err(error(
+                            "could not cleanly detach the completed breakpoint callback",
+                        ));
+                    }
+                    return Ok(true);
+                }
+                Ok(None) => (),
+                Err(issue) => {
+                    // A one-shot callback may have resumed a target that
+                    // exited before the disarm could freeze it again.
+                    self.trace.poll()?;
+                    if self.trace.exit.is_some()
+                        || (!self.launched && self.trace.threads.is_empty())
+                    {
+                        return Ok(true);
+                    }
+                    return Err(issue);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn close_breakpoints(&mut self) -> Cleanup {
+        let cleanup = self.trace.close();
+        self.software.clear();
+        self.hardware.clear();
+        self.watch_values.clear();
+        self.callbacks.clear();
+        self.active.clear();
+        self.live_sources.clear();
+        self.exports.clear();
+        self.engine = None;
+        cleanup
+    }
+
+    fn replace_hardware(&mut self, proposed: BTreeMap<u64, Rule>) -> Result<()> {
+        let mut changes = Vec::new();
+        for (&tid, thread) in &self.trace.threads {
+            if thread.stop.is_none() {
+                continue;
+            }
+            let previous = Self::thread_slots(&self.hardware, tid, thread.identity)?;
+            let next = Self::thread_slots(&proposed, tid, thread.identity)?;
+            if previous.map(|slot| slot.map(|rule| (rule.id, rule.address, rule.kind)))
+                != next.map(|slot| slot.map(|rule| (rule.id, rule.address, rule.kind)))
+            {
+                changes.push((tid, previous, next));
+            }
+        }
+        for (index, (tid, _, next)) in changes.iter().enumerate() {
+            if let Err(issue) = Self::program_slots(*tid, next) {
+                let mut failure = None;
+                // A bank may have been partially written before the failing operation.
+                for (tid, previous, _) in changes[..=index].iter().rev() {
+                    if let Err(rollback) = Self::program_slots(*tid, previous) {
+                        failure.get_or_insert(rollback);
+                    }
+                }
+                if let Some(rollback) = failure {
+                    self.close_breakpoints();
+                    return Err(error(format!(
+                        "{issue}; hardware breakpoint rollback failed: {rollback}"
+                    )));
+                }
+                return Err(issue);
+            }
+        }
+        self.hardware = proposed;
         Ok(())
     }
 
     fn control(&mut self, update: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        self.refresh_callbacks();
         let deadline = Instant::now() + CONTROL_BUDGET;
         let frozen = self.trace.freeze(deadline);
         if self.trace.exec_observed() || self.trace.foreign_software {
-            self.trace.close();
-            self.software.clear();
-            self.slots = [None; SLOTS];
+            if !self.launched {
+                self.close_breakpoints();
+            }
             return Err(error("target address space changed"));
         }
         self.trace.rewind_software_stops()?;
@@ -640,42 +1803,74 @@ impl Session<'_> {
         self.observe_writes(&mut hits);
         let mut captured = self.capture_hits(hits, frozen.is_ok());
         let stepping = self
-            .step_arm_hardware_stops(frozen.is_ok(), &mut captured)
+            .complete_hardware_hits(frozen.is_ok(), &mut captured)
             .and_then(|()| self.step_software_stops(frozen.is_ok(), &mut captured));
-        let result = if stepping.is_ok() {
-            frozen.and_then(|()| update(self))
-        } else {
-            Ok(())
-        };
-        let resume = stepping.and_then(|()| self.resume_stopped());
+        let stepping = stepping.and_then(|()| self.consume_hardware_stops());
+        let mut result = Ok(());
+        let resume = stepping.and_then(|()| {
+            result = frozen.and_then(|()| {
+                self.discard_poisoned_runtime()?;
+                let updated = update(self);
+                self.discard_poisoned_runtime()?;
+                updated
+            });
+            if self.runtime_poisoned() && result.is_err() {
+                return Err(error("could not disarm a failed live script runtime"));
+            }
+            if self.launched {
+                Ok(())
+            } else {
+                self.resume_stopped()
+            }
+        });
         self.finish_hits(captured, resume.as_ref().err().map(|error| error.as_ref()));
         if let Err(e) = resume {
-            self.trace.close();
-            self.software.clear();
-            self.slots = [None; SLOTS];
+            self.close_breakpoints();
             return Err(e);
         }
         result
     }
 
-    fn program_stopped(&self, slots: &Slots) -> Result<()> {
+    fn thread_slots(rules: &BTreeMap<u64, Rule>, tid: i32, identity: u64) -> Result<Slots> {
+        let mut slots = [None; SLOTS];
+        for (index, rule) in rules
+            .values()
+            .filter(|rule| rule.applies(tid, identity))
+            .enumerate()
+        {
+            let slot = slots.get_mut(index).ok_or_else(|| {
+                error(format!(
+                    "hardware breakpoint slots exhausted on thread {tid}"
+                ))
+            })?;
+            *slot = Some(*rule);
+        }
+        Ok(slots)
+    }
+
+    fn program_stopped(&self, rules: &BTreeMap<u64, Rule>) -> Result<()> {
         for (&tid, thread) in &self.trace.threads {
             if thread.stop.is_some() {
-                hardware::program(tid, slots).map_err(|e| {
-                    if matches!(
-                        e.downcast_ref::<Errno>(),
-                        Some(Errno::ENOSPC | Errno::EBUSY)
-                    ) {
-                        error(format!(
-                            "hardware breakpoint slots exhausted on thread {tid}: {e}"
-                        ))
-                    } else {
-                        error(format!("program hardware breakpoints on thread {tid}: {e}"))
-                    }
-                })?;
+                let slots = Self::thread_slots(rules, tid, thread.identity)?;
+                Self::program_slots(tid, &slots)?;
             }
         }
         Ok(())
+    }
+
+    fn program_slots(tid: i32, slots: &Slots) -> Result<()> {
+        hardware::program(tid, slots).map_err(|e| {
+            if matches!(
+                e.downcast_ref::<Errno>(),
+                Some(Errno::ENOSPC | Errno::EBUSY)
+            ) {
+                error(format!(
+                    "hardware breakpoint slots exhausted on thread {tid}: {e}"
+                ))
+            } else {
+                error(format!("program hardware breakpoints on thread {tid}: {e}"))
+            }
+        })
     }
 
     fn hits(&self) -> Result<Vec<Hit>> {
@@ -687,9 +1882,14 @@ impl Session<'_> {
                     observed,
                     unix_ms,
                 }) => {
-                    if let Some(&rule) = self.software.get(&address) {
+                    if let Some(&rule) = self
+                        .software
+                        .get(&address)
+                        .filter(|rule| rule.applies(tid, thread.identity))
+                    {
                         hits.push(Hit {
                             tid,
+                            pc: address,
                             rule,
                             observed,
                             unix_ms,
@@ -718,12 +1918,13 @@ impl Session<'_> {
                         }
                         _ => None,
                     };
+                    let installed = Self::thread_slots(&self.hardware, tid, thread.identity)?;
                     let nearest = if cfg!(target_arch = "aarch64") {
-                        self.slots.iter().flatten().filter_map(arm_distance).min()
+                        installed.iter().flatten().filter_map(arm_distance).min()
                     } else {
                         None
                     };
-                    for (slot, rule) in self.slots.iter().enumerate() {
+                    for (slot, rule) in installed.iter().enumerate() {
                         let Some(rule) = *rule else { continue };
                         if (cfg!(target_arch = "aarch64")
                             && nearest.is_some()
@@ -733,6 +1934,7 @@ impl Session<'_> {
                         {
                             hits.push(Hit {
                                 tid,
+                                pc,
                                 rule,
                                 observed,
                                 unix_ms,
@@ -756,26 +1958,24 @@ impl Session<'_> {
             *counts.entry(hit.rule.id).or_insert(0) += 1;
         }
         for hit in hits {
-            let Kind::Watch { length, read_write } = hit.rule.kind else {
+            let Kind::Watch { length, access } = hit.rule.kind else {
                 continue;
             };
             let after = self.trace.read_word(hit.rule.address, length).ok();
-            let before = self.watch_values.insert(hit.rule.id, after).flatten();
+            let before = self
+                .watch_values
+                .insert(hit.rule.id, after)
+                .flatten()
+                .filter(|_| counts[&hit.rule.id] == 1);
             hit.watch = Some(WatchObservation {
                 length,
-                access: if read_write { "read_write" } else { "write" },
-                write_observed: (!read_write).then_some(true),
-                value_before: if counts[&hit.rule.id] == 1 {
-                    before.map(hex)
-                } else {
-                    None
-                },
-                value_after: after.map(hex),
-                value_changed: if counts[&hit.rule.id] == 1 {
-                    before.zip(after).map(|(a, b)| a != b)
-                } else {
-                    None
-                },
+                access: access.name(),
+                write_observed: access.write_observed(),
+                value_before: before,
+                value_after: after,
+                value_before_decimal: before,
+                value_after_decimal: after,
+                value_changed: before.zip(after).map(|(a, b)| a != b),
                 reported_address: None,
                 attribution: None,
             });
@@ -785,7 +1985,7 @@ impl Session<'_> {
     fn step_arm_hardware_stops(
         &mut self,
         frozen: bool,
-        captured: &mut [(Hit, Capture)],
+        captured: &mut [CapturedHit],
     ) -> Result<()> {
         if !cfg!(target_arch = "aarch64") {
             return Ok(());
@@ -810,9 +2010,9 @@ impl Session<'_> {
         for (tid, reported) in pending {
             let mut watches = Vec::new();
             for (hit, _) in captured.iter_mut().filter(|(hit, _)| hit.tid == tid) {
-                if let Kind::Watch { length, read_write } = hit.rule.kind {
+                if let Kind::Watch { length, access } = hit.rule.kind {
                     let before = self.trace.read_word(hit.rule.address, length).ok();
-                    watches.push((hit, length, read_write, before));
+                    watches.push((hit, length, access, before));
                 }
             }
             let unambiguous = watches.len() == 1;
@@ -823,10 +2023,13 @@ impl Session<'_> {
                     "target address space changed during hardware single-step",
                 ));
             }
-            if stop.is_some() {
-                hardware::program(tid, &self.slots)?;
+            if let Some(thread) = self.trace.threads.get(&tid).filter(|_| stop.is_some()) {
+                hardware::program(
+                    tid,
+                    &Self::thread_slots(&self.hardware, tid, thread.identity)?,
+                )?;
             }
-            for (hit, length, read_write, before) in watches {
+            for (hit, length, access, before) in watches {
                 let exact = unambiguous
                     && reported.is_some_and(|a| {
                         a.checked_sub(hit.rule.address)
@@ -837,10 +2040,14 @@ impl Session<'_> {
                     .flatten();
                 hit.watch = Some(WatchObservation {
                     length,
-                    access: if read_write { "read_write" } else { "write" },
-                    write_observed: (!read_write && exact && after.is_some()).then_some(true),
-                    value_before: before.map(hex),
-                    value_after: after.map(hex),
+                    access: access.name(),
+                    write_observed: (exact && after.is_some())
+                        .then(|| access.write_observed())
+                        .flatten(),
+                    value_before: before,
+                    value_after: after,
+                    value_before_decimal: before,
+                    value_after_decimal: after,
                     value_changed: before.zip(after).map(|(a, b)| a != b),
                     reported_address: reported.map(hex),
                     attribution: Some(if exact { "exact" } else { "approximate" }),
@@ -850,11 +2057,7 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn step_software_stops(
-        &mut self,
-        frozen: bool,
-        captured: &mut Vec<(Hit, Capture)>,
-    ) -> Result<()> {
+    fn step_software_stops(&mut self, frozen: bool, captured: &mut Vec<CapturedHit>) -> Result<()> {
         let stops: Vec<_> = self
             .trace
             .threads
@@ -889,7 +2092,7 @@ impl Session<'_> {
                     .collect();
                 self.observe_writes(&mut hits);
                 let mut after = self.capture_hits(hits, true);
-                self.step_arm_hardware_stops(true, &mut after)?;
+                self.complete_hardware_hits(true, &mut after)?;
                 if pending_rearm {
                     self.trace.rearm_software(address)?;
                 }
@@ -899,57 +2102,229 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn capture_hits(&mut self, hits: Vec<Hit>, frozen: bool) -> Vec<(Hit, Capture)> {
+    fn hit_deadline(&self, hit: &Hit) -> Instant {
+        let budget = self
+            .callbacks
+            .get(&hit.rule.id)
+            .map_or(hit.rule.program.budget, |callback| {
+                Duration::from_millis(u64::from(callback.runtime.limits.pause_budget_ms))
+            });
+        hit.observed + budget
+    }
+
+    fn capture_hits(&mut self, hits: Vec<Hit>, frozen: bool) -> Vec<CapturedHit> {
         // All already-stopped threads share the earliest active deadline.
         let deadline = hits
             .iter()
-            .map(|h| h.observed + h.rule.program.budget)
+            .filter(|hit| {
+                self.callbacks
+                    .get(&hit.rule.id)
+                    .is_none_or(|cb| !cb.runtime.exhausted())
+            })
+            .map(|hit| self.hit_deadline(hit))
             .min();
         hits.into_iter()
             .map(|hit| {
-                let deadline = deadline.expect("at least one hit");
-                let capture = hit.rule.program.execute(self, &hit, deadline, frozen);
-                (hit, capture)
+                let mut outcome = Outcome {
+                    stop_context: None,
+                    pending: None,
+                    rule: None,
+                    snapshot: None,
+                    callback: None,
+                };
+                if let Some(callback) = self.callbacks.get(&hit.rule.id) {
+                    if !callback.runtime.exhausted() {
+                        let deadline = deadline.expect("active hit");
+                        let state = if Instant::now() >= deadline {
+                            Err(error("callback pause budget exceeded"))
+                        } else {
+                            regs::read(hit.tid).map(|regs| HitState {
+                                pid: self.pid,
+                                tid: hit.tid,
+                                address: hit.rule.address,
+                                kind: hit.rule.kind.name(),
+                                registers: regs.general,
+                                stack: regs.stack,
+                                proc_root: self.root.to_owned(),
+                                watch: None,
+                            })
+                        };
+                        if cfg!(target_arch = "aarch64")
+                            && matches!(hit.rule.kind, Kind::Watch { .. })
+                        {
+                            outcome.pending = Some((state, deadline));
+                        } else {
+                            self.run_callback(&hit, &mut outcome, state, deadline, frozen);
+                        }
+                    }
+                } else {
+                    let deadline = deadline.expect("active hit");
+                    outcome.snapshot = Some(hit.rule.program.execute(self, &hit, deadline, frozen));
+                }
+                if matches!(hit.rule.kind, Kind::Watch { .. })
+                    && let Some(deadline) = deadline
+                {
+                    outcome.stop_context = Some(self.watch_context(&hit, deadline));
+                }
+                (hit, outcome)
             })
             .collect()
     }
 
-    fn finish_hits(
-        &self,
-        captured: Vec<(Hit, Capture)>,
-        resume: Option<&(dyn std::error::Error + Send + Sync)>,
+    fn watch_context(&self, hit: &Hit, deadline: Instant) -> serde_json::Value {
+        use serde_json::json;
+
+        let deadline = deadline.min(Instant::now() + Duration::from_millis(25));
+        let mut site = json!({"address": hex(hit.pc)});
+        if Instant::now() < deadline
+            && let Ok(location) = symbols::resolve(self.pid, hit.pc, &[])
+        {
+            site = location.stop_site();
+        }
+        let watched = if Instant::now() < deadline {
+            symbols::resolve(self.pid, hit.rule.address, &[])
+                .ok()
+                .and_then(|location| location.symbol_location())
+        } else {
+            None
+        };
+        let args = match regs::read(hit.tid) {
+            Ok(regs) => symbols::inspect::stopped_arguments(
+                self.pid,
+                self.root,
+                &self.trace,
+                regs.stack,
+                deadline,
+            ),
+            Err(error) => json!({"status": "unavailable", "items": [], "issue": error.to_string()}),
+        };
+        json!({"site": site, "watched_symbol": watched, "args": args})
+    }
+
+    fn complete_hardware_hits(&mut self, frozen: bool, captured: &mut [CapturedHit]) -> Result<()> {
+        self.step_arm_hardware_stops(frozen, captured)?;
+        for (hit, outcome) in captured {
+            if let Some((state, deadline)) = outcome.pending.take() {
+                self.run_callback(hit, outcome, state, deadline, frozen);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_callback(
+        &mut self,
+        hit: &Hit,
+        outcome: &mut Outcome,
+        state: Result<HitState>,
+        deadline: Instant,
+        frozen: bool,
     ) {
-        for (hit, mut capture) in captured {
-            let pause_ms = hit.observed.elapsed().as_millis() as u64;
-            capture.snapshot.trace_window_ms = Some(pause_ms);
-            (self.publish)(
-                Event {
-                    breakpoint_id: hit.rule.id,
-                    pid: self.pid,
-                    tid: hit.tid,
-                    address: hex(hit.rule.address),
-                    scope: hit.rule.program.scope.name(),
-                    observed_unix_ms: hit.unix_ms,
-                    pause_ms,
-                    capture_status: capture.snapshot.status,
-                    resume_status: if resume.is_none() {
-                        "resumed"
-                    } else {
-                        "failed"
-                    },
-                    detail: resume.map(ToString::to_string),
-                    kind: hit.rule.kind.name(),
-                    watch: hit.watch,
-                },
-                capture,
-            );
+        let state = state.and_then(|mut state| {
+            if cfg!(target_arch = "aarch64")
+                && matches!(hit.rule.kind, Kind::Watch { .. })
+                && Instant::now() < deadline
+            {
+                state.stack = regs::read(hit.tid)?.stack;
+            }
+            state.watch = hit.watch.as_ref().map(|watch| WatchState {
+                before: watch.value_before,
+                after: watch.value_after,
+                changed: watch.value_changed,
+            });
+            Ok(state)
+        });
+        let callback = self
+            .callbacks
+            .get_mut(&hit.rule.id)
+            .expect("armed callback");
+        if !callback.runtime.exhausted() {
+            outcome.rule = callback.version();
+            callback.count_hit();
+            let report = callback.runtime.run(state, deadline);
+            if report.snapshot {
+                outcome.snapshot = Some(hit.rule.program.execute(self, hit, deadline, frozen));
+            }
+            outcome.callback = Some(report);
         }
     }
 
-    fn handle_stops(&mut self) -> Result<()> {
+    fn finish_hits(
+        &mut self,
+        captured: Vec<CapturedHit>,
+        resume: Option<&(dyn std::error::Error + Send + Sync)>,
+    ) {
+        for (hit, mut outcome) in captured {
+            let pause_ms = hit.observed.elapsed().as_millis() as u64;
+            let capture_status = if let Some(snapshot) = &mut outcome.snapshot {
+                snapshot.snapshot.trace_window_ms = Some(pause_ms);
+                snapshot.snapshot.status
+            } else if let Some(callback) = &outcome.callback {
+                if callback.suppressed && resume.is_none() {
+                    continue;
+                }
+                callback.status
+            } else {
+                continue;
+            };
+            let event = Event {
+                breakpoint_id: hit.rule.id,
+                rule_id: outcome.rule.map(|(id, _)| id),
+                rule_revision: outcome.rule.map(|(_, revision)| revision),
+                pid: self.pid,
+                tid: hit.tid,
+                address: hex(hit.rule.address),
+                instruction_pc: hex(hit.pc),
+                pc_relation: if cfg!(target_arch = "x86_64") && hit.watch.is_some() {
+                    "after_instruction"
+                } else {
+                    "at_instruction"
+                },
+                stop_context: outcome.stop_context,
+                scope: hit.rule.program.scope.name(),
+                observed_unix_ms: hit.unix_ms,
+                pause_ms,
+                capture_status,
+                resume_status: if resume.is_none() {
+                    "resumed"
+                } else {
+                    "failed"
+                },
+                detail: resume.map(ToString::to_string),
+                kind: hit.rule.kind.name(),
+                watch: hit.watch,
+                callback: outcome.callback,
+            };
+            if let Some(script) = self
+                .live_script
+                .as_mut()
+                .filter(|script| script.ids.contains(&event.breakpoint_id))
+            {
+                if script.events.len() < 64 {
+                    script.events.push((event, outcome.snapshot));
+                } else {
+                    script.overflow = true;
+                }
+            } else {
+                (self.publish)(event, outcome.snapshot);
+            }
+        }
+    }
+
+    fn refresh_callbacks(&mut self) {
+        self.exports.prune();
+        let mut batch = BTreeMap::new();
+        for callback in self.callbacks.values_mut() {
+            if let Some(key) = callback.refresh(&mut batch) {
+                self.exports.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn handle_stops(&mut self) -> Result<()> {
         if self.stopped().is_empty() {
             return Ok(());
         }
+        self.refresh_callbacks();
         let needs_software_freeze = self.trace.threads.values().any(|thread| {
             matches!(thread.stop, Some(Stop::Software { .. }))
                 || cfg!(target_arch = "aarch64")
@@ -959,12 +2334,7 @@ impl Session<'_> {
         let capture_deadline = initial
             .iter()
             .any(|hit| matches!(hit.rule.program.scope, Scope::Process))
-            .then(|| {
-                initial
-                    .iter()
-                    .map(|hit| hit.observed + hit.rule.program.budget)
-                    .min()
-            })
+            .then(|| initial.iter().map(|hit| self.hit_deadline(hit)).min())
             .flatten();
         let deadline = if needs_software_freeze {
             Some(Instant::now() + CONTROL_BUDGET)
@@ -984,9 +2354,26 @@ impl Session<'_> {
         self.observe_writes(&mut hits);
         let mut captured = self.capture_hits(hits, frozen);
         let resume = self
-            .step_arm_hardware_stops(frozen, &mut captured)
+            .complete_hardware_hits(frozen, &mut captured)
             .and_then(|()| self.step_software_stops(frozen, &mut captured))
-            .and_then(|()| self.resume_stopped());
+            .and_then(|()| {
+                if self.runtime_poisoned() {
+                    self.consume_hardware_stops()?;
+                    if !frozen {
+                        self.trace.freeze(Instant::now() + CONTROL_BUDGET)?;
+                        self.trace.rewind_software_stops()?;
+                        let mut hits = self.hits()?;
+                        self.observe_writes(&mut hits);
+                        let mut extra = self.capture_hits(hits, true);
+                        self.complete_hardware_hits(true, &mut extra)?;
+                        self.step_software_stops(true, &mut extra)?;
+                        self.consume_hardware_stops()?;
+                        captured.extend(extra);
+                    }
+                    self.discard_poisoned_runtime()?;
+                }
+                self.resume_stopped()
+            });
         self.finish_hits(captured, resume.as_ref().err().map(|error| error.as_ref()));
         resume
     }
@@ -1009,23 +2396,46 @@ impl Session<'_> {
             .collect()
     }
 
+    fn consume_hardware_stops(&mut self) -> Result<()> {
+        // A consumed stop must not be attributed again after slots move.
+        for tid in self.stopped() {
+            if matches!(self.trace.threads[&tid].stop, Some(Stop::Breakpoint { .. })) {
+                self.prepare_hardware_resume(tid)?;
+                self.trace.threads.get_mut(&tid).unwrap().stop = Some(Stop::Interrupt);
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_hardware_resume(&self, tid: i32) -> Result<()> {
+        let thread = &self.trace.threads[&tid];
+        let Some(Stop::Breakpoint { slots, .. }) = thread.stop else {
+            return Ok(());
+        };
+        let pc = regs::read(tid)?.stack.get(regs::PC)?;
+        let installed = Self::thread_slots(&self.hardware, tid, thread.identity)?;
+        let execution = installed.iter().enumerate().any(|(index, rule)| {
+            slots & (1 << index) != 0
+                && rule.is_some_and(|rule| rule.kind == Kind::Hardware && rule.address == pc)
+        });
+        hardware::prepare_resume(tid, execution)
+    }
+
     fn resume(&mut self, tid: i32) -> Result<()> {
         let thread = &self.trace.threads[&tid];
         if thread.newborn {
-            hardware::program(tid, &self.slots)?;
+            hardware::program(
+                tid,
+                &Self::thread_slots(&self.hardware, tid, thread.identity)?,
+            )?;
         }
         if matches!(thread.stop, Some(Stop::Software { .. })) {
             return Err(error(
                 "pending software breakpoint must execute its original instruction",
             ));
         }
-        if let Some(Stop::Breakpoint { slots, .. }) = thread.stop {
-            let pc = regs::read(tid)?.stack.get(regs::PC)?;
-            let execution = self.slots.iter().enumerate().any(|(index, rule)| {
-                slots & (1 << index) != 0
-                    && rule.is_some_and(|r| r.kind == Kind::Hardware && r.address == pc)
-            });
-            hardware::prepare_resume(tid, execution)?;
+        if matches!(thread.stop, Some(Stop::Breakpoint { .. })) {
+            self.prepare_hardware_resume(tid)?;
         }
         self.trace.resume(tid)
     }
@@ -1071,7 +2481,7 @@ mod hardware {
             if let Some(rule) = slot {
                 debug_register(tid, index, rule.address)?;
                 control |= 1 << (2 * index); // Local enable.
-                if let Kind::Watch { length, read_write } = rule.kind {
+                if let Kind::Watch { length, access } = rule.kind {
                     let width = match length {
                         1 => 0,
                         2 => 1,
@@ -1079,8 +2489,12 @@ mod hardware {
                         8 => 2,
                         _ => unreachable!(),
                     };
-                    control |=
-                        ((if read_write { 3 } else { 1 }) | (width << 2)) << (16 + 4 * index);
+                    control |= ((if access == super::WatchAccess::ReadWrite {
+                        3
+                    } else {
+                        1
+                    }) | (width << 2))
+                        << (16 + 4 * index);
                 }
             }
         }
@@ -1104,3 +2518,36 @@ mod hardware {
 #[cfg(target_arch = "aarch64")]
 #[path = "breakpoint/arm64.rs"]
 mod hardware;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reused_tid_does_not_inherit_scoped_hardware_slots() {
+        let all = Rule {
+            id: 1,
+            address: 0x1000,
+            program: Program::snapshot(Scope::Thread, 100).unwrap(),
+            kind: Kind::Hardware,
+            thread: None,
+        };
+        let scoped = Rule {
+            id: 2,
+            address: 0x2000,
+            thread: Some((1234, 1)),
+            ..all
+        };
+        let rules = BTreeMap::from([(all.id, all), (scoped.id, scoped)]);
+        let installed = |identity| {
+            Session::thread_slots(&rules, 1234, identity)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|rule| rule.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(installed(1), [1, 2]);
+        assert_eq!(installed(2), [1]);
+    }
+}

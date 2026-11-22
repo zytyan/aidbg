@@ -12,6 +12,7 @@ const NT_PRSTATUS: u32 = libc::NT_PRSTATUS as u32;
 const NT_FPREGSET: u32 = libc::NT_FPREGSET as u32;
 const NT_PRPSINFO: u32 = 3;
 const NT_AUXV: u32 = 6;
+const NT_SIGINFO: u32 = 0x53494749;
 const NT_FILE: u32 = 0x4649_4c45;
 
 #[cfg(target_arch = "x86_64")]
@@ -36,7 +37,7 @@ const REGSETS: &[(u32, usize)] = &[
     (0x403, 264),
     (0x404, 4),
     (0x405, 256 * 1024),
-    (0x406, 16),
+    (crate::regs::NT_ARM_PAC_MASK, 16),
     (0x407, 64),
     (0x408, 16),
     (0x409, 8),
@@ -131,7 +132,8 @@ fn process_info(root: &Path, pid: i32) -> [u8; 136] {
 pub(super) fn thread_notes(
     root: &Path,
     pid: i32,
-    trace: &crate::trace::Trace<'_>,
+    trace: &crate::trace::Trace,
+    signal_tid: Option<i32>,
     coverage: &mut Coverage,
     limit: &CaptureLimit<'_>,
 ) -> Result<(Vec<u8>, Vec<(i32, u64)>)> {
@@ -144,7 +146,13 @@ pub(super) fn thread_notes(
     let mut stacks = Vec::new();
     let mut optional = vec![0; REGSETS.iter().map(|&(_, size)| size).max().unwrap_or(0)];
     let mut fp = [0; 1024];
-    for &tid in trace.threads.keys() {
+    for tid in signal_tid.into_iter().chain(
+        trace
+            .threads
+            .keys()
+            .copied()
+            .filter(|tid| Some(*tid) != signal_tid),
+    ) {
         limit.check()?;
         let mut general = [0; GENERAL_SIZE];
         let size = register_bytes(tid, NT_PRSTATUS, &mut general)
@@ -159,6 +167,22 @@ pub(super) fn thread_notes(
             u64::from_le_bytes(general[SP_OFFSET..SP_OFFSET + 8].try_into()?),
         ));
         let mut status = [0; (112 + GENERAL_SIZE + 4).next_multiple_of(8)];
+        let mut signal = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        if Some(tid) == signal_tid {
+            Errno::result(unsafe {
+                libc::ptrace(
+                    libc::PTRACE_GETSIGINFO as _,
+                    tid,
+                    0_usize,
+                    signal.as_mut_ptr(),
+                )
+            })?;
+            let info = unsafe { signal.assume_init_ref() };
+            put32(&mut status, 0, info.si_signo as u32);
+            put32(&mut status, 4, info.si_code as u32);
+            put32(&mut status, 8, info.si_errno as u32);
+            status[12..14].copy_from_slice(&(info.si_signo as u16).to_le_bytes());
+        }
         let task = task_path(root, tid);
         let stat = proc_stat(&task);
         put32(&mut status, 32, tid as u32);
@@ -187,6 +211,16 @@ pub(super) fn thread_notes(
         status[112..112 + GENERAL_SIZE].copy_from_slice(&general);
         put32(&mut status, 112 + GENERAL_SIZE, u32::from(fp_len != 0));
         note(&mut notes, b"CORE", NT_PRSTATUS, &status)?;
+        if Some(tid) == signal_tid {
+            // Use the kernel's complete native ABI representation.
+            let data = unsafe {
+                std::slice::from_raw_parts(
+                    signal.as_ptr().cast::<u8>(),
+                    size_of::<libc::siginfo_t>(),
+                )
+            };
+            note(&mut notes, b"CORE", NT_SIGINFO, data)?;
+        }
         if fp_len != 0 {
             note(&mut notes, b"CORE", NT_FPREGSET, &fp[..fp_len])?;
         }
@@ -239,6 +273,7 @@ pub(super) fn mapping_notes(
     modules: &[memory::Image],
     coverage: &Coverage,
     page: u64,
+    executable: Option<&super::ExecutableMetadata>,
 ) -> Result<()> {
     let mut files = Vec::new();
     let mut names = Vec::new();
@@ -275,7 +310,7 @@ pub(super) fn mapping_notes(
         .collect();
     let metadata = serde_json::to_vec(&json!({
         "version": 1, "mode": mode.name(), "mappings": mappings,
-        "modules": modules, "coverage": coverage,
+        "modules": modules, "coverage": coverage, "executable": executable,
     }))?;
     note(notes, b"AIDBG", 1, &metadata)
 }

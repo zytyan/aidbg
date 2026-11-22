@@ -10,7 +10,7 @@ use object::{Object, ObjectSection};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::Metadata;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +21,7 @@ type Data = EndianArcSlice<LittleEndian>;
 
 struct Image {
     bytes: Vec<u8>,
+    symbols: Option<Vec<u8>>,
     eh: EhFrame<Data>,
     debug: DebugFrame<Data>,
     bases: BaseAddresses,
@@ -63,6 +64,7 @@ impl Image {
             .set_got(addr(".got"));
         Ok(Self {
             bytes,
+            symbols: None,
             eh,
             debug,
             bases,
@@ -96,11 +98,8 @@ impl Image {
         let ret = fde.cie().return_address_register();
         let mut cache = UnwindContext::new();
         let row = fde.unwind_info_for_address(section, &self.bases, &mut cache, pc)?;
-        if cfg!(target_arch = "aarch64")
-            && matches!(row.register(gimli::AArch64::RA_SIGN_STATE),Some(RegisterRule::Constant(v)) if v!=0)
-        {
-            return Ok(Step::Unsupported("aarch64_pac"));
-        }
+        let signed_return = cfg!(target_arch = "aarch64")
+            && matches!(row.register(gimli::AArch64::RA_SIGN_STATE), Some(RegisterRule::Constant(v)) if v != 0);
         let cfa = cfa_value(row.cfa(), section, enc, c)?;
         c.cfa = Some(cfa);
         // Only retain ABI callee-saved registers across a frame when CFI
@@ -124,12 +123,20 @@ impl Image {
         {
             return Ok(Step::End);
         }
-        let pc = next.get(ret)?;
+        let mut pc = next.get(ret)?;
+        if signed_return {
+            pc &= !c.regs.instruction_pac_mask();
+        }
         if pc == 0 {
             return Ok(Step::End);
         }
         next.set(PC, Some(pc));
         next.set(SP, Some(cfa));
+        if cfg!(target_arch = "aarch64") {
+            // The callee's saved LR is the caller's PC. It cannot also be used
+            // as the caller's incoming LR if the next row needs that register.
+            next.set(gimli::AArch64::X30, None);
+        }
         Ok(Step::Next(next, "cfi"))
     }
 
@@ -193,11 +200,26 @@ struct Context<'a> {
     bias: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct MissingMemory(pub u64);
+
+impl std::fmt::Display for MissingMemory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "memory page unavailable in core at {}",
+            hex(self.0)
+        )
+    }
+}
+
+impl std::error::Error for MissingMemory {}
+
 pub(crate) trait UnwindMemory {
     fn read_word(&self, address: u64, size: usize) -> Result<u64>;
 }
 
-impl UnwindMemory for Trace<'_> {
+impl UnwindMemory for Trace {
     fn read_word(&self, address: u64, size: usize) -> Result<u64> {
         Trace::read_word(self, address, size)
     }
@@ -288,7 +310,7 @@ fn frame_pointer(c: Context<'_>, modules: &[Module]) -> Result<Step> {
         fp.checked_add(8)
             .ok_or_else(|| error("frame pointer overflow"))?,
         8,
-    )?;
+    )? & !c.regs.instruction_pac_mask();
     if ret == 0 && previous == 0 {
         return Ok(Step::End);
     }
@@ -307,6 +329,9 @@ fn frame_pointer(c: Context<'_>, modules: &[Module]) -> Result<Step> {
     regs.set(PC, Some(ret));
     regs.set(SP, fp.checked_add(16));
     regs.set(FP, Some(previous));
+    if cfg!(target_arch = "aarch64") {
+        regs.set(gimli::AArch64::X30, None);
+    }
     Ok(Step::Next(regs, "frame_pointer"))
 }
 
@@ -321,6 +346,10 @@ pub struct Frame {
     module_instance: Option<String>,
     module_offset: Option<String>,
     function: Option<String>,
+    file: Option<PathBuf>,
+    line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) args: Option<serde_json::Value>,
     #[serde(flatten)]
     names: Option<crate::cpp_names::Names>,
     pub(crate) method: &'static str,
@@ -328,6 +357,15 @@ pub struct Frame {
     link_pc: Option<u64>,
     #[serde(skip)]
     pub(crate) lookup_address: u64,
+}
+
+impl Frame {
+    pub(crate) fn return_site(&self) -> Result<(u64, u64)> {
+        Ok((
+            u64::from_str_radix(self.pc.trim_start_matches("0x"), 16)?,
+            u64::from_str_radix(self.sp.trim_start_matches("0x"), 16)?,
+        ))
+    }
 }
 
 #[derive(Serialize)]
@@ -363,7 +401,20 @@ impl Images {
                 let cap = (MAX_IMAGES_TOTAL - self.bytes).min(MAX_IMAGE);
                 let bytes = m.read_image(root, exe, cap).map_err(|e| e.to_string())?;
                 self.bytes += bytes.len() as u64;
-                Image::new(bytes, m).map_err(|e| e.to_string())
+                let mut image = Image::new(bytes, m).map_err(|e| e.to_string())?;
+                if let Ok(obj) = object::File::parse(&*image.bytes)
+                    && !obj.has_debug_symbols()
+                    && let Some((_, symbols)) = crate::symbols::find_external_debug(
+                        Some(&root.join("root")),
+                        &m.path(),
+                        &obj,
+                        MAX_IMAGES_TOTAL - self.bytes,
+                    )
+                {
+                    self.bytes += symbols.len() as u64;
+                    image.symbols = Some(symbols);
+                }
+                Ok(image)
             })
             .as_ref()
             .map_err(String::as_str)
@@ -401,7 +452,14 @@ impl Images {
                 continue;
             };
             if let Ok(obj) = object::File::parse(&*image.bytes) {
-                frame.names = modules::symbol(&obj, pc);
+                let debug = image
+                    .symbols
+                    .as_deref()
+                    .and_then(|bytes| object::File::parse(bytes).ok());
+                frame.names = debug
+                    .as_ref()
+                    .and_then(|debug| modules::symbol(debug, pc))
+                    .or_else(|| modules::symbol(&obj, pc));
                 frame.function = frame.names.as_ref().map(|names| {
                     names
                         .demangled_name
@@ -409,6 +467,14 @@ impl Images {
                         .unwrap_or(&names.display_name)
                         .clone()
                 });
+                if let Some(source) = debug
+                    .as_ref()
+                    .and_then(|debug| crate::symbols::dwarf_line(debug, pc).ok().flatten())
+                    .or_else(|| crate::symbols::dwarf_line(&obj, pc).ok().flatten())
+                {
+                    frame.file = Some(source.file);
+                    frame.line = source.line;
+                }
             }
         }
     }
@@ -437,11 +503,24 @@ impl Images {
     pub fn walk(
         &mut self,
         memory: &dyn UnwindMemory,
+        regs: Registers,
+        maps: &[Module],
+        root: &Path,
+        exe: Option<&Metadata>,
+        deadline: Instant,
+    ) -> Stack {
+        self.walk_registers(memory, regs, maps, root, exe, deadline, |_, _| {})
+    }
+
+    pub(crate) fn walk_registers(
+        &mut self,
+        memory: &dyn UnwindMemory,
         mut regs: Registers,
         maps: &[Module],
         root: &Path,
         exe: Option<&Metadata>,
         deadline: Instant,
+        mut observe: impl FnMut(usize, Registers),
     ) -> Stack {
         let mut frames = Vec::new();
         let mut seen = BTreeSet::new();
@@ -455,6 +534,9 @@ impl Images {
                     return Err(error("zero PC or repeated frame"));
                 }
                 let lookup = pc - u64::from(index > 0);
+                let mut frame_regs = regs;
+                frame_regs.set(PC, Some(lookup));
+                observe(index, frame_regs);
                 let d = maps
                     .iter()
                     .enumerate()
@@ -470,6 +552,9 @@ impl Images {
                     module_instance: None,
                     module_offset: None,
                     function: None,
+                    file: None,
+                    line: None,
+                    args: None,
                     names: None,
                     method,
                     link_pc: None,
@@ -525,4 +610,132 @@ impl Images {
             stop_reason: result.map(str::to_owned).unwrap_or_else(|e| e.to_string()),
         }
     }
+}
+
+pub(crate) struct OfflineImage {
+    image: Image,
+    bias: u64,
+}
+
+impl OfflineImage {
+    pub fn new(bytes: Vec<u8>, bias: u64) -> Result<Self> {
+        let module = Module {
+            backing: modules::Backing {
+                major: 0,
+                minor: 0,
+                inode: 0,
+                path: Vec::new(),
+            },
+            maps: Vec::new(),
+        };
+        Ok(Self {
+            image: Image::new(bytes, &module)?,
+            bias,
+        })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.image.bytes
+    }
+
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.image.bytes
+    }
+
+    pub(crate) fn bias(&self) -> u64 {
+        self.bias
+    }
+
+    fn contains_code(&self, link: u64) -> bool {
+        use object::ObjectSegment;
+        let Ok(file) = object::File::parse(&*self.image.bytes) else {
+            return false;
+        };
+        file.segments().any(|segment| {
+            matches!(segment.flags(), object::SegmentFlags::Elf { p_flags, .. } if p_flags.contains(object::elf::PF_X))
+                && link.checked_sub(segment.address()).is_some_and(|offset| offset < segment.size())
+        })
+    }
+}
+
+pub(crate) struct OfflineFrame {
+    pub regs: Registers,
+    pub pc: u64,
+    pub link: Option<u64>,
+    pub cfa: Option<u64>,
+}
+
+pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
+    memory: &dyn UnwindMemory,
+    image_at: impl Fn(u64) -> Option<(I, u64, bool)>,
+    mut regs: Registers,
+    mappings: &[Module],
+) -> Vec<OfflineFrame> {
+    let mut frames = Vec::new();
+    let mut seen = BTreeSet::new();
+    for index in 0..MAX_DEPTH {
+        let (Ok(pc), Ok(sp)) = (regs.get(PC), regs.get(SP)) else {
+            break;
+        };
+        if pc == 0 || !seen.insert((pc, sp)) {
+            break;
+        }
+        let lookup = pc - u64::from(index > 0);
+        let mut context = Context {
+            memory,
+            regs,
+            cfa: None,
+            bias: 0,
+        };
+        let mut frame = OfflineFrame {
+            regs,
+            pc,
+            link: None,
+            cfa: None,
+        };
+        let step = image_at(lookup).and_then(|(image, link, main)| {
+            let image = image.as_ref();
+            if !image.contains_code(link) {
+                return None;
+            }
+            context.bias = lookup.wrapping_sub(link);
+            if main {
+                frame.link = Some(link);
+                frame.cfa = image
+                    .image
+                    .cfa_section(&image.image.eh, link, context)
+                    .or_else(|_| image.image.cfa_section(&image.image.debug, link, context))
+                    .ok();
+            }
+            image.image.step(link, context).ok()
+        });
+        if frame.cfa.is_none()
+            && let Ok(fp) = regs.get(FP)
+            && fp % 8 == 0
+            && fp >= sp
+            && fp - sp <= 1024 * 1024
+        {
+            frame.cfa = fp.checked_add(16);
+        }
+        frames.push(frame);
+        let Some(Step::Next(next, method)) = step.or_else(|| frame_pointer(context, mappings).ok())
+        else {
+            break;
+        };
+        if next.get(SP).is_ok_and(|next_sp| next_sp < sp) {
+            break;
+        }
+        regs = if method == "frame_pointer" {
+            // The fallback recovered the frame record only.
+            let mut recovered = Registers::empty();
+            recovered.set_instruction_pac_mask(next.instruction_pac_mask());
+            for register in [PC, SP, FP] {
+                recovered.set(register, next.get(register).ok());
+            }
+            recovered
+        } else {
+            next
+        };
+    }
+    frames
 }

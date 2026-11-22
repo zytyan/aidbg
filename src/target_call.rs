@@ -111,7 +111,7 @@ pub struct Report {
     tid: i32,
     symbol: String,
     address: String,
-    status: &'static str,
+    pub status: &'static str,
     steps: u32,
     return_value: Option<Value>,
     return_bits: Option<String>,
@@ -251,7 +251,10 @@ fn synchronous_fault(tid: i32, stop: Stop) -> bool {
     ) && ptrace::getsiginfo(Pid::from_raw(tid)).is_ok_and(|info| info.si_code > 0)
 }
 
-pub fn run(req: TargetCallRequest) -> Result<Report> {
+pub fn run(
+    req: TargetCallRequest,
+    authorize: impl FnOnce(Option<&str>, &[String], u64) -> Result<()>,
+) -> Result<Report> {
     let tid = req.tid.unwrap_or(req.pid);
     let max_steps = req.max_steps.unwrap_or(128);
     let budget = req.timeout_ms.unwrap_or(250);
@@ -319,6 +322,7 @@ pub fn run(req: TargetCallRequest) -> Result<Report> {
                 .as_ref()
                 .is_some_and(|demangled| demangled.replace(' ', "") == signature)
     })?;
+    authorize(site.build_id.as_deref(), &site.symbols, site.address)?;
     let code_end = site
         .address
         .checked_add(site.size)

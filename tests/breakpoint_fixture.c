@@ -32,11 +32,22 @@ static void handle_trap(int sig)
         ++signals_seen;
 }
 
+static pthread_barrier_t ready;
+static pthread_barrier_t release;
+
 static void *work(void *arg)
 {
     for (int i = 0; i < 3; ++i)
         hit();
     return arg;
+}
+
+static void *selected_worker(void *arg)
+{
+    printf("THREAD %d\n", gettid());
+    pthread_barrier_wait(&ready);
+    pthread_barrier_wait(&release);
+    return work(arg);
 }
 
 MARK static void force_watch(void)
@@ -98,9 +109,24 @@ int main(int argc, char **argv)
            (void *)slot_five, one, two, three, (void *)bss_buffer,
            (void *)&watched, (void *)anonymous);
     fflush(stdout);
+    pthread_t selected;
+    if (pthread_barrier_init(&ready, NULL, 2) || pthread_barrier_init(&release, NULL, 2))
+        return 3;
     int command;
     while ((command = getchar()) != EOF && command != 'q') {
-        if (command == 'r') {
+        if (command == 't') {
+            if (pthread_create(&selected, NULL, selected_worker, NULL) != 0)
+                return 3;
+            pthread_barrier_wait(&ready);
+        } else if (command == 'g') {
+            int before = atomic_load_explicit(&calls, memory_order_relaxed);
+            pthread_barrier_wait(&release);
+            work(NULL);
+            if (pthread_join(selected, NULL) != 0 ||
+                atomic_load_explicit(&calls, memory_order_relaxed) != before + 6)
+                return 3;
+            puts("JOINED");
+        } else if (command == 'r') {
             printf("READ %llu\n", (unsigned long long)watched);
         } else if (command == 'w') {
             pthread_t writer;

@@ -6,8 +6,12 @@ arch=${arch%-musl-cc}
 args=()
 for arg in "$@"; do
   # cc-rs uses Rust's target-triple spelling, which Zig does not accept.
-  if [[ $arg != "--target=$arch-unknown-linux-musl" ]]; then
-    args+=("$arg")
-  fi
+  case "$arg" in
+    "--target=$arch-unknown-linux-musl") continue ;;
+    # Zig 0.15.2 rejects this option, which Rust 1.98 added to the driver
+    # invocation. Keep the same linking behavior as on earlier Rust releases.
+    -Wl,--fix-cortex-a53-843419) continue ;;
+  esac
+  args+=("$arg")
 done
 exec zig cc -target "$arch-linux-musl" "${args[@]}"

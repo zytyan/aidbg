@@ -2,12 +2,14 @@ mod elf;
 mod loader;
 mod memory;
 
+mod config;
+pub use config::*;
+
 use crate::procfs::start_ticks;
 use crate::rpc::CoreMode;
 use crate::trace::Trace;
 use crate::{Result, error};
-use serde::Serialize;
-use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -15,14 +17,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
-const MIB: usize = 1024 * 1024;
 const COMPRESSION_LEVEL: i32 = 1;
-pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
-
-pub fn valid_dump_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
-}
-
 // An exclusive advisory lock, held for the lifetime of the open descriptor.
 pub fn try_lock(file: &File) -> std::io::Result<()> {
     nix::errno::Errno::result(unsafe {
@@ -30,62 +25,6 @@ pub fn try_lock(file: &File) -> std::io::Result<()> {
     })
     .map(|_| ())
     .map_err(std::io::Error::from)
-}
-
-pub fn hash_reader(mut reader: impl Read, hash: &mut Sha256) -> std::io::Result<u64> {
-    let mut buffer = vec![0; 256 * 1024];
-    let mut bytes = 0;
-    loop {
-        let n = reader.read(&mut buffer)?;
-        if n == 0 {
-            return Ok(bytes);
-        }
-        hash.update(&buffer[..n]);
-        bytes += n as u64;
-    }
-}
-
-pub struct CaptureOptions {
-    timeout_ms: u32,
-    buffer_mib: u32,
-    block_bytes: usize,
-    expected_start_ticks: Option<u64>,
-}
-
-impl CaptureOptions {
-    pub fn new(
-        mode: CoreMode,
-        timeout_ms: u32,
-        buffer_mib: Option<u32>,
-        block_kib: Option<u32>,
-    ) -> Result<Self> {
-        let default_buffer = match mode {
-            CoreMode::CoreLite => 0,
-            CoreMode::CoreStack4k => 2,
-            _ => 16,
-        };
-        let buffer_mib = buffer_mib.unwrap_or(default_buffer);
-        let block_kib = block_kib.unwrap_or(1024);
-        if buffer_mib > 64 {
-            return Err(error("coredump buffer must be between 0 and 64 MiB"));
-        }
-        if !(64..=4096).contains(&block_kib) || !block_kib.is_power_of_two() {
-            return Err(error(
-                "coredump block must be a power of two between 64 and 4096 KiB",
-            ));
-        }
-        Ok(Self {
-            timeout_ms,
-            buffer_mib,
-            block_bytes: block_kib as usize * 1024,
-            expected_start_ticks: None,
-        })
-    }
-
-    pub fn for_process(mut self, start_ticks: u64) -> Self {
-        self.expected_start_ticks = Some(start_ticks);
-        self
-    }
 }
 
 pub fn target_identity(pid: i32) -> Result<u64> {
@@ -113,29 +52,90 @@ impl CoreMode {
     }
 }
 
-#[derive(Default, Serialize)]
-struct Coverage {
-    missing: Vec<Missing>,
-    issues: Vec<String>,
+#[derive(Default, Deserialize, Serialize)]
+pub(crate) struct Coverage {
+    pub(crate) missing: Vec<Missing>,
+    pub(crate) issues: Vec<String>,
     conservative_shared_mappings: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unbacked_protected_ranges: Vec<std::ops::Range<u64>>,
 }
 
-#[derive(Serialize)]
-struct Missing {
+const VVAR_UNAVAILABLE: &str = "vvar_unavailable";
+const COMPLETE_WITHOUT_VVAR: &str = "complete_without_vvar";
+const VVAR_COMMENT: &str = "Kernel vvar pages are commonly unreadable in cross-process core dumps.";
+
+#[derive(Deserialize, Serialize)]
+pub(crate) struct Missing {
     start: u64,
     end: u64,
-    reason: &'static str,
+    reason: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct ExecutableMetadata {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) build_id: Option<String>,
+    pub(crate) debug_symbols: Option<std::path::PathBuf>,
 }
 
 impl Coverage {
-    fn missing(&mut self, start: u64, end: u64, reason: &'static str) {
+    fn status(&self) -> &'static str {
+        if !self.issues.is_empty() {
+            "partial"
+        } else if self.missing.is_empty() {
+            "complete"
+        } else if self
+            .missing
+            .iter()
+            .all(|gap| gap.reason == VVAR_UNAVAILABLE)
+        {
+            COMPLETE_WITHOUT_VVAR
+        } else {
+            "partial"
+        }
+    }
+
+    pub(crate) fn warnings(&self) -> Vec<crate::Diagnostic> {
+        let mut warnings = Vec::new();
+        let status = self.status();
+        if status == COMPLETE_WITHOUT_VVAR {
+            warnings.push(crate::Diagnostic::new(
+                "VVAR_UNAVAILABLE",
+                "Only kernel vvar pages are missing from the core.",
+                Some("The captured stacks, registers, and code remain available for debugging."),
+            ));
+        } else if status == "partial" {
+            warnings.push(crate::Diagnostic::new(
+                "PARTIAL_CORE",
+                format!(
+                    "{} missing ranges, {} capture issues",
+                    self.missing.len(),
+                    self.issues.len()
+                ),
+                Some("Check memory coverage and capture warnings."),
+            ));
+        }
+        warnings.extend(
+            self.issues
+                .iter()
+                .map(|message| crate::Diagnostic::new("CAPTURE_ISSUE", message, None)),
+        );
+        warnings
+    }
+
+    pub(crate) fn missing(&mut self, start: u64, end: u64, reason: &'static str) {
         if let Some(last) = self.missing.last_mut()
             && last.end == start
             && last.reason == reason
         {
             last.end = end;
         } else {
-            self.missing.push(Missing { start, end, reason });
+            self.missing.push(Missing {
+                start,
+                end,
+                reason: reason.into(),
+            });
         }
     }
 }
@@ -145,12 +145,19 @@ pub struct Summary {
     pid: i32,
     mode: &'static str,
     status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comment: Option<&'static str>,
     threads: usize,
     captured_bytes: u64,
     staged_bytes: u64,
     missing_bytes: u64,
     missing_ranges: usize,
+    missing_range_details: Vec<Missing>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unbacked_protected_ranges: Vec<std::ops::Range<u64>>,
     issues: usize,
+    warnings: Vec<crate::Diagnostic>,
+    executable: Option<ExecutableMetadata>,
     conservative_shared_mappings: usize,
     compressed_bytes: u64,
     pause_ms: u64,
@@ -161,6 +168,8 @@ pub struct Summary {
     image_cache_hits: usize,
     compression_level: i32,
     parallel_compression: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakpoint_replay: Option<serde_json::Value>,
 }
 
 #[derive(Default, Serialize)]
@@ -218,6 +227,26 @@ pub fn prepare(
     state_dir: &Path,
     cancelled: &(dyn Fn() -> bool + Sync),
     after_capture: impl FnOnce(),
+) -> Result<Dump> {
+    prepare_with_trace(
+        pid,
+        mode,
+        options,
+        state_dir,
+        cancelled,
+        after_capture,
+        None,
+    )
+}
+
+pub(crate) fn prepare_with_trace(
+    pid: i32,
+    mode: CoreMode,
+    options: CaptureOptions,
+    state_dir: &Path,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    after_capture: impl FnOnce(),
+    trace: Option<(&mut Trace, Option<i32>)>,
 ) -> Result<Dump> {
     let limit = CaptureLimit {
         deadline: Instant::now() + Duration::from_millis(options.timeout_ms.into()),
@@ -280,6 +309,7 @@ pub fn prepare(
                 pid,
                 mode,
                 &limit,
+                trace,
                 block(),
                 Some(&mut |block| {
                     limit.check()?;
@@ -321,7 +351,7 @@ pub fn prepare(
             Ok((capture?, payload?, staged?))
         })?
     } else if mode == CoreMode::CoreLite {
-        let capture = capture(pid, mode, &limit, Vec::new(), None);
+        let capture = capture(pid, mode, &limit, trace, Vec::new(), None);
         after_capture();
         (capture?, output, 0)
     } else {
@@ -330,6 +360,7 @@ pub fn prepare(
             pid,
             mode,
             &limit,
+            trace,
             block(),
             Some(&mut |block| {
                 let started = Instant::now();
@@ -361,11 +392,8 @@ pub fn prepare(
         .iter()
         .map(|gap| gap.end - gap.start)
         .sum();
-    let status = if missing_bytes == 0 && capture.coverage.issues.is_empty() {
-        "complete"
-    } else {
-        "partial"
-    };
+    let status = capture.coverage.status();
+    let warnings = capture.coverage.warnings();
     Ok(Dump {
         header,
         payload,
@@ -373,12 +401,17 @@ pub fn prepare(
             pid,
             mode: mode.name(),
             status,
+            comment: (status == COMPLETE_WITHOUT_VVAR).then_some(VVAR_COMMENT),
             threads: capture.threads,
             captured_bytes: capture.captured_bytes,
             staged_bytes,
             missing_bytes,
             missing_ranges: capture.coverage.missing.len(),
+            missing_range_details: capture.coverage.missing,
+            unbacked_protected_ranges: capture.coverage.unbacked_protected_ranges,
             issues: capture.coverage.issues.len(),
+            warnings,
+            executable: capture.executable,
             conservative_shared_mappings: capture.coverage.conservative_shared_mappings,
             compressed_bytes,
             pause_ms: capture.pause_us / 1000,
@@ -389,6 +422,7 @@ pub fn prepare(
             image_cache_hits: capture.image_cache_hits,
             compression_level: COMPRESSION_LEVEL,
             parallel_compression: parallel,
+            breakpoint_replay: None,
         },
     })
 }
@@ -440,6 +474,7 @@ fn finish(
 }
 
 struct Capture {
+    executable: Option<ExecutableMetadata>,
     maps: Vec<(crate::modules::Backing, crate::modules::Mapping)>,
     notes: Vec<u8>,
     coverage: Coverage,
@@ -455,6 +490,7 @@ fn capture(
     pid: i32,
     mode: CoreMode,
     limit: &CaptureLimit<'_>,
+    trace: Option<(&mut Trace, Option<i32>)>,
     buffer: Vec<u8>,
     sink: Option<&mut dyn FnMut(Vec<u8>) -> Result<Vec<u8>>>,
 ) -> Result<Capture> {
@@ -476,17 +512,46 @@ fn capture(
         preflight: micros(started),
         ..Default::default()
     };
-    let mut trace = Trace::new(pid, &root, identity);
+    let own_trace = trace.is_none();
+    let mut owned;
+    let (trace, signal_tid) = match trace {
+        Some((trace, tid)) => (trace, tid),
+        None => {
+            owned = Trace::new(pid, &root, identity);
+            (&mut owned, None)
+        }
+    };
+    let freeze_started = Instant::now();
     let collected = (|| {
         limit.check()?;
         trace.freeze_checked(limit.deadline, &|| limit.check())?;
-        timings.freeze = trace.started.map_or(0, micros);
+        timings.freeze = if own_trace {
+            trace.started.map_or(0, micros)
+        } else {
+            micros(freeze_started)
+        };
         let started = Instant::now();
         let maps = crate::modules::map_entries(&root)?;
+        let executable = (|| {
+            use std::os::unix::fs::MetadataExt;
+            let link = root.join("exe");
+            let path = std::fs::read_link(&link).ok()?;
+            if !path.is_absolute() || path.to_str().is_none() {
+                return None;
+            }
+            let metadata = std::fs::metadata(link).ok()?;
+            let device = format!(
+                "{:x}:{:x}",
+                nix::libc::major(metadata.dev()),
+                nix::libc::minor(metadata.dev())
+            );
+            Some((path, device, metadata.ino().to_string()))
+        })();
         timings.maps = micros(started);
         let mut coverage = Coverage::default();
         let started = Instant::now();
-        let (notes, stacks) = elf::thread_notes(&root, pid, &trace, &mut coverage, limit)?;
+        let (notes, stacks) =
+            elf::thread_notes(&root, pid, trace, signal_tid, &mut coverage, limit)?;
         timings.registers = micros(started);
         let (modules, image_cache_hits) = if mode.needs_elf_memory() {
             let started = Instant::now();
@@ -502,7 +567,7 @@ fn capture(
         };
         let memory = if let Some(sink) = sink {
             memory::capture(
-                &trace,
+                trace,
                 pid,
                 &root,
                 mode,
@@ -531,20 +596,33 @@ fn capture(
             stacks.len(),
             modules,
             image_cache_hits,
+            executable,
         ))
     })();
-    let started = Instant::now();
-    let cleanup = trace.close();
-    let pause_us = trace.started.map_or(0, micros);
-    timings.detach = micros(started);
-    if !cleanup.ok() {
-        return Err(error(format!(
-            "coredump detach failed: {}",
-            serde_json::to_string(&cleanup)?
-        )));
-    }
-    let (maps, mut notes, mut coverage, memory, threads, mut modules, mut image_cache_hits) =
-        collected?;
+    let pause_us = if own_trace {
+        let started = Instant::now();
+        let cleanup = trace.close();
+        timings.detach = micros(started);
+        if !cleanup.ok() {
+            return Err(error(format!(
+                "coredump detach failed: {}",
+                serde_json::to_string(&cleanup)?
+            )));
+        }
+        trace.started.map_or(0, micros)
+    } else {
+        micros(freeze_started)
+    };
+    let (
+        maps,
+        mut notes,
+        mut coverage,
+        memory,
+        threads,
+        mut modules,
+        mut image_cache_hits,
+        executable,
+    ) = collected?;
     if let Some(images) = images {
         (modules, image_cache_hits) =
             images.resolve(&root, mode, page, &maps, &mut coverage, || {
@@ -554,8 +632,37 @@ fn capture(
                 Ok(())
             })?;
     }
-    elf::mapping_notes(&mut notes, mode, &maps, &modules, &coverage, page)?;
+    let executable = executable.and_then(|(path, device, inode)| {
+        let image = modules
+            .iter()
+            .find(|image| image.identity.device == device && image.identity.inode == inode);
+        let build_id = image.and_then(|image| image.identity.build_id.clone());
+        let debug_symbols = build_id
+            .as_deref()
+            .and_then(crate::symbols::installed_debug_symbols)
+            .or_else(|| {
+                let link = image?.debug_link.as_deref()?;
+                crate::symbols::debuglink_paths(&path, link)
+                    .into_iter()
+                    .find(|candidate| candidate.is_file() && candidate.to_str().is_some())
+            });
+        Some(ExecutableMetadata {
+            path,
+            build_id,
+            debug_symbols,
+        })
+    });
+    elf::mapping_notes(
+        &mut notes,
+        mode,
+        &maps,
+        &modules,
+        &coverage,
+        page,
+        executable.as_ref(),
+    )?;
     Ok(Capture {
+        executable,
         maps,
         notes,
         coverage,

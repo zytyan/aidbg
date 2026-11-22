@@ -98,9 +98,13 @@ pub(super) fn program(tid: i32, slots: &Slots) -> Result<()> {
                 }
                 exec.push((rule.address, EL0_ENABLE | (0xf << 5)));
             }
-            Kind::Watch { length, read_write } => {
+            Kind::Watch { length, access } => {
                 let byte_mask = ((1u64 << length) - 1) << (rule.address & 7);
-                let access = if read_write { 3 } else { 2 };
+                let access = match access {
+                    super::WatchAccess::Read => 1,
+                    super::WatchAccess::Write => 2,
+                    super::WatchAccess::ReadWrite => 3,
+                };
                 watch.push((
                     rule.address & !7,
                     EL0_ENABLE | (access << 3) | (byte_mask << 5),

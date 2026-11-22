@@ -2,6 +2,7 @@ use aidbg::Result;
 use aidbg::coredump::{Dump, hash_reader, valid_dump_id};
 use aidbg::rpc::{CoredumpJob, CoredumpJobState};
 use nix::libc;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -145,6 +146,160 @@ fn missing() -> Status {
 }
 
 impl DumpStore {
+    pub(super) fn retain(
+        &self,
+        id: &str,
+        seconds: u64,
+    ) -> std::result::Result<CoredumpJob, Status> {
+        if !(1..=30 * 86400).contains(&seconds) {
+            return Err(Status::invalid_argument(
+                "retention_secs must be in 1..=2592000",
+            ));
+        }
+        let _lock = self.catalog_lock().map_err(super::internal)?;
+        let mut artifact = self.manifest(id)?;
+        if !matches!(artifact.state, State::Ready { .. }) {
+            return Err(Status::failed_precondition("coredump is not ready"));
+        }
+        artifact.expires_unix_secs = artifact.expires_unix_secs.max(now() + seconds);
+        save_manifest(&self.path(id), &artifact).map_err(super::internal)?;
+        artifact.job(id).map_err(super::internal)
+    }
+
+    pub(super) fn upload_limit(&self, kind: aidbg::rpc::artifact_header::Kind) -> u64 {
+        use aidbg::rpc::artifact_header::Kind;
+        self.max_bytes.min(match kind {
+            Kind::Core => u64::MAX,
+            _ => 128 * 1024 * 1024,
+        })
+    }
+
+    pub(super) fn upload_directory(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn commit_upload(
+        &self,
+        mut payload: tempfile::NamedTempFile,
+        kind: aidbg::rpc::artifact_header::Kind,
+    ) -> Result<serde_json::Value> {
+        use aidbg::rpc::artifact_header::Kind;
+        use std::os::unix::fs::PermissionsExt;
+        let mut ident = [0; 20];
+        payload.as_file_mut().read_exact(&mut ident)?;
+        let compressed = ident.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+        payload.rewind()?;
+        if compressed && kind == Kind::Core {
+            zstd::stream::read::Decoder::new(payload.as_file_mut())?.read_exact(&mut ident)?;
+        }
+        let elf_type = u16::from_le_bytes([ident[16], ident[17]]);
+        if !ident.starts_with(b"\x7fELF")
+            || ident[4..6] != [2, 1]
+            || match kind {
+                Kind::Core => elf_type != 4,
+                Kind::Executable => !matches!(elf_type, 2 | 3),
+                Kind::DebugSymbols => elf_type == 4,
+            }
+        {
+            return Err(aidbg::Diagnostic::new(
+                "INVALID_ARTIFACT",
+                "Expected a matching 64-bit little-endian ELF artifact",
+                None,
+            )
+            .into());
+        }
+        payload.rewind()?;
+        if kind == Kind::Core && !compressed {
+            let mut encoder =
+                zstd::stream::write::Encoder::new(tempfile::NamedTempFile::new_in(&self.root)?, 1)?;
+            io::copy(&mut payload, &mut encoder)?;
+            payload = encoder.finish()?;
+            payload.rewind()?;
+        }
+        let token = tempfile::Builder::new()
+            .prefix(".upload-")
+            .rand_bytes(32)
+            .tempfile_in(&self.root)?;
+        let name = token
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap();
+        let id = name.strip_prefix(".upload-").unwrap();
+        let (_, guard) = self.reserve(id, vec![])?;
+        let _guard = guard.ok_or_else(|| io::Error::other("artifact ID collision"))?;
+        let dir = self.path(id);
+        let result: Result<_> = (|| {
+            let size = payload.as_file().metadata()?.len();
+            let mut hash = Sha256::new();
+            hash_reader(&mut payload, &mut hash)?;
+            let sha256 = hash.finalize().into();
+            let artifact = match kind {
+                Kind::Core => "core",
+                Kind::Executable => "executable",
+                Kind::DebugSymbols => "debug_symbols",
+            };
+            let summary = serde_json::json!({"status": "complete", "artifact": artifact, "compressed_bytes": size, "warnings": []});
+            if kind == Kind::Executable {
+                payload
+                    .as_file()
+                    .set_permissions(fs::Permissions::from_mode(0o700))?;
+            }
+            payload.as_file().sync_all()?;
+            let path = dir.join("payload.zst");
+            save(&dir, "header.zst", &[])?;
+            payload.persist_noclobber(&path)?;
+            let path = fs::canonicalize(path)?;
+            self.mark_ready(id, size, sha256, summary)?;
+            let job = self.get(id)?;
+            Ok(
+                serde_json::json!({"artifact_id": id, "kind": artifact, "size": size, "expires_unix_secs": job.expires_unix_secs,
+                "dump_id": (kind == Kind::Core).then_some(id), "server_path": (kind != Kind::Core).then_some(path)}),
+            )
+        })();
+        if let Err(ref issue) = result {
+            self.fail(id, issue.to_string())?;
+        }
+        result
+    }
+
+    pub(super) fn capture_signal(
+        &self,
+        pid: i32,
+        capture: &mut dyn FnMut(&Path) -> Result<Dump>,
+    ) -> Result<serde_json::Value> {
+        let token = tempfile::Builder::new()
+            .prefix(".run-")
+            .rand_bytes(32)
+            .tempfile_in(&self.root)?;
+        let id = token
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".run-"))
+            .filter(|id| valid_dump_id(id))
+            .ok_or_else(|| io::Error::other("could not generate coredump ID"))?;
+        let request = aidbg::rpc::CoredumpRequest {
+            pid,
+            mode: aidbg::rpc::CoreMode::CoreFull as i32,
+            ..Default::default()
+        };
+        let (_, guard) = self.reserve(id, request.encode_to_vec())?;
+        let _guard = guard.ok_or_else(|| io::Error::other("coredump ID collision"))?;
+        let result: Result<_> = (|| {
+            let dump = capture(&self.path(id))?;
+            let summary = serde_json::to_value(&dump.summary)?;
+            self.finish(id, dump)?;
+            Ok(serde_json::json!({ "dump_id": id, "summary": summary }))
+        })();
+        if let Err(error) = &result {
+            if let Err(store_error) = self.fail(id, error.to_string()) {
+                eprintln!("Could not save failed signal coredump status: {store_error}");
+            }
+        }
+        result
+    }
+
     pub(super) fn open(state_dir: &Path, retention_secs: u64, max_bytes: u64) -> Result<Self> {
         let root = state_dir.join("coredumps");
         match DirBuilder::new().mode(0o700).create(&root) {
@@ -315,6 +470,17 @@ impl DumpStore {
         save(&dir, "header.zst", &dump.header)?;
         dump.payload.persist_noclobber(dir.join("payload.zst"))?;
 
+        self.mark_ready(id, size, sha256, summary)
+    }
+
+    fn mark_ready(
+        &self,
+        id: &str,
+        size: u64,
+        sha256: [u8; 32],
+        summary: serde_json::Value,
+    ) -> Result<()> {
+        let dir = self.path(id);
         let at = now();
         let _catalog = self.catalog_lock()?;
         let used = self

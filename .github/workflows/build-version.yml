@@ -25,7 +25,7 @@ jobs:
       - name: Install static build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build python3-pip
+          sudo apt-get install -y cmake ninja-build python3-pip gdb
           python3 -m pip --disable-pip-version-check install --target "$RUNNER_TEMP/zig" ziglang==0.15.2
           echo "$RUNNER_TEMP/zig/ziglang" >> "$GITHUB_PATH"
       - name: Build release binaries
@@ -33,9 +33,28 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          rustup update stable
-          rustup target add --toolchain stable "$TARGET"
-          cargo +stable build --locked --release --bins --target "$TARGET"
+          rustup target add "$TARGET"
+          cargo build --locked --release --bins --target "$TARGET"
+      - name: Verify offline scripting on a real core
+        timeout-minutes: 5
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          c++ -O0 -g -pthread -fno-omit-frame-pointer -Wl,--build-id tests/script_fixture.cc -o "$RUNNER_TEMP/script-fixture"
+          c++ -O0 -g -pthread -fno-omit-frame-pointer -Wl,--build-id -DFIXTURE_VALUE=41 tests/script_fixture.cc -o "$RUNNER_TEMP/script-wrong"
+          python3 tests/scripts.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
+            "$RUNNER_TEMP/script-fixture" "$RUNNER_TEMP/script-wrong"
+      - name: Verify retained core workflow without helper executables
+        timeout-minutes: 5
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cc -O0 -g -fno-omit-frame-pointer -Wl,--build-id tests/debug-cases/cases/D01.c -pthread -o "$RUNNER_TEMP/D01"
+          cc -O0 -g -Wl,--build-id tests/run_target_fixture.c -pthread -o "$RUNNER_TEMP/run-target"
+          python3 tests/core_workflow.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
+            "$RUNNER_TEMP/D01" "$RUNNER_TEMP/run-target"
       - name: Verify ELF and package binaries
         env:
           TARGET: ${{ matrix.target }}

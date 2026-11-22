@@ -249,14 +249,15 @@ def check_variables(socket, library):
             result = inspect("discarded")
             assert result["status"] in ("optimized_out", "unavailable_at_pc"), (library.name, result)
         for expression, status in (
-            ("inspect_case::object.array[3]", "read_failed"),
-            ("*inspect_case::null_pointer", "read_failed"),
+            ("inspect_case::object.array[3]", "out_of_bounds"),
+            ("*inspect_case::null_pointer", "null_pointer"),
             ("missing_identifier", "not_found"),
         ):
             result = inspect(expression)
             assert result["status"] == status, (library.name, result)
-        call(socket, "inspect", "--pid", p.pid, "--expression", "inspect_case::global = 1",
-             error="read-only")
+        assignment = inspect("inspect_case::global = 1")
+        assert assignment["code"] == "INVALID_EXPRESSION", assignment
+        assert "read-only" in assignment["message"], assignment
         check_detach(p, [p.pid])
     print(f"PASS DWARF variables, inlined local, type layout and read failures ({library.name})")
 

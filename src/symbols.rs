@@ -1,12 +1,12 @@
 use crate::modules::{self, Backing, Layout, Mapping, Module, ModuleIdentity, id_hex, signed_hex};
 use crate::procfs::Status;
 use crate::rpc::SymbolMatch;
-use crate::{Result, error, hex};
+use crate::{Diagnostic, Result, error, hex};
 use gimli::{ColumnType, DwarfSections, EndianSlice, LittleEndian};
 use nix::libc;
+use object::ObjectSegment;
 use object::{Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind};
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -14,10 +14,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
-mod inspect;
+pub(crate) mod inspect;
 mod overrides;
-pub use inspect::inspect;
+pub(crate) use inspect::inspect_with_trace;
+pub use inspect::{Report as InspectReport, inspect};
 pub use overrides::{Overrides, Rule as OverrideRule};
 
 const IMAGE_LIMIT: u64 = 128 * 1024 * 1024;
@@ -51,7 +56,7 @@ impl Process {
     }
 }
 
-fn path_matches(module: &Module, filter: &str) -> bool {
+pub(crate) fn path_matches(module: &Module, filter: &str) -> bool {
     let path = module.path();
     path == Path::new(filter) || path.file_name() == Some(OsStr::new(filter))
 }
@@ -61,38 +66,71 @@ fn module_matches(module: &Module, filter: &str, build_id: Option<&[u8]>) -> boo
         || build_id.is_some_and(|id| id_hex(id).eq_ignore_ascii_case(filter))
 }
 
-fn may_be_build_id(filter: &str) -> bool {
+pub(crate) fn may_be_build_id(filter: &str) -> bool {
     filter.len() >= 2
         && filter.len().is_multiple_of(2)
         && filter.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-struct DebugFile {
-    path: PathBuf,
-    bytes: Vec<u8>,
+pub(crate) struct DebugFile {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: Vec<u8>,
 }
 
-fn debug_bytes(path: &Path) -> Result<Vec<u8>> {
+fn debug_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > DEBUG_LIMIT {
+    if !metadata.is_file() || metadata.len() > limit {
         return Err(error("invalid or oversized external debug file"));
     }
     let mut bytes = Vec::new();
-    file.take(DEBUG_LIMIT + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > DEBUG_LIMIT {
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
         return Err(error("external debug file exceeds byte limit"));
     }
     Ok(bytes)
 }
 
-fn external_debug(
+pub(crate) fn installed_debug_symbols(build_id: &str) -> Option<PathBuf> {
+    if build_id.len() < 4 || !build_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (prefix, suffix) = build_id.split_at(2);
+    let path = PathBuf::from(format!("/usr/lib/debug/.build-id/{prefix}/{suffix}.debug"));
+    path.is_file().then_some(path)
+}
+
+pub(crate) fn debuglink_paths(path: &Path, link: &[u8]) -> Vec<PathBuf> {
+    let name = Path::new(OsStr::from_bytes(link));
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    if name.file_name() != Some(name.as_os_str()) {
+        return Vec::new();
+    }
+    let mut paths = vec![parent.join(name), parent.join(".debug").join(name)];
+    if let Ok(relative) = parent.strip_prefix("/") {
+        paths.push(Path::new("/usr/lib/debug").join(relative).join(name));
+    }
+    paths
+}
+
+pub(crate) fn external_debug(
     root: &Path,
     module: &Module,
     obj: &object::File<'_>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    find_external_debug(Some(&root.join("root")), &module.path(), obj, DEBUG_LIMIT)
+}
+
+pub(crate) fn find_external_debug(
+    target_root: Option<&Path>,
+    module_path: &Path,
+    obj: &object::File<'_>,
+    limit: u64,
 ) -> Option<(PathBuf, Vec<u8>)> {
     let build_id = obj.build_id().ok().flatten();
     let debuglink = obj.gnu_debuglink().ok().flatten().filter(|(name, _)| {
@@ -100,29 +138,37 @@ fn external_debug(
         name.file_name()
             .is_some_and(|basename| name.as_os_str() == basename)
     });
-    let target_root = root.join("root");
-    let target_debug = target_root.join("usr/lib/debug");
+    let target_debug = target_root.map(|root| root.join("usr/lib/debug"));
     let host_debug = Path::new("/usr/lib/debug");
     let mut candidates = Vec::new();
     if let Some(id) = build_id.filter(|id| !id.is_empty()) {
         let id = id_hex(id);
         let relative = format!(".build-id/{}/{}.debug", &id[..2], &id[2..]);
-        candidates.push((target_debug.join(&relative), None));
+        if let Some(target_debug) = &target_debug {
+            candidates.push((target_debug.join(&relative), None));
+        }
         candidates.push((host_debug.join(relative), None));
     }
-    let module_path = module.path();
     if let Some((name, crc)) = debuglink
         && let Ok(relative) = module_path.strip_prefix("/")
         && let Some(dir) = relative.parent()
     {
         let name = OsStr::from_bytes(name);
-        candidates.push((target_root.join(dir).join(name), Some(crc)));
-        candidates.push((target_root.join(dir).join(".debug").join(name), Some(crc)));
-        candidates.push((target_debug.join(dir).join(name), Some(crc)));
-        candidates.push((host_debug.join(dir).join(name), Some(crc)));
+        if let Some(root) = target_root {
+            candidates.push((root.join(dir).join(name), Some(crc)));
+            candidates.push((root.join(dir).join(".debug").join(name), Some(crc)));
+            candidates.push((root.join("usr/lib/debug").join(dir).join(name), Some(crc)));
+            candidates.push((host_debug.join(dir).join(name), Some(crc)));
+        } else {
+            candidates.extend(
+                debuglink_paths(module_path, name.as_bytes())
+                    .into_iter()
+                    .map(|path| (path, Some(crc))),
+            );
+        }
     }
     for (path, crc) in candidates {
-        let Ok(bytes) = debug_bytes(&path) else {
+        let Ok(bytes) = debug_bytes(&path, limit.min(DEBUG_LIMIT)) else {
             continue;
         };
         if crc.is_some_and(|expected| crc32fast::hash(&bytes) != expected) {
@@ -146,8 +192,8 @@ fn external_debug(
             _ => false,
         };
         if identity_ok {
-            let display = path
-                .strip_prefix(&target_root)
+            let display = target_root
+                .and_then(|root| path.strip_prefix(root).ok())
                 .map(|p| Path::new("/").join(p))
                 .unwrap_or(path);
             return Some((display, bytes));
@@ -330,17 +376,84 @@ impl<'a> Matcher<'a> {
     }
 }
 
+pub(crate) fn validate_search(request: &crate::rpc::SearchSymbolsRequest) -> Result<()> {
+    if !(1..=MAX_RESULTS).contains(&request.limit.unwrap_or(256)) {
+        return Err(error("symbol result limit must be in 1..=4096"));
+    }
+    Matcher::new(SymbolMatch::try_from(request.match_mode)?, &request.pattern)?;
+    Ok(())
+}
+
+pub(crate) fn search_core(
+    image: &object::File<'_>,
+    debug: Option<&DebugFile>,
+    bias: i128,
+    module: &Module,
+    request: &crate::rpc::SearchSymbolsRequest,
+) -> Result<Search> {
+    let limit = request.limit.unwrap_or(256);
+    let mode = SymbolMatch::try_from(request.match_mode)?;
+    let matcher = Matcher::new(mode, &request.pattern)?;
+    let mut result = Search {
+        matches: Vec::new(),
+        truncated: false,
+        issues: Vec::new(),
+    };
+    let build_id = image.build_id()?;
+    if request
+        .module
+        .as_deref()
+        .is_some_and(|filter| !module_matches(module, filter, build_id))
+    {
+        return Ok(result);
+    }
+    let (symbols, truncated) =
+        find_symbols(image, debug, |name| matcher.matches(name), limit as usize);
+    let base = image
+        .segments()
+        .map(|segment| segment.address())
+        .min()
+        .unwrap_or(0);
+    let identity = module.identity(build_id);
+    result.truncated = truncated;
+    result
+        .matches
+        .extend(symbols.into_iter().filter_map(|((link, _, _), symbol)| {
+            let runtime = u64::try_from(bias + i128::from(link)).ok()?;
+            Some(Match {
+                module: identity.clone(),
+                instance: hex(u64::try_from(bias + i128::from(base)).ok()?),
+                load_bias: signed_hex(bias),
+                runtime_address: hex(runtime),
+                module_offset: hex(link.checked_sub(base)?),
+                symbol,
+                symbol_override: None,
+            })
+        }));
+    Ok(result)
+}
+
 #[derive(Serialize)]
 struct SearchIssue {
     module: ModuleIdentity,
     error: String,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct Search {
     matches: Vec<Match>,
     truncated: bool,
     issues: Vec<SearchIssue>,
+}
+
+impl Search {
+    pub(crate) fn merge(&mut self, other: Self, limit: usize) {
+        let available = limit - self.matches.len();
+        self.truncated |= other.truncated || other.matches.len() > available;
+        self.matches
+            .extend(other.matches.into_iter().take(available));
+        self.issues.extend(other.issues);
+    }
 }
 
 pub fn search(
@@ -459,6 +572,8 @@ pub fn search(
 pub(crate) struct BreakpointSite {
     pub address: u64,
     pub size: u64,
+    pub(crate) build_id: Option<String>,
+    pub(crate) symbols: Vec<String>,
     backing: Backing,
     file_offset: u64,
 }
@@ -517,14 +632,18 @@ pub(crate) fn breakpoint_site_matching(
         let layout = Layout::new(&image, &module)?;
         let debug = DebugFile::discover(root, &module, &image);
         let parsed = debug.as_ref().and_then(DebugFile::parse);
-        let mut addresses = BTreeMap::<u64, u64>::new();
+        let mut addresses = BTreeMap::<u64, (u64, Vec<String>)>::new();
         for (symbol, _, _) in symbol_entries(&image, parsed.as_ref()) {
             if symbol.kind() == SymbolKind::Text
                 && has_elf_address(&symbol)
-                && symbol.name().is_ok_and(&matches)
+                && let Ok(name) = symbol.name()
+                && matches(name)
             {
-                let size = addresses.entry(symbol.address()).or_default();
+                let (size, names) = addresses.entry(symbol.address()).or_default();
                 *size = (*size).max(symbol.size());
+                if !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_owned());
+                }
             }
         }
         for &instance in layout
@@ -532,7 +651,7 @@ pub(crate) fn breakpoint_site_matching(
             .iter()
             .filter(|i| base.is_none_or(|base| i.base == base))
         {
-            for (&elf_address, &size) in &addresses {
+            for (&elf_address, (size, symbols)) in &addresses {
                 let Some(address) = layout.runtime(instance, elf_address, &module, &[]) else {
                     continue;
                 };
@@ -549,7 +668,9 @@ pub(crate) fn breakpoint_site_matching(
                 }
                 found = Some(BreakpointSite {
                     address,
-                    size,
+                    size: *size,
+                    build_id: image.build_id()?.map(id_hex),
+                    symbols: symbols.clone(),
                     backing: module.backing.clone(),
                     file_offset,
                 });
@@ -560,16 +681,16 @@ pub(crate) fn breakpoint_site_matching(
 }
 
 #[derive(Serialize)]
-struct Line {
-    file: PathBuf,
-    line: Option<u64>,
-    column: Option<u64>,
+pub(crate) struct Line {
+    pub(crate) file: PathBuf,
+    pub(crate) line: Option<u64>,
+    pub(crate) column: Option<u64>,
     source: Option<String>,
 }
 
-fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>> {
+fn line_sections<'a>(obj: &object::File<'a>) -> Result<DwarfSections<Cow<'a, [u8]>>> {
     let mut total = 0;
-    let sections = DwarfSections::load(|id: gimli::SectionId| -> Result<_> {
+    DwarfSections::load(|id: gimli::SectionId| -> Result<_> {
         let Some(section) = obj.section_by_name(id.name()) else {
             return Ok(std::borrow::Cow::Borrowed(&[][..]));
         };
@@ -579,8 +700,193 @@ fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>> {
         }
         total += length;
         Ok(section.uncompressed_data()?)
-    })?;
+    })
+}
+
+pub(crate) fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>> {
+    let sections = line_sections(obj)?;
     let dwarf = sections.borrow(|s| EndianSlice::new(s, LittleEndian));
+    line_for_pc(&dwarf, pc)
+}
+
+type LineReader<'a> = EndianSlice<'a, LittleEndian>;
+
+fn source_path(
+    dwarf: &gimli::Dwarf<LineReader<'_>>,
+    unit: &gimli::Unit<LineReader<'_>>,
+    header: &gimli::LineProgramHeader<LineReader<'_>>,
+    file: &gimli::FileEntry<LineReader<'_>>,
+) -> Result<PathBuf> {
+    let mut path = PathBuf::new();
+    if let Some(dir) = &unit.comp_dir {
+        path.push(dir.to_string_lossy().as_ref());
+    }
+    if let Some(dir) = file.directory(header) {
+        path.push(dwarf.attr_string(unit, dir)?.to_string_lossy().as_ref());
+    }
+    path.push(
+        dwarf
+            .attr_string(unit, file.path_name())?
+            .to_string_lossy()
+            .as_ref(),
+    );
+    Ok(path)
+}
+
+fn source_addresses(
+    obj: &object::File<'_>,
+    wanted: &Path,
+    line: u64,
+) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
+    let sections = line_sections(obj)?;
+    let dwarf = sections.borrow(|s| EndianSlice::new(s, LittleEndian));
+    let mut units = dwarf.units();
+    let mut statements = BTreeSet::new();
+    let mut declarations = BTreeSet::new();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let Some(program) = unit.line_program.clone() else {
+            continue;
+        };
+        let header = program.header();
+        let files = header
+            .file_names()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, _)| {
+                let index = i as u64 + u64::from(header.version() < 5);
+                header.file(index).map(|file| (index, file))
+            })
+            .map(|(index, file)| Ok((index, source_path(&dwarf, &unit, header, file)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let matches = |index: u64| files.get(&index).is_some_and(|path| path.ends_with(wanted));
+        if !files.values().any(|path| path.ends_with(wanted)) {
+            continue;
+        }
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs()? {
+            if entry.tag() == gimli::DW_TAG_subprogram
+                && matches!(entry.attr_value(gimli::DW_AT_decl_file), Some(gimli::AttributeValue::FileIndex(index)) if matches(index))
+                && entry
+                    .attr_value(gimli::DW_AT_decl_line)
+                    .and_then(|value| value.udata_value())
+                    == Some(line)
+                && let Some(gimli::AttributeValue::Addr(address)) =
+                    entry.attr_value(gimli::DW_AT_low_pc)
+            {
+                declarations.insert(address);
+            }
+        }
+        let mut rows = program.rows();
+        while let Some((_, row)) = rows.next_row()? {
+            if !row.end_sequence()
+                && row.is_stmt()
+                && row.line().map(|n| n.get()) == Some(line)
+                && matches(row.file_index())
+            {
+                statements.insert(row.address());
+            }
+        }
+    }
+    Ok((statements, declarations))
+}
+
+pub(crate) fn breakpoint_line(
+    root: &Path,
+    file: &Path,
+    line: u64,
+    filter: Option<&str>,
+    base: Option<u64>,
+) -> Result<BreakpointSite> {
+    let unavailable = |message| -> Box<dyn std::error::Error + Send + Sync> {
+        Diagnostic::new(
+            "LINE_UNAVAILABLE",
+            message,
+            Some("Use an executable source line, a fuller path, or select a module instance."),
+        )
+        .into()
+    };
+    if file.as_os_str().len() > 4096 || filter.is_some_and(|filter| filter.len() > 4096) {
+        return Err(unavailable("source path or module exceeds length limit"));
+    }
+    let exe = fs::metadata(root.join("exe")).ok();
+    let mut statements = BTreeMap::new();
+    let mut declarations = BTreeMap::new();
+    for module in modules::read(root)? {
+        if filter.is_some_and(|f| !path_matches(&module, f) && !may_be_build_id(f)) {
+            continue;
+        }
+        let Ok(bytes) = module.read_image(root, exe.as_ref(), IMAGE_LIMIT) else {
+            continue;
+        };
+        let Ok(image) = object::File::parse(&*bytes) else {
+            continue;
+        };
+        let build_id = image.build_id()?;
+        if !modules::is_executable_module(&image)
+            || filter.is_some_and(|f| !module_matches(&module, f, build_id))
+        {
+            continue;
+        }
+        let layout = Layout::new(&image, &module)?;
+        let debug = DebugFile::discover(root, &module, &image);
+        let parsed = debug.as_ref().and_then(DebugFile::parse);
+        let Ok((lines, functions)) =
+            source_addresses(parsed.as_ref().unwrap_or(&image), file, line)
+        else {
+            continue;
+        };
+        for &instance in layout
+            .instances
+            .iter()
+            .filter(|i| base.is_none_or(|base| i.base == base))
+        {
+            for (offsets, candidates) in
+                [(&lines, &mut statements), (&functions, &mut declarations)]
+            {
+                for &offset in offsets {
+                    let Some(address) = layout.runtime(instance, offset, &module, &[]) else {
+                        continue;
+                    };
+                    let Some(file_offset) = module
+                        .executable_at(address)
+                        .and_then(|map| map.file_offset(address))
+                    else {
+                        continue;
+                    };
+                    candidates.insert(
+                        address,
+                        BreakpointSite {
+                            address,
+                            size: 0,
+                            build_id: build_id.map(id_hex),
+                            symbols: Vec::new(),
+                            backing: module.backing.clone(),
+                            file_offset,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let candidates = if statements.is_empty() {
+        declarations
+    } else {
+        statements
+    };
+    match candidates.len() {
+        1 => Ok(candidates.into_values().next().unwrap()),
+        0 => Err(unavailable("source line has no executable address")),
+        _ => Err(unavailable(
+            "source line resolves to multiple executable addresses",
+        )),
+    }
+}
+
+pub(crate) fn line_for_pc(
+    dwarf: &gimli::Dwarf<gimli::EndianSlice<'_, LittleEndian>>,
+    pc: u64,
+) -> Result<Option<Line>> {
     let mut units = dwarf.units();
     while let Some(header) = units.next()? {
         let unit = dwarf.unit(header)?;
@@ -611,21 +917,8 @@ fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>> {
                 let Some(file) = row.file(header) else {
                     continue;
                 };
-                let mut path = PathBuf::new();
-                if let Some(dir) = &unit.comp_dir {
-                    path.push(dir.to_string_lossy().as_ref());
-                }
-                if let Some(dir) = file.directory(header) {
-                    path.push(dwarf.attr_string(&unit, dir)?.to_string_lossy().as_ref());
-                }
-                path.push(
-                    dwarf
-                        .attr_string(&unit, file.path_name())?
-                        .to_string_lossy()
-                        .as_ref(),
-                );
                 line = Some(Line {
-                    file: path,
+                    file: source_path(dwarf, &unit, header, file)?,
                     line: row.line().map(|n| n.get()),
                     column: match row.column() {
                         ColumnType::LeftEdge => None,
@@ -658,6 +951,136 @@ pub struct ResolvedAddress {
     original_symbol: Option<Symbol>,
     source_line: Option<Line>,
     issues: Vec<String>,
+}
+
+impl ResolvedAddress {
+    pub(crate) fn replay_location(&self) -> serde_json::Value {
+        serde_json::json!({
+            "module": self.module,
+            "module_offset": self.module_offset,
+        })
+    }
+}
+
+pub(crate) fn resolve_module_offset(
+    root: &Path,
+    filter: &str,
+    offset: u64,
+    execution: bool,
+    base: Option<u64>,
+) -> Result<u64> {
+    let exe = fs::metadata(root.join("exe")).ok();
+    let space = modules::address_space(root)?;
+    let mut addresses = BTreeSet::new();
+    for module in &space.modules {
+        if !path_matches(module, filter) && !may_be_build_id(filter) {
+            continue;
+        }
+        let Ok(bytes) = module.read_image(root, exe.as_ref(), IMAGE_LIMIT) else {
+            continue;
+        };
+        let Ok(image) = object::File::parse(&*bytes) else {
+            continue;
+        };
+        if !modules::is_executable_module(&image)
+            || !module_matches(module, filter, image.build_id()?)
+        {
+            continue;
+        }
+        let layout = Layout::new(&image, module)?;
+        let Some(link) = layout.elf_base.checked_add(offset) else {
+            continue;
+        };
+        for instance in layout
+            .instances
+            .iter()
+            .copied()
+            .filter(|instance| base.is_none_or(|base| instance.base == base))
+        {
+            if let Some(address) = layout.runtime(instance, link, module, &space.anonymous)
+                && (!execution || module.executable_at(address).is_some())
+            {
+                addresses.insert(address);
+            }
+        }
+    }
+    if addresses.len() == 1 {
+        return Ok(addresses.into_iter().next().unwrap());
+    }
+    Err(Diagnostic::new(
+        "MODULE_OFFSET_UNAVAILABLE",
+        if addresses.is_empty() {
+            "Module offset is not mapped"
+        } else {
+            "Module offset matches multiple load instances"
+        },
+        Some("Use a target with one matching module instance."),
+    )
+    .into())
+}
+
+pub(crate) fn symbol_module_offset(
+    pid: i32,
+    module: &str,
+    symbol: &str,
+    base: Option<u64>,
+    offset: u64,
+) -> Result<(u64, u64)> {
+    let found = search(
+        pid,
+        symbol,
+        SymbolMatch::Exact,
+        Some(module),
+        MAX_RESULTS,
+        &[],
+    )?;
+    let parse = |hex: &str| u64::from_str_radix(hex.trim_start_matches("0x"), 16);
+    let sites = found
+        .matches
+        .iter()
+        .filter_map(|item| {
+            let instance = parse(&item.instance).ok()?;
+            let address = parse(&item.module_offset).ok()?.checked_add(offset)?;
+            base.is_none_or(|base| instance == base)
+                .then_some((instance, address))
+        })
+        .collect::<BTreeSet<_>>();
+    if found.truncated || sites.len() != 1 {
+        return Err(Diagnostic::new(
+            "SYMBOL_OFFSET_UNAVAILABLE",
+            "Symbol and offset must identify one loaded address",
+            Some("Use an exact module path or build ID and a load instance."),
+        )
+        .into());
+    }
+    Ok(sites.into_iter().next().unwrap())
+}
+
+impl ResolvedAddress {
+    pub(crate) fn symbol_location(&self) -> Option<serde_json::Value> {
+        let symbol = self.symbol.as_ref()?;
+        let parse = |address: &str| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok();
+        let offset =
+            parse(self.elf_address.as_deref()?)?.checked_sub(parse(&symbol.elf_address)?)?;
+        Some(serde_json::json!({
+            "address": self.runtime_address,
+            "name": symbol.name,
+            "offset": offset,
+            "display": self.display,
+            "module": self.module,
+        }))
+    }
+
+    pub(crate) fn stop_site(&self) -> serde_json::Value {
+        serde_json::json!({
+            "address": self.runtime_address,
+            "symbol": self.symbol_location(),
+            "function": self.symbol.as_ref().map(|symbol| {
+                symbol.names.demangled_name.as_ref().unwrap_or(&symbol.names.display_name)
+            }),
+            "source_line": self.source_line,
+        })
+    }
 }
 
 pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<ResolvedAddress> {

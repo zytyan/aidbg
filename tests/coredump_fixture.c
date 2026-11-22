@@ -136,6 +136,10 @@ int main(int argc, char **argv) {
 
     int short_fd = backing(directory, "short-map", stress ? page : 2 * page);
     unsigned char *short_map = map(short_fd, 2 * page, MAP_PRIVATE);
+    int protected_fd = backing(directory, "protected-map", page);
+    unsigned char *protected = map(protected_fd, 2 * page, MAP_PRIVATE);
+    protected[0] = 0x6d;
+    assert(mprotect(protected, 2 * page, PROT_NONE) == 0);
     size_t anonymous_size = (stress ? 18 : 10) * 1024 * 1024;
     unsigned char *anonymous = map(-1, anonymous_size, MAP_PRIVATE | MAP_ANONYMOUS);
     if (stress)
@@ -145,6 +149,7 @@ int main(int argc, char **argv) {
     anonymous[0] = 0x68;
     anonymous[anonymous_size - 1] = 0x6a;
     core_dso_bss[128 * 1024] = 0x69;
+    printf("protected %p\nunbacked %p\n", (void *)protected, (void *)(protected + page));
     printf("main_data %p\ndso_data %p\ndso_bss %p\ncow %p\nclean %p\ncow_end %p\n"
            "shared %p\nipc %p\nshort %p\nanonymous %p\nanonymous_end %p\ncode %p\n",
            (void *)&core_main_data, (void *)&core_dso_data, (void *)&core_dso_bss[128 * 1024],

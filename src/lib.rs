@@ -1,46 +1,126 @@
-#[cfg(not(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    all(target_os = "windows", target_arch = "x86_64")
 )))]
-compile_error!("aidbg supports Linux x86_64 and AArch64");
+compile_error!("aidbg supports Linux x86_64/AArch64 and the Windows x64 client");
 
+#[cfg(target_os = "linux")]
 pub mod breakpoint;
+#[cfg(target_os = "linux")]
 pub mod code;
+#[cfg(target_os = "linux")]
 pub mod coredump;
+#[cfg(target_os = "windows")]
+#[path = "coredump/config.rs"]
+pub mod coredump;
+#[cfg(target_os = "linux")]
 mod cpp_names;
+#[cfg(target_os = "linux")]
 pub mod disassembly;
+#[cfg(target_os = "linux")]
 mod modules;
+#[cfg(target_os = "linux")]
 pub mod perf;
+#[cfg(target_os = "linux")]
 mod procfs;
+#[cfg(target_os = "linux")]
 mod regs;
 pub mod rpc;
+#[cfg(target_os = "linux")]
+pub mod run;
+#[cfg(target_os = "linux")]
+pub mod script;
+pub mod script_observation;
 pub mod selection;
+#[cfg(target_os = "linux")]
 mod software_breakpoint;
+#[cfg(target_os = "linux")]
 pub mod symbols;
+#[cfg(target_os = "linux")]
 pub mod target_call;
+#[cfg(target_os = "linux")]
 mod trace;
+#[cfg(target_os = "linux")]
 mod unwind;
+#[cfg(target_os = "linux")]
 pub mod watch_step;
 
-use procfs::{Memory, Signals, Status, epoch_ms, start_ticks, task_path};
-use serde::Serialize;
-use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::{self, Read};
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+#[path = "run/request.rs"]
+pub mod run;
+#[cfg(target_os = "windows")]
+#[path = "script/api.rs"]
+pub mod script;
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const BUILD_REVISION: Option<&str> = option_env!("AIDBG_BUILD_REVISION");
+
+pub const BUILD_VERSION: &str = env!("AIDBG_BUILD_VERSION");
+
+#[derive(Clone, serde::Serialize)]
+pub struct Diagnostic {
+    pub code: &'static str,
+    pub message: String,
+    pub hint: Option<&'static str>,
+}
+
+impl Diagnostic {
+    pub fn new(code: &'static str, message: impl Into<String>, hint: Option<&'static str>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            hint,
+        }
+    }
+}
+
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::fmt::Debug for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Diagnostic")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl std::error::Error for Diagnostic {}
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn error(message: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
-    io::Error::other(message.into()).into()
+    std::io::Error::other(message.into()).into()
 }
 
 pub fn hex(v: u64) -> String {
     format!("0x{v:x}")
 }
+#[cfg(target_os = "linux")]
+use procfs::{Memory, Signals, Status, epoch_ms, start_ticks, task_path};
+#[cfg(target_os = "linux")]
+use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::fs::{self, File};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct Issue {
     section: &'static str,
@@ -48,6 +128,7 @@ struct Issue {
     message: String,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct Process {
     pid: i32,
@@ -58,6 +139,7 @@ struct Process {
     state_before: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 struct Thread {
     tid: i32,
@@ -70,6 +152,7 @@ struct Thread {
     stack: Option<unwind::Stack>,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Serialize)]
 pub struct Snapshot {
     freeze_requested: &'static str,
@@ -88,6 +171,7 @@ pub struct Snapshot {
     cleanup: trace::Cleanup,
 }
 
+#[cfg(target_os = "linux")]
 impl Snapshot {
     fn new(pid: i32, mode: rpc::FreezeMode) -> Self {
         Self {
@@ -205,7 +289,7 @@ impl Snapshot {
 
     fn collect_stopped(
         &mut self,
-        trace: &trace::Trace<'_>,
+        trace: &trace::Trace,
         root: &Path,
         deadline: Instant,
         hit: Option<i32>,
@@ -239,6 +323,7 @@ impl Snapshot {
             self.issue("memory", None, "could not refresh process status");
         }
         let mut images = unwind::Images::new();
+        let mut leader_regs = None;
         for (&tid, captured) in &trace.threads {
             if hit.is_some_and(|hit| hit != tid) {
                 continue;
@@ -273,6 +358,9 @@ impl Snapshot {
                         if self.all_threads_stopped_during_capture || hit.is_some() {
                             let stack =
                                 images.walk(trace, regs.stack, &maps, root, exe.as_ref(), deadline);
+                            if hit.is_none() && tid == self.process.pid {
+                                leader_regs = Some(regs.stack);
+                            }
                             if !stack.complete {
                                 self.issue("stack", Some(tid), &stack.stop_reason);
                             }
@@ -283,6 +371,22 @@ impl Snapshot {
                 }
             }
             self.threads.push(thread);
+        }
+        if let Some(registers) = leader_regs
+            && let Some(frame) = self
+                .threads
+                .iter_mut()
+                .find(|thread| thread.tid == self.process.pid)
+                .and_then(|thread| thread.stack.as_mut())
+                .and_then(|stack| stack.frames.first_mut())
+        {
+            frame.args = Some(symbols::inspect::stopped_arguments(
+                self.process.pid,
+                root,
+                trace,
+                registers,
+                deadline.min(Instant::now() + std::time::Duration::from_millis(25)),
+            ));
         }
         (maps, images, exe)
     }
@@ -306,7 +410,7 @@ impl Snapshot {
             .collect();
     }
 
-    fn finish_trace(&mut self, trace: &mut trace::Trace<'_>) {
+    fn finish_trace(&mut self, trace: &mut trace::Trace) {
         self.cleanup = trace.close();
         let unconfirmed: Vec<_> = self
             .cleanup
@@ -389,6 +493,59 @@ impl Snapshot {
         Ok(())
     }
 
+    fn from_run(
+        pid: i32,
+        mode: rpc::FreezeMode,
+        root: &Path,
+        trace: &mut trace::Trace,
+        run_deadline: Instant,
+    ) -> Self {
+        if mode == rpc::FreezeMode::Never {
+            return Self::run(pid, mode);
+        }
+        let mut result = Self::new(pid, mode);
+        let started = Instant::now();
+        let deadline = run_deadline.min(started + Duration::from_millis(500));
+        let capture = (|| -> Result<()> {
+            let identity = start_ticks(root)?;
+            result.process.start_time_ticks_since_boot = Some(identity.to_string());
+            let before = Status::read(root)?;
+            result.process.name = before.name();
+            result.process.state_before = before.state();
+            result.read_identity(root);
+            match trace.freeze(deadline) {
+                Ok(()) => result.all_threads_stopped_during_capture = true,
+                Err(error) => result.issue("attach", None, error),
+            }
+            result.freeze_achieved = if result.all_threads_stopped_during_capture {
+                "all"
+            } else if trace.threads.values().any(|thread| thread.stop.is_some()) {
+                "some"
+            } else {
+                "none"
+            };
+            if mode == rpc::FreezeMode::Required && !result.all_threads_stopped_during_capture {
+                return Ok(());
+            }
+            let (maps, images, exe) = result.collect_stopped(trace, root, deadline, None, true);
+            result.finish_symbols(Some(root), maps, images, exe.as_ref());
+            result.status = if result.all_threads_stopped_during_capture && result.issues.is_empty()
+            {
+                "complete"
+            } else {
+                "partial"
+            };
+            Ok(())
+        })();
+        if let Err(error) = capture {
+            result.issue("process", None, error);
+        }
+        // The run loop handles any pending signal stops before resuming its threads.
+        result.trace_window_ms = Some(started.elapsed().as_millis() as u64);
+        result.capture_finished_unix_ms = epoch_ms();
+        result
+    }
+
     pub fn run(pid: i32, mode: rpc::FreezeMode) -> Self {
         let mut result = Self::new(pid, mode);
         if let Err(e) = result.acquire(mode) {
@@ -401,6 +558,7 @@ impl Snapshot {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn machine(root: &Path) -> Result<&'static str> {
     let mut h = [0u8; 20];
     File::open(root.join("exe"))?.read_exact(&mut h)?;

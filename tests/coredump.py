@@ -59,7 +59,7 @@ def unpack_core(data):
     return loads, registers, metadata
 
 
-def capture(cli, path, fixture, mode=None, extra=(), expected=0):
+def capture(cli, path, fixture, mode=None, extra=(), expected=0, traced=False):
     args = ["coredump", "--pid", str(fixture.pid), "--output", path, *extra]
     if mode is not None:
         args += ["--mode", mode]
@@ -75,7 +75,7 @@ def capture(cli, path, fixture, mode=None, extra=(), expected=0):
     assert 0 <= summary["staged_bytes"] <= summary["captured_bytes"]
     if not summary["parallel_compression"]:
         assert summary["staged_bytes"] == summary["captured_bytes"]
-    assert all(status(fixture.pid, tid.name)["TracerPid"] == "0"
+    assert all((status(fixture.pid, tid.name)["TracerPid"] != "0") == traced
                for tid in Path(f"/proc/{fixture.pid}/task").iterdir())
     return summary
 
@@ -109,7 +109,7 @@ def verify_mode(cli, work, fixture, mode, addresses, workload):
         ("dso_data", 0x45, "standard"), ("dso_bss", 0x69, "standard"),
         ("cow", 0x61, "standard"), ("cow_end", 0x62, "standard"),
         ("clean", 0, "full"), ("ipc", 0x64, "extended"), ("anonymous", 0x68, "extended"),
-        ("anonymous_end", 0x6a, "extended"),
+        ("anonymous_end", 0x6a, "extended"), ("protected", 0x6d, "standard"),
     ]
     if workload == "typical":
         markers.extend([
@@ -123,6 +123,23 @@ def verify_mode(cli, work, fixture, mode, addresses, workload):
         assert read(addresses["shared"]) == 0x63
     if mode == "full":
         assert read(addresses["shared"]) == 0x63
+        assert read(addresses["unbacked"]) is None
+        skipped = meta["coverage"]["unbacked_protected_ranges"]
+        assert summary["unbacked_protected_ranges"] == skipped
+        assert any(gap["start"] <= addresses["unbacked"] < gap["end"] for gap in skipped)
+        assert all(not gap["start"] <= addresses["unbacked"] < gap["end"]
+                   for gap in summary["missing_range_details"])
+        warnings = {warning["code"] for warning in summary["warnings"]}
+        gaps = summary["missing_range_details"]
+        if not summary["issues"] and gaps and all(gap["reason"] == "vvar_unavailable" for gap in gaps):
+            assert summary["status"] == "complete_without_vvar", summary
+            assert "commonly unreadable" in summary["comment"], summary
+            assert warnings == {"VVAR_UNAVAILABLE"}, summary
+        elif summary["issues"] or gaps:
+            assert summary["status"] == "partial" and "PARTIAL_CORE" in warnings, summary
+            assert "comment" not in summary, summary
+        else:
+            assert summary["status"] == "complete" and "comment" not in summary, summary
     if workload == "stress" and level >= MODES.index("standard"):
         assert read(addresses["short"]) is None
         assert any(gap["start"] <= addresses["short"] < gap["end"]
@@ -401,20 +418,21 @@ def verify_write_failure(cli, work, fixture):
     assert status(fixture.pid)["TracerPid"] == "0"
 
 
-def verify_breakpoint_conflict(cli, work, fixture, address):
+def verify_traced_capture(cli, work, fixture, address):
     command = [*cli, "breakpoint"]
     capabilities = json.loads(subprocess.check_output([*command, "capabilities"], timeout=15))
     if not capabilities["software_execution"]:
-        print("SKIP coredump breakpoint conflict (software breakpoints unavailable)")
+        print("SKIP coredump with breakpoints (software breakpoints unavailable)")
         return
     rule = json.loads(subprocess.check_output([
         *command, "set", "--kind", "software", "--address", hex(address), "--pid", str(fixture.pid),
     ], timeout=15))
     try:
-        output = work / "conflict.core.zst"
-        result = capture(cli, output, fixture, "lite", expected=1)
-        assert b"an active breakpoint session owns this PID" in result.stderr, result
-        assert not output.exists()
+        output = work / "traced.core.zst"
+        summary = capture(cli, output, fixture, "lite", traced=True)
+        point, = summary["breakpoint_replay"]["breakpoints"]
+        assert point["breakpoint_id"] == rule["breakpoint_id"] and point["module_offset"], point
+        assert output.exists()
     finally:
         subprocess.check_call([
             *command, "remove", "--pid", str(fixture.pid), "--breakpoint-id", str(rule["breakpoint_id"]),
@@ -589,8 +607,8 @@ def main():
                         verify_cancel(cli, case, fixture)
                         verify_disconnect(cli, case, fixture, state)
                         verify_write_failure(cli, case, fixture)
-                        verify_breakpoint_conflict(cli, case, fixture, addresses["code"])
-                        print("PASS MCP, no-clobber, timeout, cancellation, write failure and breakpoint conflict")
+                        verify_traced_capture(cli, case, fixture, addresses["code"])
+                        print("PASS MCP, no-clobber, timeout, cancellation, write failure and coredump with active breakpoints")
                 if args.benchmark:
                     compare_compression(workload, case / "full.core.zst")
         verify_restart(cli, work, state)

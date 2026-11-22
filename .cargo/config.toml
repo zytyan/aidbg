@@ -9,3 +9,6 @@ rustflags = ["-C", "link-self-contained=no"]
 [target.x86_64-unknown-linux-musl]
 linker = "build/x86_64-musl-cc"
 rustflags = ["-C", "link-self-contained=no"]
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
