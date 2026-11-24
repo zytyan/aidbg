@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -41,7 +42,31 @@ static void on_signal(int number) {
     signal_count++;
 }
 
+static void *event_worker(void *argument) {
+    fixture_stop(argument);
+    return NULL;
+}
+
+static int event_fixture(void) {
+    pthread_t workers[2];
+    if (pthread_create(&workers[0], NULL, event_worker, &packet) ||
+        pthread_create(&workers[1], NULL, event_worker, &packet))
+        return 91;
+    pthread_join(workers[0], NULL);
+    pthread_join(workers[1], NULL);
+    signal(SIGUSR1, on_signal);
+    raise(SIGUSR1);
+    char input[80];
+    puts("enter data");
+    fputs("stderr ready\n", stderr);
+    fflush(stdout);
+    if (!fgets(input, sizeof(input), stdin)) return 92;
+    printf("received %s", input);
+    return signal_count == 1 ? 37 : 93;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'e') return event_fixture();
     if (argc > 1 && argv[1][0] == 'a') {
         if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) < 0) return errno;
         puts("ready");

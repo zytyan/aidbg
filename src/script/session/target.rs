@@ -6,7 +6,10 @@ use crate::{
     Result,
     breakpoint::{self, Kind, WatchAccess},
     code, coredump, disassembly, error, hex, modules, procfs, regs,
-    rpc::{CoreMode, OpenCoreRequest, RunProcessRequest, SearchSymbolsRequest, SymbolMatch},
+    rpc::{
+        CoreMode, OpenCoreRequest, RunProcessRequest, SearchMemoryRequest, SearchSymbolsRequest,
+        SymbolMatch,
+    },
     symbols,
     trace::{Stop, Trace, read_process_prefix},
     unwind::Images,
@@ -55,14 +58,18 @@ pub(super) struct Live {
     pub root: PathBuf,
     pub(super) trace: Trace,
     launched: bool,
+    exit_reported: bool,
+    pub(super) stdio: Option<super::process_io::ProcessIo>,
     pub paused: BTreeSet<i32>,
     pub callbacks: BTreeSet<i32>,
+    stop_sequences: BTreeMap<i32, BTreeSet<u64>>,
     points: BTreeMap<u32, Point>,
     handled_stops: BTreeSet<i32>,
     programmed: BTreeMap<i32, u64>,
     watch_values: BTreeMap<u32, u64>,
     branch_record: BTreeMap<i32, (u64, bool)>,
     branches: Vec<Value>,
+    steps: Vec<Event>,
     suppress: BTreeSet<i32>,
     last_software_tid: i32,
     linked: Vec<(std::ops::Range<u64>, Vec<Value>)>,
@@ -73,12 +80,23 @@ pub(super) enum Event {
     Breakpoint {
         tid: i32,
         id: u32,
+        address: u64,
         watch: Option<WatchHit>,
     },
     Signal {
         tid: i32,
         number: i32,
         fault: Option<u64>,
+        callback: bool,
+    },
+    Exit {
+        tid: i32,
+        process: bool,
+        result: Option<crate::trace::LaunchExit>,
+    },
+    Step {
+        tid: i32,
+        address: u64,
     },
 }
 
@@ -90,21 +108,26 @@ pub(super) struct WatchHit {
 }
 
 impl Live {
-    fn new(pid: i32, root: PathBuf, start: u64, trace: Trace, launched: bool) -> Self {
+    fn new(pid: i32, root: PathBuf, start: u64, mut trace: Trace, launched: bool) -> Self {
+        trace.retired = Some(Vec::new());
         Self {
             pid,
             start,
             root,
             trace,
             launched,
+            exit_reported: false,
+            stdio: None,
             paused: BTreeSet::new(),
             callbacks: BTreeSet::new(),
+            stop_sequences: BTreeMap::new(),
             points: BTreeMap::new(),
             handled_stops: BTreeSet::new(),
             programmed: BTreeMap::new(),
             watch_values: BTreeMap::new(),
             branch_record: BTreeMap::new(),
             branches: Vec::new(),
+            steps: Vec::new(),
             suppress: BTreeSet::new(),
             last_software_tid: 0,
             linked: Vec::new(),
@@ -150,8 +173,7 @@ impl Live {
             .chain(std::iter::once(std::ptr::null()))
             .collect();
         let (gate, mut release) = io::pipe()?;
-        let null = File::open("/dev/null")?;
-        let output = fs::OpenOptions::new().write(true).open("/dev/null")?;
+        let (stdio, child_io) = super::process_io::ProcessIo::new()?;
         let (report, exec_error) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
         // Only async-signal-safe operations are used in the fork child.
         let pid = Errno::result(unsafe { libc::fork() })?;
@@ -164,9 +186,9 @@ impl Live {
                 }
                 libc::close(gate.as_raw_fd());
                 libc::close(report.as_raw_fd());
-                if libc::dup2(null.as_raw_fd(), 0) >= 0
-                    && libc::dup2(output.as_raw_fd(), 1) >= 0
-                    && libc::dup2(output.as_raw_fd(), 2) >= 0
+                if libc::dup2(child_io.stdin.as_raw_fd(), 0) >= 0
+                    && libc::dup2(child_io.stdout.as_raw_fd(), 1) >= 0
+                    && libc::dup2(child_io.stderr.as_raw_fd(), 2) >= 0
                 {
                     libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                     libc::execv(path.as_ptr(), argv.as_ptr());
@@ -176,7 +198,7 @@ impl Live {
                 libc::_exit(127);
             }
         }
-        drop((gate, exec_error));
+        drop((gate, exec_error, child_io));
         let root = PathBuf::from(format!("/proc/{pid}"));
         let launched = (|| {
             let start = procfs::start_ticks(&root)?;
@@ -193,6 +215,7 @@ impl Live {
                     }
                     trace.threads.get_mut(&pid).unwrap().stop = Some(Stop::ExecBoundary);
                     let mut live = Self::new(pid, root, start, trace, true);
+                    live.stdio = Some(stdio);
                     live.paused.insert(pid);
                     return Ok(live);
                 }
@@ -424,10 +447,25 @@ impl Live {
         Ok(())
     }
 
+    pub fn track_stop(&mut self, tid: i32, sequence: u64) {
+        if self.paused.contains(&tid) {
+            self.stop_sequences.entry(tid).or_default().insert(sequence);
+        }
+    }
+
+    pub fn holds_stop(&self, tid: i32, sequence: u64) -> bool {
+        self.paused.contains(&tid)
+            && self
+                .stop_sequences
+                .get(&tid)
+                .is_some_and(|stops| stops.contains(&sequence))
+    }
+
     fn resume(&mut self, tid: i32) -> Result<()> {
         let Some(thread) = self.trace.threads.get(&tid) else {
             return Err(error("thread no longer exists"));
         };
+        self.stop_sequences.remove(&tid);
         let Some(stop) = thread.stop else {
             return Ok(());
         };
@@ -486,9 +524,12 @@ impl Live {
         self.trace.resume(tid)
     }
 
-    fn continue_threads(&mut self, tid: Option<i32>) -> Result<()> {
+    pub(super) fn continue_threads(&mut self, tid: Option<i32>) -> Result<()> {
+        if let Some(tid) = tid {
+            self.identity(tid)?;
+        }
         for tid in self.original_tids(tid) {
-            if !self.callbacks.contains(&tid) {
+            if self.paused.contains(&tid) && !self.callbacks.contains(&tid) {
                 if self.traced(tid) {
                     self.trace.stop_thread(tid, Instant::now() + DEADLINE)?;
                 } else {
@@ -596,6 +637,13 @@ impl Live {
         Ok(())
     }
 
+    pub fn drain_io(&mut self) -> Result<()> {
+        if let Some(stdio) = &mut self.stdio {
+            stdio.drain()?;
+        }
+        Ok(())
+    }
+
     pub fn tick(&mut self, signals: &BTreeSet<i32>) -> Result<Vec<Event>> {
         self.trace.poll()?;
         // A successful exec invalidates breakpoints and the scratch mapping.
@@ -629,7 +677,31 @@ impl Live {
                 .get(tid)
                 .is_some_and(|thread| thread.identity == *identity)
         });
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.steps);
+        let retired = self
+            .trace
+            .retired
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default();
+        for (tid, result) in retired {
+            self.stop_sequences.remove(&tid);
+            if tid != self.pid || !self.trace.threads.is_empty() {
+                events.push(Event::Exit {
+                    tid,
+                    process: false,
+                    result,
+                });
+            }
+        }
+        if self.trace.threads.is_empty() && !self.exit_reported {
+            self.exit_reported = true;
+            events.push(Event::Exit {
+                tid: self.pid,
+                process: true,
+                result: self.trace.exit,
+            });
+        }
         for tid in self.tids() {
             if self.callbacks.contains(&tid) {
                 continue;
@@ -652,6 +724,7 @@ impl Live {
                         .map(|(&id, _)| Event::Breakpoint {
                             tid,
                             id,
+                            address,
                             watch: None,
                         })
                         .collect(),
@@ -679,10 +752,15 @@ impl Live {
                                 }
                                 _ => None,
                             };
-                            Event::Breakpoint { tid, id, watch }
+                            Event::Breakpoint {
+                                tid,
+                                id,
+                                address: point.address,
+                                watch,
+                            }
                         })
                         .collect(),
-                    Stop::Delivery(signal) if signals.contains(&(signal as i32)) => {
+                    Stop::Delivery(signal) => {
                         let fault = matches!(
                             signal,
                             Signal::SIGSEGV | Signal::SIGILL | Signal::SIGBUS | Signal::SIGFPE
@@ -698,13 +776,15 @@ impl Live {
                             tid,
                             number: signal as i32,
                             fault,
+                            callback: signals.contains(&(signal as i32)),
                         }]
                     }
-                    Stop::UnnamedDelivery(number) if signals.contains(&number) => {
+                    Stop::UnnamedDelivery(number) => {
                         vec![Event::Signal {
                             tid,
                             number,
                             fault: None,
+                            callback: signals.contains(&number),
                         }]
                     }
                     _ => Vec::new(),
@@ -714,8 +794,24 @@ impl Live {
                     if matches!(stop, Stop::Software { .. }) {
                         self.trace.rewind_software_stops()?;
                     }
-                    self.callbacks.insert(tid);
+                    let callbacks = new_events.iter().any(|event| {
+                        !matches!(
+                            event,
+                            Event::Signal {
+                                callback: false,
+                                ..
+                            }
+                        )
+                    });
                     events.extend(new_events);
+                    if callbacks {
+                        self.callbacks.insert(tid);
+                        continue;
+                    }
+                    // Forward signal-delivery stops even for software-stepped threads.
+                    if !self.paused.contains(&tid) {
+                        self.resume(tid)?;
+                    }
                     continue;
                 }
             }
@@ -851,7 +947,7 @@ impl Live {
                     _ => None,
                 };
                 if access.is_some() {
-                    events.push(Event::Breakpoint {tid,id,watch:Some(WatchHit {length,before:Some(before),after,access})});
+                    events.push(Event::Breakpoint {tid,id,address,watch:Some(WatchHit {length,before:Some(before),after,access})});
                 }
             }
             Ok(events)
@@ -892,10 +988,23 @@ impl Live {
         if self.launched {
             let pid = Pid::from_raw(self.pid);
             if self.trace.exit.is_none() {
+                let mut stdio = self.stdio.take();
                 let _ = thread::Builder::new()
                     .name("aidbg-reap".into())
                     .spawn(move || {
-                        while matches!(nix::sys::wait::waitpid(pid, None), Err(Errno::EINTR)) {}
+                        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+                        if let Some(io) = &mut stdio {
+                            io.close_input();
+                            while matches!(
+                                waitpid(pid, Some(WaitPidFlag::WNOHANG)),
+                                Ok(WaitStatus::StillAlive) | Err(Errno::EINTR)
+                            ) {
+                                let _ = io.drain();
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                        } else {
+                            while matches!(waitpid(pid, None), Err(Errno::EINTR)) {}
+                        }
                     });
             }
             self.launched = false;
@@ -1204,6 +1313,28 @@ impl Target {
                     self.read_prefix(parse_address(&args["address"])?, length)?
                 ))
             }
+            "xref" => {
+                let address = |key: &str| args.get(key).map(parse_address).transpose();
+                let optional_u32 = |key: &str| serde_json::from_value(args[key].clone());
+                let request = SearchMemoryRequest {
+                    pointer_value: Some(parse_address(&args["address"])?),
+                    start: address("start")?,
+                    end: address("end")?,
+                    resume_from: address("resumeFrom")?,
+                    instruction_references: args["instructionReferences"] == true,
+                    alignment: optional_u32("alignment")?,
+                    limit: optional_u32("limit")?,
+                    max_scan_bytes: optional_u32("maxScanBytes")?,
+                    ..Default::default()
+                };
+                match self {
+                    Self::Live(live) => {
+                        live.verify()?;
+                        core::memory::search_live(live.pid, &request)
+                    }
+                    Self::Core(core) => core.search_memory(&request),
+                }
+            }
             "write" => {
                 let bytes = serde_json::from_value::<Vec<u8>>(args["bytes"].clone())?;
                 if bytes.len() > MAX_MEMORY {
@@ -1295,6 +1426,29 @@ impl Target {
                 let result = self.live()?.syscall(tid()?, number, &words)?;
                 Ok(json!([(result as i64).to_string()]))
             }
+            "stdio" => {
+                let live = self.live()?;
+                let io = live.stdio.as_mut().ok_or_else(|| {
+                    error("NotSupport: process I/O is only available for launched targets")
+                })?;
+                Ok(match args["operation"].as_str() {
+                    Some("stdout") => io.read(0),
+                    Some("stderr") => io.read(1),
+                    Some("combined") => io.read(2),
+                    Some("write") => json!(
+                        io.write(
+                            args["data"]
+                                .as_str()
+                                .ok_or_else(|| error("stdin accepts a string"))?
+                        )?
+                    ),
+                    Some("close") => {
+                        io.close_input();
+                        Value::Null
+                    }
+                    _ => return Err(error("unknown process I/O operation")),
+                })
+            }
             "prepareScratchPad" => {
                 self.live()?.prepare_scratch(None)?;
                 Ok(Value::Null)
@@ -1308,6 +1462,54 @@ impl Target {
                     live.prepare_scratch(None)?;
                 }
                 Ok(Value::Null)
+            }
+            "lineToAddr" => {
+                let file = Path::new(
+                    args["file"]
+                        .as_str()
+                        .ok_or_else(|| error("expected a source path"))?,
+                );
+                let line = number(&args, "line")?;
+                if file.as_os_str().is_empty() || file.as_os_str().len() > 4096 || line == 0 {
+                    return Err(error("expected a source path and a positive line number"));
+                }
+                let address = match self {
+                    Self::Live(live) => {
+                        live.verify()?;
+                        match symbols::breakpoint_line(&live.root, file, line, None, None) {
+                            Ok(site) => Some(site.address),
+                            Err(err)
+                                if err.downcast_ref::<crate::Diagnostic>().is_some_and(
+                                    |diagnostic| diagnostic.code == "LINE_UNAVAILABLE",
+                                ) =>
+                            {
+                                None
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Self::Core(core) => core.script_line_address(file, line)?,
+                };
+                Ok(json!(address.map(hex)))
+            }
+            "addrToLine" => {
+                let address = parse_address(&args["address"])?;
+                let resolved = match self {
+                    Self::Live(live) => {
+                        live.verify()?;
+                        serde_json::to_value(symbols::resolve(live.pid, address, &[])?)?
+                    }
+                    Self::Core(core) => core.resolve(address)?,
+                };
+                Ok(
+                    match (
+                        resolved["source_line"]["file"].as_str(),
+                        resolved["source_line"]["line"].as_u64(),
+                    ) {
+                        (Some(file), Some(line)) => json!({"file":file,"line":line}),
+                        _ => Value::Null,
+                    },
+                )
             }
             "address" => Ok(json!(hex(self.address(&args["at"])?))),
             "symbolPage" => {
@@ -1381,7 +1583,12 @@ impl Target {
                 Ok(Value::Null)
             }
             "step" => {
-                self.live()?.step(tid()?, &args)?;
+                let live = self.live()?;
+                let tid = tid()?;
+                live.stop_sequences.remove(&tid);
+                live.step(tid, &args)?;
+                let address = regs::read(tid)?.stack.get(regs::PC)?;
+                live.steps.push(Event::Step { tid, address });
                 Ok(Value::Null)
             }
             "recordBranch" => {

@@ -4,6 +4,8 @@
     let host, arch;
     let nextPoint = 0;
     let callbackTid;
+    let callbackContext;
+    const eventWaiters = new Map();
     const inputs = new Map();
     const points = new Map();
     const signals = new Map();
@@ -146,6 +148,58 @@
             });
     }
 
+    const timers = new Map();
+    const abortSignals = new WeakMap();
+    class AbortController {
+        constructor() {
+            const state = {aborted:false, reason:undefined, listeners:new Set()};
+            const signal = Object.freeze({
+                get aborted() { return state.aborted; },
+                get reason() { return state.reason; },
+            });
+            abortSignals.set(signal,state);
+            Object.defineProperty(this,"signal",{value:signal});
+        }
+        abort(reason = new Error("operation aborted")) {
+            const state = abortSignals.get(this.signal);
+            if (state.aborted) return;
+            state.aborted = true;
+            state.reason = reason;
+            for (const notify of state.listeners) notify();
+            state.listeners.clear();
+        }
+    }
+    function reportError(error, kind = "callback_error") {
+        rpc("reportError", {kind, message:error instanceof Error && error.name === "Error" ? error.message : String(error),
+            stack:typeof error?.stack === "string" ? error.stack : undefined});
+    }
+    function setTimeout(callback, ms = 0) {
+        if (typeof callback !== "function") throw new TypeError("expected a timer callback");
+        if (!Number.isFinite(ms) || ms < 0 || ms > 86400000) throw new RangeError("invalid timer duration");
+        const id = rpc("setTimer",{ms:Math.ceil(ms)});
+        timers.set(id,{callback});
+        return id;
+    }
+    function clearTimeout(id) {
+        timers.delete(id);
+        rpc("clearTimer",{id});
+    }
+    function queueMicrotask(callback) {
+        if (typeof callback !== "function") throw new TypeError("expected a microtask callback");
+        Promise.resolve().then(callback).catch(reportError);
+    }
+    function sleep(ms, signal) {
+        const state = signal === undefined ? undefined : abortSignals.get(signal);
+        if (signal !== undefined && !state) throw new TypeError("expected an AbortSignal");
+        return new Promise((resolve,reject) => {
+            if (state?.aborted) { reject(state.reason); return; }
+            const abort = () => { clearTimeout(id); reject(state.reason); };
+            const id = setTimeout(() => { state?.listeners.delete(abort); resolve(); },ms);
+            timers.get(id).cancel=() => {state?.listeners.delete(abort); reject(new Error("target changed"));};
+            state?.listeners.add(abort);
+        });
+    }
+
     function makeConsole(id, generation) {
         const check = () => {
             if (generation !== rpc("generation")) throw new Error("debugger target changed");
@@ -196,6 +250,20 @@
             return fromUtf8(bytes.slice(0, end));
         },
         readAsType(address, type) { return type.at(address); },
+        xref(address, options = {}) {
+            const {start, end, instructionReferences, limit, maxScanBytes, alignment, resumeFrom} = options;
+            const row = rpc("xref", {address:word(address), instructionReferences, limit, maxScanBytes, alignment,
+                start:start === undefined ? undefined : word(start), end:end === undefined ? undefined : word(end),
+                resumeFrom:resumeFrom === undefined ? undefined : word(resumeFrom)});
+            const result = {kind:row.kind, scannedBytes:row.scanned_bytes,
+                nextAddress:row.next_address === null ? null : BigInt(row.next_address), warnings:row.warnings};
+            if (row.kind === "pointer_value") {
+                return {...result, matches:row.matches.map(value => BigInt(value)), uncapturedBytes:row.uncaptured_bytes};
+            }
+            return {...result, matches:row.matches.map(match => ({instruction:BigInt(match.instruction),
+                kind:match.kind, mnemonic:match.mnemonic, function:match.function ?? null,
+                sourceLine:match.source_line ?? null}))};
+        },
         search(pattern, startRange, endRange) {
             const needle = typeof pattern === "string" ? utf8(pattern) : pattern;
             if (!(needle instanceof Uint8Array) || !needle.length || needle.length > 65536) throw new TypeError("invalid search pattern");
@@ -265,7 +333,66 @@
         if (!["none","r","w","x","rw","rx","wx","rwx"].includes(prot)) throw new TypeError("invalid memory protection");
         return prot;
     };
-    function makeThread(tid, controlled = false) {
+    function stopEvent(row) {
+        if (row.address != null) row.address = BigInt(row.address);
+        if (row.faultAddress != null) row.faultAddress = BigInt(row.faultAddress);
+        else delete row.faultAddress;
+        if (row.length != null) {
+            if (row.before != null) row.before = immediateWatch(row.length, row.before);
+            else delete row.before;
+            if (row.after != null) row.after = immediateWatch(row.length, row.after);
+            else delete row.after;
+            if (row.access == null) delete row.access;
+        }
+        return Object.freeze(row);
+    }
+
+    function waitEvent(options, callback) {
+        let args = options;
+        if (callback?.active) {
+            if (options.kind !== "hit") {
+                throw new Error("finish the current callback before waiting for another stop");
+            }
+            args = {...options, handoff:callback.token, handoffTid:callback.tid,
+                pass:callback.pass, counts:callback.counts};
+        }
+        const id = rpc("eventWait", args);
+        if (callback?.active) callback.active = false;
+        return new Promise((resolve, reject) => eventWaiters.set(id, {resolve, reject}));
+    }
+
+    function ask(payload, timeoutMs, tid) {
+        if (payload == null || typeof payload !== "object") throw new TypeError("ask requires a JSON object or array");
+        if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 86400000)) {
+            throw new RangeError("invalid timeoutMs");
+        }
+        const handler = rpc("ask", {payload:parse(jsonText(payload)), timeoutMs, tid});
+        return new Promise((resolve, reject) => inputs.set(handler,{resolve,reject}));
+    }
+
+    function scope(tid) {
+        if (tid === undefined || tid === "all") return undefined;
+        if (!Number.isSafeInteger(tid) || tid <= 0 || tid > 0x7fffffff) throw new RangeError("invalid thread ID");
+        return tid;
+    }
+
+    async function continueForStop(tid = "all", options = {}) {
+        const {until:predicate, timeoutMs = 180000} = options;
+        if (predicate !== undefined && typeof predicate !== "function") throw new TypeError("expected a stop predicate");
+        scope(tid);
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 86400000) throw new RangeError("invalid timeoutMs");
+        const deadline = rpc("clock") + timeoutMs;
+        while (true) {
+            const event = await waitEvent({kind:"stop", tid:scope(tid), resume:true,
+                timeoutMs:Math.max(0,deadline-rpc("clock"))}, callbackContext);
+            if (predicate === undefined || ["exit","ended","timeout"].includes(event.kind)) return event;
+            if (event.paused && predicate(event) === true) return event;
+            if (event.paused) rpc("continue", {tid:event.tid});
+            if (rpc("clock") >= deadline) return Object.freeze({kind:"timeout"});
+        }
+    }
+
+    function makeThread(tid, controlled = false, callback) {
         const generation = rpc("generation");
         let identity;
         try { identity = rpc("identity", {tid}); } catch (_) {}
@@ -276,6 +403,10 @@
         };
         const check = () => { if (!exists()) throw new Error("thread no longer exists"); };
         const access = (name, fields = {}) => { check(); return rpc(name, {...fields, tid}); };
+        const control = (name, fields = {}) => {
+            if (callback && !callback.active) throw new Error("the callback no longer controls this stop");
+            return access(name,fields);
+        };
         const proxy = full => new Proxy(Object.create(null), {
             get(_, name) { return registers(access("registers", {full}))[name]; },
             set(_, name, value) { access("writeRegisters", {values:{[name]:encodeRegister(value)}}); return true; },
@@ -300,19 +431,33 @@
             },
             backtrace(limit) { return Object.freeze(access("backtrace", {limit}).map(frame)); },
             locals() { return access("locals").map(variable); },
+            async waitThreadStop(timeoutMs) {
+                return waitEvent({kind:"stop",tid,timeoutMs}, callback?.active ? callback : callbackContext);
+            },
+            async waitThreadExit(timeoutMs) {
+                return waitEvent({kind:"thread_exit",tid,timeoutMs}, callback?.active ? callback : callbackContext);
+            },
+            async ask(payload, timeoutMs) {
+                check();
+                return ask(payload,timeoutMs,tid);
+            },
             injectSyscall(id, ...args) { return access("syscall", {number:word(id), args:args.map(bits)}).map(BigInt); },
         };
         if (controlled) Object.assign(thread, {
-            async step(count) { access("step", {mode:"step", count}); },
-            async next(count) { access("step", {mode:"next", count}); },
-            async nextBranch(count) { access("step", {mode:"branch", count}); },
-            async nextCall(count, follow) { access("step", {mode:"call", count, follow}); },
-            async finish() { access("step", {mode:"finish"}); },
-            async until(at) { access("step", {mode:"until", at:word(at)}); },
-            recordBranch(allReg) { access("recordBranch", {allReg}); },
-            async allocate(size, prot = "rw") { return BigInt(access("allocate", {size, prot:protection(prot)})); },
-            async free(address, size) { access("free", {address:word(address), size}); },
-            async protect(address, size, prot) { access("protect", {address:word(address), size, prot:protection(prot)}); },
+            async nextHit(timeoutMs) {
+                check();
+                return waitEvent({kind:"hit",tid,timeoutMs,resume:true,fresh:true},callback);
+            },
+            async step(count) { control("step", {mode:"step", count}); },
+            async next(count) { control("step", {mode:"next", count}); },
+            async nextBranch(count) { control("step", {mode:"branch", count}); },
+            async nextCall(count, follow) { control("step", {mode:"call", count, follow}); },
+            async finish() { control("step", {mode:"finish"}); },
+            async until(at) { control("step", {mode:"until", at:word(at)}); },
+            recordBranch(allReg) { control("recordBranch", {allReg}); },
+            async allocate(size, prot = "rw") { return BigInt(control("allocate", {size, prot:protection(prot)})); },
+            async free(address, size) { control("free", {address:word(address), size}); },
+            async protect(address, size, prot) { control("protect", {address:word(address), size, prot:protection(prot)}); },
         });
         return Object.freeze(thread);
     }
@@ -320,7 +465,7 @@
         : value instanceof Uint8Array ? Array.from(value) : value;
 
     function install(type, at, callback, options = {}) {
-        if (typeof callback !== "function") throw new TypeError("expected breakpoint callback");
+        if (callback != null && typeof callback !== "function") throw new TypeError("expected breakpoint callback");
         const generation = rpc("generation");
         const id = ++nextPoint;
         const address = BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...options}));
@@ -348,10 +493,20 @@
     }
 
     const symbol = row => Object.freeze({...row, address:BigInt(row.address), module:optional(row.module)});
+    const processIo = Object.freeze({
+        stdin:Object.freeze({
+            write:data => rpc("stdio",{operation:"write",data}),
+            close:() => {rpc("stdio",{operation:"close"});},
+        }),
+        stdout:Object.freeze({read:() => rpc("stdio",{operation:"stdout"})}),
+        stderr:Object.freeze({read:() => rpc("stdio",{operation:"stderr"})}),
+        combinedOutErr:Object.freeze({read:() => rpc("stdio",{operation:"combined"})}),
+    });
     const dbg = Object.freeze({
         get arch() { return arch; },
         endian:"le",
         get pid() { return rpc("pid"); },
+        process:processIo,
         memory,
         thread:tid => makeThread(tid),
         threads:() => Object.freeze(rpc("threads").map(tid => makeThread(tid))),
@@ -361,7 +516,12 @@
             const threads = rpc("pause", {tid}).map(tid => makeThread(tid, true));
             return tid === "all" ? threads : threads[0];
         },
-        async continue(tid) { rpc("continue", {tid}); },
+        async resume(tid = "all") { rpc("continue", {tid:scope(tid) ?? "all"}); },
+        async continue(tid = "all") { return dbg.resume(tid); },
+        continueForStop,
+        async waitExit(timeoutMs) { return waitEvent({kind:"process_exit",timeoutMs},callbackContext); },
+        async waitStops(limit, timeoutMs) { return waitEvent({kind:"batch",limit,timeoutMs},callbackContext); },
+        async ask(payload, timeoutMs) { return ask(payload,timeoutMs,callbackTid); },
         async detach() { rpc("detach"); },
         async kill(signal) { rpc("kill", {signal}); },
         async prepare() { rpc("prepare"); },
@@ -372,6 +532,11 @@
             if (callback == null) signals.delete(n);
             else signals.set(n, callback);
         },
+        lineToAddr(file,line) {
+            const result = rpc("lineToAddr",{file,line});
+            return result == null ? null : BigInt(result);
+        },
+        addrToLine(address) { return rpc("addrToLine",{address:word(address)}); },
         async getSymbol(name) {
             const rows = rpc("symbols", {pattern:name});
             return rows.length ? symbol(rows[0]) : null;
@@ -421,24 +586,30 @@
         },
     });
 
-    async function dispatch(tid, events) {
+    async function dispatch(tid, token, events) {
         const generation = rpc("generation");
-        let pause = null, pass = true;
-        const thread = makeThread(tid, true);
+        const context = {tid,token,active:true,pause:null,pass:true,counts:{}};
+        const thread = makeThread(tid, true, context);
+        const check = () => {
+            if (!context.active || rpc("generation") !== generation) throw new Error("the callback no longer controls this stop");
+        };
         try {
             for (const event of parse(events)) {
-                if (rpc("generation") !== generation) return;
+                if (!context.active || rpc("generation") !== generation) return;
                 let result;
+                const previousContext = callbackContext, previousTid = callbackTid;
+                callbackContext = context;
                 callbackTid = tid;
                 try {
-                    if (event.id !== undefined) {
-                        const installed = points.get(event.id);
+                    if (event.breakpointId !== undefined) {
+                        const installed = points.get(event.breakpointId);
                         if (!installed) continue;
+                        context.counts[event.sequence] = ++installed.count;
                         const hit = {
-                            thread, breakpoint:installed.point, hitCount:++installed.count,
-                            pause() { pause = true; },
-                            continue() { pause = false; },
-                            preventOtherBreakpointOnThisThread() { rpc("preventOtherStops", {tid}); },
+                            thread, breakpoint:installed.point, hitCount:installed.count,
+                            pause() { check(); context.pause = true; },
+                            continue() { check(); context.pause = false; },
+                            preventOtherBreakpointOnThisThread() { check(); rpc("preventOtherStops", {tid}); },
                         };
                         if (event.length != null) {
                             hit.length = event.length;
@@ -446,24 +617,34 @@
                             if (event.after != null) hit.after = immediateWatch(event.length, event.after);
                             if (event.access != null) hit.access = event.access;
                         }
-                        result = installed.point.callback(Object.freeze(hit));
+                        const callback = installed.point.callback;
+                        if (callback == null) context.pause = true;
+                        else result = callback(Object.freeze(hit));
                     } else {
-                        const callback = signals.get(event.number);
+                        const callback = signals.get(event.signalNumber);
                         if (!callback) continue;
                         result = callback(Object.freeze({
-                            thread, signalNumber:event.number, signalName:event.name,
-                            faultAddress:event.fault == null ? undefined : BigInt(event.fault),
-                            passToTarget(value) { pass = !!value; },
-                            removeThisHandler() { if (signals.get(event.number) === callback) dbg.onSignal(event.number, null); },
+                            thread, signalNumber:event.signalNumber, signalName:event.signalName,
+                            faultAddress:event.faultAddress == null ? undefined : BigInt(event.faultAddress),
+                            passToTarget(value) { check(); context.pass = !!value; },
+                            removeThisHandler() {
+                                if (signals.get(event.signalNumber) === callback) dbg.onSignal(event.signalNumber, null);
+                            },
                         }));
                     }
-                } finally { callbackTid = undefined; }
+                } finally {
+                    callbackTid = previousTid;
+                    callbackContext = previousContext;
+                }
                 await result;
             }
         } catch (error) {
-            if (rpc("generation") === generation) rpc("log", {id:0, value:{kind:"callback_error",error:error instanceof Error && error.name === "Error" ? error.message : String(error)}});
+            if (rpc("generation") === generation) reportError(error);
         } finally {
-            rpc("callbackDone", {generation, tid, pause, pass});
+            if (context.active) {
+                context.active = false;
+                rpc("callbackDone", {generation,tid,token,pause:context.pause,pass:context.pass,counts:context.counts});
+            }
         }
     }
 
@@ -883,9 +1064,24 @@
                         : undefined;
                 },
             });
-            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgConsole:makeConsole})) {
+            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgConsole:makeConsole,setTimeout,clearTimeout,queueMicrotask,sleep,AbortController})) {
                 Object.defineProperty(globalThis,name,{value});
             }
+        },
+        fireTimer(id) {
+            const timer = timers.get(id);
+            if (!timer) return;
+            timers.delete(id);
+            queueMicrotask(timer.callback);
+        },
+        eventResult(id, data) {
+            const entry = eventWaiters.get(id);
+            if (!entry) return;
+            eventWaiters.delete(id);
+            const result = parse(data);
+            if (result.kind === "stops") {
+                entry.resolve(Object.freeze({...result,events:Object.freeze(result.events.map(stopEvent))}));
+            } else entry.resolve(stopEvent(result));
         },
         input(handler, ok, text) {
             const entry = inputs.get(handler);
@@ -897,6 +1093,10 @@
         dispatch,
         publish(namespace, keys) { for (const key of parse(keys)) exports[key] = namespace; },
         reset() {
+            for (const timer of timers.values()) timer.cancel?.();
+            timers.clear();
+            for (const waiter of eventWaiters.values()) waiter.reject(new Error("target changed"));
+            eventWaiters.clear();
             points.clear();
             signals.clear();
             for (const key of Object.keys(exports)) delete exports[key];

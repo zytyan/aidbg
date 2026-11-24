@@ -331,6 +331,13 @@ export interface Thread {
     backtrace(limit?: number): readonly StackFrame[];
     /** 获取当前位置的局部变量（若有 DWARF 信息） */
     locals(): Variable[];
+
+    /** 消费该线程最早的停点事件。仅观察，不恢复线程。默认等待 180 秒。 */
+    waitThreadStop(timeoutMs?: number): Promise<WaitResult<StopEvent>>;
+    /** 消费该线程的退出事件。默认等待 180 秒。 */
+    waitThreadExit(timeoutMs?: number): Promise<WaitResult<ExitEvent>>;
+    /** 在 MCP 回包中请求 LLM 回复。携带本线程 TID，不消费停点。 */
+    ask(payload: object, timeoutMs?: number): Promise<string>;
 }
 
 export interface ControlledThread extends Thread {
@@ -338,6 +345,9 @@ export interface ControlledThread extends Thread {
     /** 走到下 n 个分支指令时断住 */
     nextBranch(n?: number): Promise<void>;
     nextCall(n?: number, followCall?: boolean): Promise<void>;
+    /** 先登记等待，再恢复本线程。只匹配恢复后的断点或观察点，默认 180 秒。 */
+    nextHit(timeoutMs?: number): Promise<WaitResult<BreakpointStop | ExitEvent>>;
+
     step(n?: number): Promise<void>;
     /** 走到 ret 指令后断住 */
     finish(): Promise<void>;
@@ -357,6 +367,52 @@ export interface ControlledThread extends Thread {
 // ============================================================================
 // 核心类型：MemoryView
 // ============================================================================
+
+interface XrefScanOptions {
+    /** 最多返回 1–256 条结果，默认 64。 */
+    limit?: number;
+    maxScanBytes?: number;
+}
+
+export interface PointerXrefOptions extends XrefScanOptions {
+    instructionReferences?: false;
+    start?: bigint;
+    end?: bigint;
+    /** 候选地址的字节对齐，默认 8，须为不超过 4096 的 2 的幂。 */
+    alignment?: number;
+}
+
+export interface InstructionXrefOptions extends XrefScanOptions {
+    instructionReferences: true;
+    /** 同一可执行映射内的指令区间，至多 64 KiB。start 必须是指令边界。 */
+    start: bigint;
+    end: bigint;
+    /** 继续扫描时保留原 start 和 end，将 nextAddress 传给 resumeFrom。 */
+    resumeFrom?: bigint;
+}
+
+interface XrefScanResult {
+    scannedBytes: number;
+    nextAddress: bigint | null;
+    warnings: { code: string; message: string; hint: string | null }[];
+}
+
+export interface PointerXrefResult extends XrefScanResult {
+    kind: "pointer_value";
+    matches: bigint[];
+    uncapturedBytes: number;
+}
+
+export interface InstructionXrefResult extends XrefScanResult {
+    kind: "instruction_reference";
+    matches: {
+        instruction: bigint;
+        kind: "branch_target" | "pc_relative" | "address" | "read" | "write";
+        mnemonic: string | null;
+        function: string | null;
+        sourceLine: { file: string; line: number | null; column: number | null; source: string | null } | null;
+    }[];
+}
 
 export interface MemoryView {
     // 1. 标量读取（同步操作，底层直调 process_vm_readv）
@@ -413,6 +469,11 @@ export interface MemoryView {
         startRange: bigint,
         endRange: bigint
     ): bigint[];
+    /** 查找存储目标地址的 64 位小端指针。分页时将 nextAddress 传为 start。 */
+    xref(address: bigint, options?: PointerXrefOptions): PointerXrefResult;
+    /** 在指定代码区间查找直接分支、PC 相对引用和可解析的地址引用。 */
+    xref(address: bigint, options: InstructionXrefOptions): InstructionXrefResult;
+    xref(address: bigint, options: PointerXrefOptions | InstructionXrefOptions): PointerXrefResult | InstructionXrefResult;
 }
 /**  */
 interface WatchpointOptions {
@@ -429,7 +490,11 @@ export interface Debugger {
     detach(): Promise<void>;
     /** 默认信号为 SIGINT */
     kill(signal?: number): Promise<void>;
-
+    /** 消费进程退出事件。正常退出或信号退出都作为结果返回。 */
+    waitExit(timeoutMs?: number): Promise<WaitResult<ExitEvent>>;
+    /** 在 MCP 回包中携带 payload 和 handler，等待 send_input 提供字符串。默认 180 秒。 */
+    ask(payload: object, timeoutMs?: number): Promise<string>;
+    readonly process: Process;
     readonly arch: Arch;
     readonly endian: Endian;
     readonly pid: number;
@@ -456,22 +521,22 @@ export interface Debugger {
     /** 暂停预算暂时有意不加 */
     hardwareBreakpoint(
         at: bigint | string,
-        cb: BreakpointCallback,
+        cb?: BreakpointCallback | null,
         tid?: number
     ): Breakpoint;
     softwareBreakpoint(
         at: bigint | string,
-        cb: BreakpointCallback,
+        cb?: BreakpointCallback | null,
         tid?: number
     ): Breakpoint;
     hardwareWatchpoint(
         at: bigint | string,
-        cb: WatchpointCallback,
+        cb: WatchpointCallback | null,
         opt: WatchpointOptions
     ): Breakpoint;
     softwareWatchpoint(
         at: bigint | string,
-        cb: WatchpointCallback,
+        cb: WatchpointCallback | null,
         opt: WatchpointOptions
     ): Breakpoint;
 
@@ -491,11 +556,89 @@ export interface Debugger {
 
     pause(tid: number): Promise<ControlledThread>;
     pause(tid: "all"): Promise<ControlledThread[]>;
-    continue(tid: number | "all"): Promise<void>;
-
+    /** 立即恢复指定范围，默认 "all"。 */
+    resume(tid?: number | "all"): Promise<void>;
+    /** resume 的同义词。立即返回，不消费停点。 */
+    continue(tid?: number | "all"): Promise<void>;
+    /** 先取最早匹配的排队事件。没有时先登记等待，再恢复指定范围。 */
+    continueForStop(tid?: number | "all", options?: ContinueOptions): Promise<WaitResult<StopEvent>>;
+    /** 等待并消费一批已排队的停点，不恢复线程。默认最多 16 条。 */
+    waitStops(limit?: number, timeoutMs?: number): Promise<WaitResult<StopBatch | ExitEvent>>;
     iterDwarfTypes(pattern: RegExp): AsyncIterableIterator<Type.Base<unknown>>;
     getDwarfTypes(name: string): AsyncIterableIterator<Type.Base<unknown>>;
 
+    /** 返回唯一匹配的运行时地址。无匹配或存在多个地址时返回 null。 */
+    lineToAddr(file: string, line: number): bigint | null;
+    addrToLine(addr: bigint): { file: string; line: number } | null;
+}
+
+export type WaitResult<T> = T | { readonly kind: "timeout" } | { readonly kind: "ended" };
+
+export interface ContinueOptions {
+    /** 默认 180 秒。超时不改变目标状态。 */
+    timeoutMs?: number;
+    /** 只在仍暂停的停点调用。返回 false 时释放该停点并继续等待。 */
+    until?: (stop: StoppedEvent) => boolean;
+}
+
+export interface StopBatch {
+    readonly kind: "stops";
+    readonly events: readonly StoppedEvent[];
+}
+
+interface EventLocation {
+    readonly sequence: number;
+    readonly tid: number;
+    /** 此事件交付时线程是否仍由调试器暂停。 */
+    readonly paused: boolean;
+}
+
+export type BreakpointStop = EventLocation & {
+    readonly kind: "breakpoint" | "watchpoint";
+    readonly breakpointId: number;
+    readonly address: bigint;
+    readonly hitCount?: number;
+    readonly length?: number;
+    readonly access?: "read" | "write";
+    readonly before?: Value.Base;
+    readonly after?: Value.Base;
+};
+
+export type StoppedEvent =
+    | BreakpointStop
+    | (EventLocation & { readonly kind: "step"; readonly address: bigint })
+    | (EventLocation & {
+        readonly kind: "signal";
+        readonly signalNumber: number;
+        readonly signalName: string;
+        readonly faultAddress?: bigint;
+    });
+
+export type StopEvent = StoppedEvent | ExitEvent;
+
+export interface ProcessOutput {
+    readonly text: string;
+    readonly eof: boolean;
+    readonly truncated: boolean;
+}
+
+export interface Readable {
+    read(): ProcessOutput;
+}
+
+export interface Writable {
+    /** 非阻塞写入，返回本次写入的 UTF-8 字节数。 */
+    write(data: string): number;
+    close(): void;
+}
+
+/** 仅适用于 run 启动的进程。每个读取端与 MCP 输出各自保存游标。 */
+export interface Process {
+    readonly stdin: Writable;
+    readonly stdout: Readable;
+    readonly stderr: Readable;
+    /** 按调试器收到两个管道输出的顺序合并。 */
+    readonly combinedOutErr: Readable;
 }
 
 // ============================================================================
@@ -527,12 +670,12 @@ export interface HexdumpOptions {
 }
 
 export interface Console {
-    /** console.log 非常符合直觉 */
+    /** 同步写入会话输出缓冲区，与 printf 使用相同的回包规则。 */
     log(...args: unknown[]): void;
-    /** 
-     * log与printf都是同步函数，但它们最终呈现给AI是异步的
-     * 立刻写入同步缓冲区，随下一次MCP调用返回。
-     * 缓冲区暂定1M，如果太大就循环丢弃并告警。
+    /**
+     * 同步写入会话输出缓冲区，由写入后第一个收集输出的 MCP 响应携带。
+     * 当前 script_run 尚未收集输出时，该响应即可带回这条日志。
+     * 输出缓冲区上限为 1 MiB，溢出时丢弃最旧的输出并报告截断。
      */
     printf(fmt: string, ...args: unknown[]): void;
     sprintf(fmt: string, ...args: unknown[]): string;
@@ -784,6 +927,26 @@ export interface TypeSystem {
     fromDwarf<const S extends string>(name: S & LiteralString<S>): any;
 }
 
+export type ExitEvent = {
+    readonly kind: "exit";
+    readonly sequence: number;
+    readonly scope: "thread" | "process";
+    readonly tid: number;
+} & (
+    | { readonly reason: "code"; readonly code: number }
+    | { readonly reason: "signal"; readonly signal: number }
+    | { readonly reason: "unknown" }
+);
+
+export interface ScriptError {
+    message: string;
+    stack?: string;
+    file?: string;
+    line?: number;
+    column?: number;
+    scriptId?: number;
+}
+
 // ============================================================================
 // 全局导出单例
 // ============================================================================
@@ -792,3 +955,19 @@ export declare const dbg: Debugger;
 export declare const m: TypeSystem;
 export declare const $: GlobalScope;
 export declare const console: Console;
+
+export declare function setTimeout(cb: () => void, ms?: number): number;
+export declare function clearTimeout(id: number): void;
+export declare function queueMicrotask(cb: () => void): void;
+export declare function sleep(ms: number, signal?: AbortSignal): Promise<void>;
+
+
+export interface AbortSignal {
+    readonly aborted: boolean;
+    readonly reason: unknown;
+}
+
+export declare class AbortController {
+    readonly signal: AbortSignal;
+    abort(reason?: unknown): void;
+}

@@ -162,7 +162,13 @@ fn reply(
     let inputs: Vec<_> = result
         .waiting_inputs
         .iter()
-        .map(|input| json!({"handler": input.handler, "tid":input.tid}))
+        .map(|input| {
+            let mut row = json!({"handler":input.handler,"tid":input.tid});
+            if let Ok(payload) = serde_json::from_slice::<Value>(&input.payload_json) {
+                row["payload"] = payload;
+            }
+            row
+        })
         .collect();
     let output: Vec<_> = result.script_output.iter().map(|entry| {
         json!({"script_id":entry.script_id, "value":serde_json::from_slice::<Value>(&entry.json).unwrap_or(Value::Null)})
@@ -170,7 +176,7 @@ fn reply(
     let mut prompts = Vec::new();
     if !result.paused_threads.is_empty() {
         prompts.push(
-            "Target threads are paused by the debugger. Inspect them or use dbg.continue(tid).",
+            "Target threads are paused by the debugger. Inspect them or use dbg.resume(tid).",
         );
     }
     if !inputs.is_empty() {
@@ -182,12 +188,26 @@ fn reply(
     if result.output_dropped {
         prompts.push("Older script output was dropped after the 1 MiB buffer filled.");
     }
+    let waiting_events =
+        serde_json::from_slice::<Value>(&result.waiting_events_json).unwrap_or_else(|_| json!([]));
+    let signals =
+        serde_json::from_slice::<Value>(&result.signals_json).unwrap_or_else(|_| json!([]));
+    if result.event_queue_full {
+        prompts.push(
+            "The target event queue is full. Consume queued events before waiting for fresh stops.",
+        );
+    }
     let document = json!({
         "result":serde_json::from_slice::<Value>(&result.result_json).unwrap_or(Value::Null),
         "error":result.error,
         "paused_threads":result.paused_threads,
         "waiting_inputs":inputs,
         "running_scripts":result.running_scripts,
+        "waiting_events":waiting_events,
+        "signals":signals,
+        "process_output":serde_json::from_slice::<Value>(&result.process_output_json).unwrap_or(Value::Null),
+        "pending_events":result.pending_events,
+        "event_queue_full":result.event_queue_full,
         "output":output,
         "output_dropped":result.output_dropped,
         "target_error":result.target_error,

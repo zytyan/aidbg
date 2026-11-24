@@ -1,6 +1,9 @@
+mod events;
 mod inferior;
 mod instruction;
 mod link;
+mod process_io;
+mod source_map;
 mod target;
 
 use self::target::{Event, Live, Target};
@@ -97,6 +100,7 @@ impl Drop for Worker {
 struct Waiting {
     tid: Option<i32>,
     deadline: Option<Instant>,
+    payload: Option<Value>,
 }
 
 struct State {
@@ -111,6 +115,13 @@ struct State {
     output_dropped: bool,
     target_error: Option<String>,
     signals: BTreeSet<i32>,
+    events: events::Queue,
+    dispatches: BTreeMap<i32, Vec<u64>>,
+    reported_signals: VecDeque<Value>,
+    started: Instant,
+    source_maps: BTreeMap<u64, source_map::SourceMap>,
+    timers: BTreeMap<u64, Instant>,
+    next_timer: u64,
 }
 
 impl State {
@@ -118,6 +129,11 @@ impl State {
         self.target = target;
         self.generation += 1;
         self.signals.clear();
+        self.events.reset();
+        self.dispatches.clear();
+        self.reported_signals.clear();
+        self.timers.clear();
+        self.source_maps.clear();
         self.target_error = None;
     }
 
@@ -139,9 +155,164 @@ impl State {
         self.output.push_back(ScriptOutput { script_id, json });
     }
 
+    fn complete_callback(
+        &mut self,
+        tid: i32,
+        token: u64,
+        pause: Option<bool>,
+        pass: bool,
+        counts: &Value,
+    ) {
+        let Some(sequences) = self
+            .dispatches
+            .get(&tid)
+            .filter(|sequences| sequences.first() == Some(&token))
+        else {
+            return;
+        };
+        let interested = sequences
+            .iter()
+            .any(|&sequence| self.events.interested(sequence));
+        let pause = pause.or(interested
+            .then_some(true)
+            .filter(|_| sequences.iter().any(|&seq| self.events.is_breakpoint(seq))));
+        let Some(Target::Live(live)) = &mut self.target else {
+            return;
+        };
+        live.finish_callback(tid, pause, pass);
+        let held = live.paused.contains(&tid);
+        for sequence in self.dispatches.remove(&tid).unwrap() {
+            live.track_stop(tid, sequence);
+            self.events
+                .complete(sequence, held, counts[sequence.to_string()].as_u64());
+        }
+    }
+
+    fn register_event(&mut self, args: Value) -> Result<Value> {
+        let request: events::Request = serde_json::from_value(args.clone())?;
+        self.target.as_mut().ok_or_else(no_target)?.live()?;
+        let (id, resume) = self.events.register(&request)?;
+        if let Some((tid, token)) = args["handoffTid"].as_i64().zip(args["handoff"].as_u64()) {
+            if self
+                .dispatches
+                .get(&(tid as i32))
+                .and_then(|values| values.first())
+                .copied()
+                != Some(token)
+            {
+                self.events.remove(id);
+                return Err(error("the callback no longer controls this stop"));
+            }
+            self.complete_callback(
+                tid as i32,
+                token,
+                Some(true),
+                args["pass"] != false,
+                &args["counts"],
+            );
+        }
+        if resume {
+            let live = self.target.as_mut().unwrap().live()?;
+            if let Err(err) = live.continue_threads(request.tid) {
+                self.events.remove(id);
+                return Err(err);
+            }
+        }
+        Ok(json!(id))
+    }
+
+    fn report_error(
+        &mut self,
+        id: Option<u64>,
+        kind: &str,
+        message: String,
+        stack: Option<String>,
+    ) {
+        let mut report = json!({"kind":kind,"error":message,"message":message});
+        let mut origin = None;
+        if let Some(stack) = stack {
+            let (stack, script, location) = source_map::remap(&stack, &self.source_maps);
+            origin = script;
+            report["stack"] = json!(stack);
+            if let Some(location) = location {
+                report["file"] = json!(location.file);
+                report["line"] = json!(location.line);
+                report["column"] = json!(location.column);
+            }
+        }
+        let id = id.or(origin);
+        if let Some(id) = id {
+            report["scriptId"] = json!(id);
+        }
+        self.log(id.unwrap_or_default(), report);
+    }
+
     fn operation(&mut self, op: &str, args: Value) -> Result<Value> {
         match op {
             "generation" => Ok(json!(self.generation)),
+            "clock" => Ok(json!(self.started.elapsed().as_millis() as u64)),
+            "reportError" => {
+                self.report_error(
+                    None,
+                    args["kind"].as_str().unwrap_or("callback_error"),
+                    args["message"]
+                        .as_str()
+                        .unwrap_or("script callback failed")
+                        .into(),
+                    args["stack"].as_str().map(str::to_owned),
+                );
+                Ok(Value::Null)
+            }
+            "setTimer" => {
+                if self.timers.len() >= 1024 {
+                    return Err(error("too many pending script timers"));
+                }
+                let ms = args["ms"]
+                    .as_u64()
+                    .filter(|&ms| ms <= 86_400_000)
+                    .ok_or_else(|| error("timer duration must be in 0..=86400000 milliseconds"))?;
+                self.next_timer += 1;
+                self.timers
+                    .insert(self.next_timer, Instant::now() + Duration::from_millis(ms));
+                Ok(json!(self.next_timer))
+            }
+            "clearTimer" => {
+                if let Some(id) = args["id"].as_u64() {
+                    self.timers.remove(&id);
+                }
+                Ok(Value::Null)
+            }
+            "eventWait" => self.register_event(args),
+            "ask" => {
+                if self.waiting.len() >= MAX_PENDING {
+                    return Err(error("too many waiting input handlers"));
+                }
+                let payload = &args["payload"];
+                if !payload.is_object() && !payload.is_array() {
+                    return Err(error("ask requires a JSON object or array"));
+                }
+                if payload.to_string().len() > 16 * 1024 {
+                    return Err(error("ask payload exceeds 16 KiB"));
+                }
+                let timeout = args["timeoutMs"]
+                    .as_u64()
+                    .unwrap_or(events::DEFAULT_TIMEOUT_MS);
+                if timeout > 86_400_000 {
+                    return Err(error("timeoutMs must be in 0..=86400000"));
+                }
+                let tid = args["tid"].as_i64().map(i32::try_from).transpose()?;
+                self.next_handler += 1;
+                let handler = format!("input-{}", self.next_handler);
+                self.waiting.insert(
+                    handler.clone(),
+                    Waiting {
+                        tid,
+                        payload: Some(payload.clone()),
+                        deadline: Some(Instant::now() + Duration::from_millis(timeout)),
+                    },
+                );
+                Ok(json!(handler))
+            }
             "signal" => {
                 self.target
                     .as_mut()
@@ -158,10 +329,16 @@ impl State {
             }
             "callbackDone" => {
                 if args["generation"].as_u64() == Some(self.generation)
-                    && let Some(Target::Live(live)) = &mut self.target
                     && let Some(tid) = args["tid"].as_i64().and_then(|tid| i32::try_from(tid).ok())
+                    && let Some(token) = args["token"].as_u64()
                 {
-                    live.finish_callback(tid, args["pause"].as_bool(), args["pass"] != false);
+                    self.complete_callback(
+                        tid,
+                        token,
+                        args["pause"].as_bool(),
+                        args["pass"] != false,
+                        &args["counts"],
+                    );
                 }
                 Ok(Value::Null)
             }
@@ -186,8 +363,14 @@ impl State {
                 let tid = args["tid"].as_i64().and_then(|tid| i32::try_from(tid).ok());
                 self.next_handler += 1;
                 let handler = format!("input-{}", self.next_handler);
-                self.waiting
-                    .insert(handler.clone(), Waiting { tid, deadline });
+                self.waiting.insert(
+                    handler.clone(),
+                    Waiting {
+                        tid,
+                        deadline,
+                        payload: None,
+                    },
+                );
                 Ok(json!(handler))
             }
             "detach" => {
@@ -228,12 +411,23 @@ impl State {
                 .map(|(handler, state)| WaitingInput {
                     handler: handler.clone(),
                     tid: state.tid,
+                    payload_json: state
+                        .payload
+                        .as_ref()
+                        .map_or_else(Vec::new, |events| events.to_string().into_bytes()),
                 })
                 .collect(),
             script_output: self.output.drain(..).collect(),
             output_dropped: std::mem::take(&mut self.output_dropped),
             running_scripts: pending.iter().map(|script| script.id).collect(),
             target_error: self.target_error.clone(),
+            waiting_events_json: json!(self.events.status()).to_string().into_bytes(),
+            signals_json: json!(self.reported_signals.drain(..).collect::<Vec<_>>())
+                .to_string()
+                .into_bytes(),
+            pending_events: self.events.len() as u32,
+            event_queue_full: self.events.len() >= events::QUEUE_LIMIT,
+            process_output_json: Vec::new(),
         }
     }
 }
@@ -334,6 +528,12 @@ declare const dbg: import("aidbg").Debugger;
 declare const m: import("aidbg").TypeSystem;
 declare const $: AidbgGlobals & import("aidbg").GlobalScope;
 declare const console: import("aidbg").Console;
+declare const setTimeout: typeof import("aidbg").setTimeout;
+declare const clearTimeout: typeof import("aidbg").clearTimeout;
+declare const queueMicrotask: typeof import("aidbg").queueMicrotask;
+declare const sleep: typeof import("aidbg").sleep;
+declare const AbortController: typeof import("aidbg").AbortController;
+type AbortSignal = import("aidbg").AbortSignal;
 "#
     )
 }
@@ -365,6 +565,13 @@ fn run(
         output_dropped: false,
         target_error: None,
         signals: BTreeSet::new(),
+        events: events::Queue::default(),
+        dispatches: BTreeMap::new(),
+        reported_signals: VecDeque::new(),
+        started: Instant::now(),
+        source_maps: BTreeMap::new(),
+        timers: BTreeMap::new(),
+        next_timer: 0,
     }));
     let mut compiler = Compiler::with_session_api(&declarations(), true);
     context.with(|ctx| {
@@ -391,6 +598,8 @@ fn run(
         let initialize: Function = api.get("initialize")?;
         initialize.call::<_, ()>((operation, regs::ARCH))?;
         let dispatch: Function = api.get("dispatch")?;
+        let event_result: Function = api.get("eventResult")?;
+        let fire_timer: Function = api.get("fireTimer")?;
         let input: Function = api.get("input")?;
         let publish: Function = api.get("publish")?;
         let reset: Function = api.get("reset")?;
@@ -398,6 +607,9 @@ fn run(
         while !cancelled.load(Ordering::Relaxed) {
             deadline.set(Instant::now() + SCRIPT_SLICE);
             tick(&state, &dispatch, &input, &ctx)?;
+            fire_timers(&state,&fire_timer)?;
+            pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
+            resolve_events(&state,&event_result)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
             let (command, reply) = match commands.recv_timeout(TICK) {
@@ -458,9 +670,13 @@ fn run(
                             }
                             Ok(rows.pop().unwrap().1)
                         })?;
-                        let Some((js,declarations)) = compiled else {
+                        let Some((js,declarations,map)) = compiled else {
                             return Ok(json!({"script_id":id,"status":"check_failed","diagnostics":diagnostics}));
                         };
+                        let mut current = state.borrow_mut();
+                        if current.source_maps.len()>=512 {current.source_maps.pop_first();}
+                        current.source_maps.insert(id,source_map::SourceMap::parse(&map)?);
+                        drop(current);
                         let js = format!("const console = globalThis.__aidbgConsole({id}, {generation});\n{js}");
                         deadline.set(Instant::now() + SCRIPT_SLICE);
                         let (module, promise) = Module::declare(ctx.clone(), format!("script-{id}.js"), js)
@@ -475,15 +691,37 @@ fn run(
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
             deadline.set(Instant::now() + SCRIPT_SLICE);
             tick(&state, &dispatch, &input, &ctx)?;
+            fire_timers(&state,&fire_timer)?;
+            pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
+            resolve_events(&state,&event_result)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
             if !reply.is_closed() {
                 let mut state = state.borrow_mut();
-                let message = state.tool_reply(result, &pending);
-                if let Err(message) = reply.send(message) {
-                    state.output_size = message.script_output.iter().map(|row|row.json.len()+16).sum();
-                    state.output = message.script_output.into();
-                    state.output_dropped = message.output_dropped;
+                let mut message = state.tool_reply(result, &pending);
+                let output_cursor = match state.target.as_ref() {
+                    Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
+                        let (value,cursor) = stdio.mcp_output();
+                        message.process_output_json = value.to_string().into_bytes();
+                        cursor
+                    }),
+                    _ => None,
+                };
+                match reply.send(message) {
+                    Ok(()) => {
+                        if let Some(cursor) = output_cursor
+                            && let Some(Target::Live(live)) = state.target.as_mut()
+                            && let Some(stdio) = &mut live.stdio
+                        {
+                            stdio.acknowledge(cursor);
+                        }
+                    }
+                    Err(message) => {
+                        state.output_size = message.script_output.iter().map(|row|row.json.len()+16).sum();
+                        state.output = message.script_output.into();
+                        state.output_dropped = message.output_dropped;
+                        state.reported_signals = serde_json::from_slice(&message.signals_json).unwrap_or_default();
+                    }
                 }
             }
         }
@@ -546,11 +784,25 @@ fn tick(
     }
     let events = {
         let mut state = state.borrow_mut();
+        let backpressure = state.events.len() >= events::QUEUE_LIMIT;
         let State {
             target, signals, ..
         } = &mut *state;
         if let Some(Target::Live(live)) = target {
-            let events = live.tick(signals);
+            let events = live.drain_io().and_then(|()| {
+                if backpressure {
+                    Ok(Vec::new())
+                } else {
+                    let events = live.tick(signals)?;
+                    if events
+                        .iter()
+                        .any(|event| matches!(event, Event::Exit { process: true, .. }))
+                    {
+                        live.drain_io()?;
+                    }
+                    Ok(events)
+                }
+            });
             for branch in live.take_branches() {
                 state.log(0, branch);
             }
@@ -559,8 +811,8 @@ fn tick(
             Ok(Vec::new())
         }
     };
-    let events = match events {
-        Ok(events) => events,
+    let rows = match events {
+        Ok(rows) => rows,
         Err(err) => {
             let mut state = state.borrow_mut();
             state.replace(None);
@@ -569,39 +821,140 @@ fn tick(
         }
     };
     let mut by_tid = BTreeMap::<i32, Vec<Value>>::new();
-    for event in events {
-        match event {
-            Event::Breakpoint { tid, id, watch } => {
-                let mut value = json!({"id":id});
-                if let Some(watch) = watch {
-                    value["length"] = json!(watch.length);
-                    value["before"] = json!(watch.before.map(crate::hex));
-                    value["after"] = json!(watch.after.map(crate::hex));
-                    value["access"] = json!(watch.access);
+    {
+        let mut state = state.borrow_mut();
+        let active = match &state.target {
+            Some(Target::Live(live)) => live.tids(),
+            _ => Vec::new(),
+        };
+        state.events.resurrect(active);
+        for event in rows {
+            match event {
+                Event::Breakpoint {
+                    tid,
+                    id,
+                    address,
+                    watch,
+                } => {
+                    let mut row = json!({"kind":if watch.is_some() {"watchpoint"} else {"breakpoint"},
+                        "tid":tid,"breakpointId":id,"address":crate::hex(address),"paused":true});
+                    if let Some(watch) = watch {
+                        row["length"] = json!(watch.length);
+                        row["before"] = json!(watch.before.map(crate::hex));
+                        row["after"] = json!(watch.after.map(crate::hex));
+                        row["access"] = json!(watch.access);
+                    }
+                    row["sequence"] = json!(state.events.push(row.clone(), false));
+                    by_tid.entry(tid).or_default().push(row);
                 }
-                by_tid.entry(tid).or_default().push(value);
-            }
-            Event::Signal { tid, number, fault } => {
-                let name = nix::sys::signal::Signal::try_from(number)
-                    .map_or_else(|_| format!("SIG{number}"), |s| s.to_string());
-                by_tid
-                    .entry(tid)
-                    .or_default()
-                    .push(json!({"number":number,"name":name,"fault":fault.map(crate::hex)}));
+                Event::Signal {
+                    tid,
+                    number,
+                    fault,
+                    callback,
+                } => {
+                    let name = nix::sys::signal::Signal::try_from(number)
+                        .map_or_else(|_| format!("SIG{number}"), |s| s.to_string());
+                    let paused = matches!(&state.target,Some(Target::Live(live)) if live.paused.contains(&tid));
+                    let mut row = json!({"kind":"signal","tid":tid,"signalNumber":number,"signalName":name,
+                        "faultAddress":fault.map(crate::hex),"paused":paused});
+                    let sequence = state.events.push(row.clone(), !callback);
+                    if !callback && let Some(Target::Live(live)) = &mut state.target {
+                        live.track_stop(tid, sequence);
+                    }
+                    row["sequence"] = json!(sequence);
+                    state.reported_signals.push_back(row.clone());
+                    if callback {
+                        by_tid.entry(tid).or_default().push(row);
+                    }
+                }
+                Event::Exit {
+                    tid,
+                    process,
+                    result,
+                } => {
+                    let mut row = json!({"kind":"exit","tid":tid,"scope":if process {"process"} else {"thread"}});
+                    match result {
+                        Some(crate::trace::LaunchExit::Code(code)) => {
+                            row["reason"] = json!("code");
+                            row["code"] = json!(code);
+                        }
+                        Some(crate::trace::LaunchExit::Signal(signal)) => {
+                            row["reason"] = json!("signal");
+                            row["signal"] = json!(signal);
+                        }
+                        None => {
+                            row["reason"] = json!("unknown");
+                        }
+                    }
+                    state.events.push(row, true);
+                    if let Some(sequences) = state.dispatches.remove(&tid) {
+                        for sequence in sequences {
+                            state.events.complete(sequence, false, None);
+                        }
+                    }
+                }
+                Event::Step { tid, address } => {
+                    let sequence=state.events.push(json!({"kind":"step","tid":tid,"address":crate::hex(address),"paused":true}),true);
+                    if let Some(Target::Live(live)) = &mut state.target {
+                        live.track_stop(tid, sequence);
+                    }
+                }
             }
         }
     }
-    for (tid, events) in by_tid {
+    for (tid, rows) in by_tid {
+        let sequences: Vec<_> = rows
+            .iter()
+            .map(|row| row["sequence"].as_u64().unwrap())
+            .collect();
+        let token = sequences[0];
+        state.borrow_mut().dispatches.insert(tid, sequences);
         if let Err(err) = dispatch
-            .call::<_, ()>((tid, json!(events).to_string()))
+            .call::<_, ()>((tid, token, json!(rows).to_string()))
             .catch(ctx)
         {
             let mut state = state.borrow_mut();
             state.log(0, json!({"kind":"callback_error","error":err.to_string()}));
-            if let Some(Target::Live(live)) = &mut state.target {
-                live.finish_callback(tid, None, true);
-            }
+            state.complete_callback(tid, token, None, true, &Value::Null);
         }
+    }
+    Ok(())
+}
+
+fn fire_timers(state: &RefCell<State>, fire: &Function<'_>) -> Result<()> {
+    let expired = {
+        let mut state = state.borrow_mut();
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        state.timers.retain(|&id, &mut deadline| {
+            if deadline <= now {
+                expired.push((deadline, id));
+                false
+            } else {
+                true
+            }
+        });
+        expired.sort_unstable();
+        expired
+    };
+    for (_, id) in expired {
+        fire.call::<_, ()>((id,))?;
+    }
+    Ok(())
+}
+
+fn resolve_events(state: &RefCell<State>, function: &Function<'_>) -> Result<()> {
+    let results = {
+        let mut state = state.borrow_mut();
+        let State { events, target, .. } = &mut *state;
+        events.poll(
+            Instant::now(),
+            |tid,sequence| matches!(target.as_ref(),Some(Target::Live(live)) if live.holds_stop(tid,sequence)),
+        )
+    };
+    for (id, result) in results {
+        function.call::<_, ()>((id, result.to_string()))?;
     }
     Ok(())
 }
@@ -623,13 +976,11 @@ fn pump<'js>(
         let Some(result) = script.promise.result::<JsValue>() else {
             return script.generation == generation;
         };
-        let result = result
-            .catch(ctx)
-            .map_err(|err| error(exception_text(ctx, err)))
-            .and_then(|_| {
-                if script.generation != generation {
-                    return Ok(());
-                }
+        if script.generation != generation {
+            return false;
+        }
+        let result = match result.catch(ctx) {
+            Ok(_) => (|| -> Result<()> {
                 let namespace = script.module.namespace()?;
                 let keys = namespace
                     .keys::<String>()
@@ -637,13 +988,31 @@ fn pump<'js>(
                 exports.merge(script.id, keys.clone(), script.declarations.clone())?;
                 publish.call::<_, ()>((namespace, json!(keys).to_string()))?;
                 Ok(())
-            });
-        let event = match result {
-            Ok(()) => json!({"kind":"script_complete"}),
-            Err(err) => json!({"kind":"script_error","error":err.to_string()}),
+            })(),
+            Err(err) => {
+                let stack = match &err {
+                    rquickjs::CaughtError::Exception(exception) => exception.stack(),
+                    _ => None,
+                };
+                state.borrow_mut().report_error(
+                    Some(script.id),
+                    "script_error",
+                    exception_text(ctx, err),
+                    stack,
+                );
+                return false;
+            }
         };
-        if script.generation == generation {
-            state.borrow_mut().log(script.id, event);
+        match result {
+            Ok(()) => state
+                .borrow_mut()
+                .log(script.id, json!({"kind":"script_complete"})),
+            Err(err) => state.borrow_mut().report_error(
+                Some(script.id),
+                "script_error",
+                err.to_string(),
+                None,
+            ),
         }
         false
     });

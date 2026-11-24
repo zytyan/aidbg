@@ -50,6 +50,7 @@ message SessionProfileRequest {
 message WaitingInput {
   string handler = 1;
   optional int32 tid = 2;
+  bytes payload_json = 3;
 }
 message ScriptOutput {
   uint64 script_id = 1;
@@ -64,4 +65,9 @@ message ToolReply {
   bool output_dropped = 6;
   repeated uint64 running_scripts = 7;
   optional string target_error = 8;
+  bytes waiting_events_json = 9;
+  bytes signals_json = 10;
+  uint32 pending_events = 11;
+  bool event_queue_full = 12;
+  bytes process_output_json = 13;
 }

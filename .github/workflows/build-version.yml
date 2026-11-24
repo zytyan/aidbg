@@ -44,8 +44,8 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          gcc -O0 -g -gdwarf-4 tests/session_fixture.c -o "$RUNNER_TEMP/gcc-fixture"
-          clang -O0 -g -gdwarf-5 tests/session_fixture.c -o "$RUNNER_TEMP/clang-fixture"
+          gcc -O0 -g -gdwarf-4 -pthread tests/session_fixture.c -o "$RUNNER_TEMP/gcc-fixture"
+          clang -O0 -g -gdwarf-5 -pthread tests/session_fixture.c -o "$RUNNER_TEMP/clang-fixture"
           gcc -O0 -fno-pic -c tests/session_link.c -o "$RUNNER_TEMP/link.o"
           python3 tests/session.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
             "$RUNNER_TEMP/gcc-fixture" "$RUNNER_TEMP/clang-fixture" --object "$RUNNER_TEMP/link.o"

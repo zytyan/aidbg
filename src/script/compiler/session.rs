@@ -324,7 +324,7 @@ impl Compiler {
         globals: &str,
         id: u64,
         lookup: impl Fn(&str) -> Result<Graph>,
-    ) -> Result<(Vec<Diagnostic>, Option<(String, String)>)> {
+    ) -> Result<(Vec<Diagnostic>, Option<(String, String, String)>)> {
         let base = Source::new(source);
         let input = base.edit(vec![Edit {
             start: source.len(),
@@ -350,7 +350,10 @@ impl Compiler {
         let declarations = self.emit_declarations()?;
         self.load(&input.text, globals)?;
         let js = self.emit()?;
-        Ok((diagnostics, Some((js, declarations))))
+        Ok((
+            diagnostics,
+            Some((js, declarations, self.emit_source_map()?)),
+        ))
     }
 
     fn context_edits(

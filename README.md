@@ -30,7 +30,7 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | `perf` | 传入 `pid`，选择 `hotspot` 或 `stack`。可选 `tid`、`duration_ms`、`frequency_hz`。 |
 | `ps` | 查看服务端进程。 |
 
-工具响应里的 `paused_threads`、`waiting_inputs` 和 `running_scripts` 是当前会话状态。异步断点回调可以等待输入。脚本输出缓存在服务端，随工具响应返回。live 和 core 使用同一套 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。
+工具响应里的 `paused_threads`、`waiting_inputs` 和 `running_scripts` 是当前会话状态。异步断点回调可以等待输入。脚本输出缓存在服务端，随工具响应返回。`run` 启动的进程也会在回包的 `process_output` 中返回新增 stdout 和 stderr。live 和 core 使用同一套 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。
 
 ## TypeScript
 
@@ -47,6 +47,8 @@ export const breakpoint = dbg.softwareBreakpoint("main", async hit => {
 });
 await dbg.continue("all");
 ```
+
+`dbg.resume()` 和 `dbg.continue()` 恢复后立即返回。`dbg.continueForStop()` 会取出一个排队的停点或恢复并等待，`dbg.waitStops()` 可以批量取出停点。脚本可用 `dbg.ask({ stop })` 将现场放进工具回包，等待 `send_input` 写回字符串。消费停点和回复输入都不自动恢复线程。
 
 `dbg.coredump` 将压缩 core 写到服务端路径。使用 `core_open` 可以重新打开它。TypeScript 中地址与寄存器为 `bigint`，MCP JSON 中的地址与寄存器使用十六进制字符串。
 

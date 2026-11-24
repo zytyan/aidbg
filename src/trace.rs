@@ -149,6 +149,7 @@ pub struct Trace {
     monitored: bool,
     launched: bool,
     pub(crate) exit: Option<LaunchExit>,
+    pub(crate) retired: Option<Vec<(i32, Option<LaunchExit>)>>,
     patches: BTreeMap<u64, Patch>,
     pub foreign_software: bool,
     _same_thread: PhantomData<Rc<()>>,
@@ -205,6 +206,7 @@ impl Trace {
             monitored: false,
             launched: false,
             exit: None,
+            retired: None,
             patches: BTreeMap::new(),
             foreign_software: false,
             _same_thread: PhantomData,
@@ -407,10 +409,17 @@ impl Trace {
         let mut exited = Vec::new();
         let mut failure = None;
         for (&tid, thread) in &mut self.threads {
-            if thread.stop.is_some() {
+            if thread.stop.is_some() && self.retired.is_none() {
                 continue;
             }
-            let status = wait_for_task(tid, self.launched);
+            let status = wait_for_task(tid, self.launched || self.retired.is_some());
+            // SIGKILL can retire a task even while it is held in a ptrace stop.
+            if matches!(
+                status,
+                Ok(Wait::Named(WaitStatus::StillAlive)) | Err(Errno::EINTR)
+            ) {
+                continue;
+            }
             thread.stop = match status {
                 Ok(Wait::Named(WaitStatus::PtraceEvent(_, sig, libc::PTRACE_EVENT_STOP))) => Some(
                     if sig == Signal::SIGTRAP || (self.launched && thread.newborn) {
@@ -493,22 +502,27 @@ impl Trace {
                     status @ (Wait::Named(WaitStatus::Exited(..) | WaitStatus::Signaled(..))
                     | Wait::Terminated(_)),
                 ) => {
-                    if self.launched && tid == self.pid.as_raw() {
-                        self.exit = match status {
-                            Wait::Named(WaitStatus::Exited(_, code)) => {
-                                Some(LaunchExit::Code(code))
-                            }
-                            Wait::Named(WaitStatus::Signaled(_, signal, _)) => {
-                                Some(LaunchExit::Signal(signal as i32))
-                            }
-                            Wait::Terminated(signal) => Some(LaunchExit::Signal(signal)),
-                            _ => unreachable!(),
-                        };
+                    let outcome = match status {
+                        Wait::Named(WaitStatus::Exited(_, code)) => LaunchExit::Code(code),
+                        Wait::Named(WaitStatus::Signaled(_, signal, _)) => {
+                            LaunchExit::Signal(signal as i32)
+                        }
+                        Wait::Terminated(signal) => LaunchExit::Signal(signal),
+                        _ => unreachable!(),
+                    };
+                    if (self.launched || self.retired.is_some()) && tid == self.pid.as_raw() {
+                        self.exit = Some(outcome);
+                    }
+                    if let Some(retired) = &mut self.retired {
+                        retired.push((tid, Some(outcome)));
                     }
                     exited.push(tid);
                     None
                 }
                 Err(Errno::ECHILD | Errno::ESRCH) if !task_path(&self.root, tid).is_dir() => {
+                    if let Some(retired) = &mut self.retired {
+                        retired.push((tid, None));
+                    }
                     exited.push(tid);
                     None
                 }

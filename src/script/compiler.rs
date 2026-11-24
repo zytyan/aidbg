@@ -108,7 +108,7 @@ impl Compiler {
                 "compilerOptions": {
                     "target": "ES2020", "module": "ES2022", "strict": true,
                     "noLib": true, "types": [], "skipLibCheck": true,
-                    "noEmitOnError": !session_api, "declaration": session_api, "disableSizeLimit": true
+                    "noEmitOnError": !session_api, "sourceMap": session_api, "declaration": session_api, "disableSizeLimit": true
                 },
                 "files": roots,
             })
@@ -297,6 +297,10 @@ impl Compiler {
 
     pub(super) fn emit(&self) -> Result<String> {
         self.emit_output(1, OUTPUT)
+    }
+
+    pub(super) fn emit_source_map(&self) -> Result<String> {
+        self.emit_output(1, "/aidbg/script.js.map")
     }
 
     pub(super) fn emit_declarations(&self) -> Result<String> {

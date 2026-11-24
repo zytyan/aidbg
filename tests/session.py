@@ -101,6 +101,21 @@ def validate_types_and_input(client):
         console.log(Tree.$size, Node.$size, nested.$size);
     """)
     assert logs(result) == [[16, 16, 16]], result
+    assert logs(client.script("export default function main() { console.log('unexpected'); } console.log('top');")) == [["top"]]
+    reply = client.script("""
+        const abort = new AbortController();
+        setTimeout(() => abort.abort("cancelled"), 1);
+        queueMicrotask(() => console.log("microtask"));
+        try { await sleep(1000, abort.signal); } catch (reason) { console.log(reason); }
+    """)
+    timing = logs(reply)
+    if reply["running_scripts"]:
+        timing += logs(await_state(client, lambda row: not row["running_scripts"]))
+    assert timing == [["microtask"],["cancelled"]], reply
+    thrown = client.tool("script_run", src="const label: string = 'mapped';\nthrow new Error(label);")
+    error = next(row["value"] for row in thrown["output"] if row["value"]["kind"] == "script_error")
+    assert error["message"] == "mapped" and error["line"] == 2 and error["file"].endswith(".ts"), error
+    assert ".ts:2" in error["stack"], error
     reply = client.script("console.log(await console.waitInput());")
     assert len(reply["running_scripts"]) == 1 and len(reply["waiting_inputs"]) == 1, reply
     handler = reply["waiting_inputs"][0]["handler"]
@@ -119,6 +134,26 @@ def validate_types_and_input(client):
     assert logs(reply) == [["input timed out"]], reply
 
 
+def validate_xref(client):
+    reply = client.script("""
+        const nodes = (await dbg.getSymbol("nodes"))!;
+        const target = dbg.memory.readPointer(nodes.address);
+        const pointers = dbg.memory.xref(target, {start:nodes.address, end:nodes.address+8n});
+        console.log(pointers.kind, pointers.matches.length === 1 && pointers.matches[0] === nodes.address);
+        const main = (await dbg.getSymbol("main"))!;
+        const stop = (await dbg.getSymbol("fixture_stop"))!;
+        const options = {instructionReferences:true as const, start:main.address,
+                         end:main.address+BigInt(main.size!), limit:1};
+        const page = dbg.memory.xref(stop.address, options);
+        const next = dbg.memory.xref(stop.address, {...options,resumeFrom:page.nextAddress!});
+        const first = page.matches[0], second = next.matches[0];
+        console.log(page.kind, first.kind, first.function, first.sourceLine?.line !== undefined,
+                    first.instruction < second.instruction, next.nextAddress);
+    """)
+    assert logs(reply) == [["pointer_value", True],
+                           ["instruction_reference", "branch_target", "main", True, True, None]], reply
+
+
 def validate_debugging(client, fixture, directory, object_file, owned):
     reply = client.tool("run", path=fixture, arg=[])
     pid = reply["result"]["pid"]
@@ -133,6 +168,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
         console.log(names);
     """)
     assert logs(symbols) == [[["fixture_sum"]]], symbols
+    validate_xref(client)
     client.script('m.fromDwarf("NoSuchType")', invalid=True)
     client.script('m.fromDwarf("Packet").at(1n).noSuchMember', invalid=True)
     reply = client.script("""
@@ -226,6 +262,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
     reply = client.tool("core_open", path=dump, executable=fixture)
     assert not reply["paused_threads"] and reply["result"]["dwarf_available"], reply
     assert client.tool("snapshot")["result"]["threads"][0]["tid"] == pid
+    validate_xref(client)
     reply = client.script("""
         const packet = m.fromDwarf("Packet").at((await dbg.getSymbol("packet"))!.address);
         console.log(packet.length.$read(), packet.flag.$read(),
@@ -235,6 +272,116 @@ def validate_debugging(client, fixture, directory, object_file, owned):
     """)
     assert logs(reply) == [[8, 6, 29], [True], ["NotSupport"]], reply
     os.kill(pid, signal.SIGKILL)
+    owned.remove(pid)
+
+
+def validate_event_queue(client, fixture, owned):
+    result = client.tool("run", path=fixture, arg=["events"])
+    pid = result["result"]["pid"]
+    owned.add(pid)
+    reply = client.script("""
+        const addr = (await dbg.getSymbol("fixture_stop"))!.address;
+        const line = dbg.addrToLine(addr)!;
+        const roundtrip = dbg.lineToAddr(line.file,line.line);
+        if (typeof roundtrip === "bigint") console.log(dbg.addrToLine(roundtrip)?.line === line.line);
+        dbg.softwareBreakpoint(addr);
+        await dbg.continue("all");
+        console.log("resumed");
+    """)
+    assert logs(reply)[-1] == ["resumed"] and not reply["waiting_events"], reply
+    reply = await_state(client, lambda row: row["pending_events"] >= 2 and len(row["paused_threads"]) == 2)
+    assert pid not in reply["paused_threads"], reply
+    first = client.script("""
+        const first = await dbg.continueForStop("all", {timeoutMs:1000});
+        if (first.kind !== "breakpoint") throw new Error(first.kind);
+        const answer = await dbg.thread(first.tid).ask({event:first, note:"inspect"});
+        console.log(first.tid, answer);
+    """)
+    assert first["pending_events"] == 1 and len(first["waiting_inputs"]) == 1, first
+    handler = first["waiting_inputs"][0]
+    assert handler["payload"]["note"] == "inspect"
+    event = handler["payload"]["event"]
+    assert event["kind"] == "breakpoint" and event["paused"] is True, event
+    assert handler["tid"] == event["tid"], handler
+    second = client.script("""
+        const batch = await dbg.waitStops(16,1000);
+        if (batch.kind !== "stops") throw new Error(batch.kind);
+        console.log(batch.events.map(e => [e.tid,e.sequence]));
+        console.log((await dbg.waitStops(16,1)).kind);
+    """)
+    if len(logs(second)) < 2:
+        tail = await_state(client, lambda row: not row["waiting_events"])
+        second["output"] += tail["output"]
+    assert len(logs(second)[0][0]) == 1 and logs(second)[1] == ["timeout"], second
+    assert logs(second)[0][0][0][0] != event["tid"], second
+    assert logs(second)[0][0][0][1] > event["sequence"], second
+    answer = client.tool("send_input", handler=handler["handler"], data="release")
+    assert logs(answer) == [[event["tid"],"release"]] and len(answer["paused_threads"]) == 2, answer
+    resumed = client.script('await dbg.resume("all");')
+    chunks = [resumed]
+    deadline = time.monotonic() + 5
+    while not any("enter data" in row["process_output"]["stdout"] for row in chunks):
+        assert time.monotonic() < deadline, chunks
+        chunks.append(client.tool("ps"))
+        time.sleep(.02)
+    assert any("stderr ready" in row["process_output"]["stderr"] for row in chunks), chunks
+    assert any(sig["signalName"] == "SIGUSR1" for row in chunks for sig in row["signals"]), chunks
+    output = client.script(r"""
+        console.log(dbg.process.stdout.read().text, dbg.process.stderr.read().text);
+        console.log(dbg.process.stdin.write("answer\n"));
+        dbg.process.stdin.close();
+        const exit = await dbg.waitExit();
+        if (exit.kind !== "exit" || exit.reason !== "code") throw new Error(exit.kind);
+        console.log(exit.code);
+        console.log((await dbg.waitExit(1)).kind);
+    """)
+    if not any(row == ["ended"] for row in logs(output)):
+        tail = await_state(client, lambda row: not row["waiting_events"] and not row["running_scripts"])
+        output["output"] += tail["output"]
+    assert logs(output) == [["enter data\n","stderr ready\n"],[7],[37],["ended"]], output
+    owned.remove(pid)
+
+    result = client.tool("run", path="/bin/sh", arg=["-c", "exit 29"])
+    pid = result["result"]["pid"]
+    owned.add(pid)
+    result = client.script("""
+        const stop = await dbg.continueForStop("all", {until: () => false});
+        if (stop.kind !== "exit" || stop.reason !== "code" || stop.scope !== "process") throw new Error(stop.kind);
+        console.log(stop.code);
+    """)
+    if not logs(result):
+        tail = await_state(client, lambda row: not row["waiting_events"] and not row["running_scripts"])
+        result["output"] += tail["output"]
+    assert logs(result) == [[29]], result
+    owned.remove(pid)
+
+
+def validate_next_hit(client, fixture, owned):
+    target = client.tool("run", path=fixture, arg=[])
+    pid = target["result"]["pid"]
+    owned.add(pid)
+    reply = client.script("""
+        dbg.softwareBreakpoint("fixture_stop", async hit => {
+            if (hit.hitCount !== 1) return;
+            const result = await hit.thread.nextHit(3000);
+            if (result.kind !== "breakpoint") throw new Error(result.kind);
+            console.log(result.hitCount,result.paused);
+        });
+        await dbg.continue();
+    """)
+    if not logs(reply):
+        reply = await_state(client, lambda row: bool(logs(row)))
+    assert logs(reply) == [[2,True]], reply
+    assert reply["paused_threads"] == [pid], reply
+    reply = client.script("""
+        await dbg.kill(9);
+        const result = await dbg.waitExit(3000);
+        if (result.kind !== "exit" || result.reason !== "signal") throw new Error(result.kind);
+        console.log(result.signal);
+    """)
+    if not logs(reply):
+        reply = await_state(client, lambda row: bool(logs(row)))
+    assert logs(reply) == [[9]] and not reply["paused_threads"], reply
     owned.remove(pid)
 
 
@@ -294,6 +441,8 @@ def main():
                 token = "integration-session-" + os.urandom(16).hex()
                 client = Client(client_exe, socket, token)
                 validate_types_and_input(client)
+                validate_event_queue(client, fixtures[0], owned)
+                validate_next_hit(client, fixtures[0], owned)
                 for fixture in fixtures:
                     validate_debugging(client, fixture, directory, object_file, owned)
                     print("validated", Path(fixture).name, flush=True)

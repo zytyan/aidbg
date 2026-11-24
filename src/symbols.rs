@@ -804,7 +804,7 @@ fn source_path(
     Ok(path)
 }
 
-fn source_addresses(
+pub(crate) fn source_addresses(
     obj: &object::File<'_>,
     wanted: &Path,
     line: u64,

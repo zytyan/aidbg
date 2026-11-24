@@ -207,6 +207,43 @@ impl Target {
         Some(Image::Shared(image, instance))
     }
 
+    pub(crate) fn script_line_address(&self, file: &Path, line: u64) -> Result<Option<u64>> {
+        use std::collections::BTreeSet;
+        let mut statements = BTreeSet::new();
+        let mut declarations = BTreeSet::new();
+        let mut collect = |image: Image<'_>| -> Result<()> {
+            let primary = object::File::parse(image.bytes())?;
+            let debug = image.debug(self).and_then(DebugFile::parse);
+            let (rows, functions) =
+                symbols::source_addresses(debug.as_ref().unwrap_or(&primary), file, line)?;
+            statements.extend(rows.into_iter().filter_map(|link| image.runtime(link)));
+            declarations.extend(functions.into_iter().filter_map(|link| image.runtime(link)));
+            Ok(())
+        };
+        if let Some(image) = &self.image {
+            collect(Image::Main(image))?;
+        }
+        let main = self
+            .entry
+            .and_then(|entry| self.mapped_file(entry).map(|(module, _)| module));
+        for module in &self.file_modules {
+            if self.image.is_some() && main.is_some_and(|main| std::ptr::eq(main, module)) {
+                continue;
+            }
+            if let Some(image) = self.shared_image(module) {
+                for &instance in &image.layout.instances {
+                    collect(Image::Shared(image.clone(), instance))?;
+                }
+            }
+        }
+        let matched = if statements.is_empty() {
+            declarations
+        } else {
+            statements
+        };
+        Ok((matched.len() == 1).then(|| *matched.first().unwrap()))
+    }
+
     pub(crate) fn script_symbols(
         &self,
         mut cursor: symbols::script_page::Cursor,

@@ -12,7 +12,7 @@ binaries="${CARGO_TARGET_DIR:-target}/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/
 fixtures=$(mktemp -d)
 trap 'rm -rf -- "$fixtures"' EXIT
 
-flags=(-Wall -Wextra -Werror -g -O0 -fno-omit-frame-pointer)
+flags=(-Wall -Wextra -Werror -g -O0 -fno-omit-frame-pointer -pthread)
 "${CC:-gcc}" "${flags[@]}" -gdwarf-4 tests/session_fixture.c -o "$fixtures/gcc-fixture"
 "${CC:-gcc}" -O0 -fno-pic -c tests/session_link.c -o "$fixtures/link.o"
 targets=("$fixtures/gcc-fixture")
