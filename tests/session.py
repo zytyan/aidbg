@@ -257,7 +257,8 @@ def validate_debugging(client, fixture, directory, object_file, owned):
     reply = client.tool("send_input", handler=reply["waiting_inputs"][0]["handler"], data="keep paused")
     assert reply["paused_threads"] == [pid], reply
     dump = str(directory / ("target-" + Path(fixture).name + ".zst"))
-    client.script(f'dbg.coredump({json.dumps(dump)}, "standard");')
+    # Instruction xref needs captured code bytes across all pages of main.
+    client.script(f'dbg.coredump({json.dumps(dump)}, "full");')
     assert Path(dump).is_file()
     reply = client.tool("core_open", path=dump, executable=fixture)
     assert not reply["paused_threads"] and reply["result"]["dwarf_available"], reply
