@@ -1,11 +1,15 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::ffi::c_void;
 
 const MAX_COPY: usize = 256 * 1024;
 const MAX_EVENTS: usize = 512;
 const MEM_READ: c_int = 16;
 const MEM_WRITE: c_int = 17;
+const PROT_READ: u32 = 1;
+const PROT_WRITE: u32 = 2;
+const PROT_EXEC: u32 = 4;
 
 struct Engine(Handle);
 
@@ -40,10 +44,13 @@ impl Engine {
         Ok(value)
     }
 
-    fn map_bytes(&self, page: &Range<u64>, address: u64, bytes: &[u8], perms: u32) -> Result<()> {
+    fn map(&self, address: u64, size: u64, perms: u32) -> Result<()> {
         self.check("Unicorn map", unsafe {
-            uc_mem_map(self.0, page.start, page.end - page.start, perms)
-        })?;
+            uc_mem_map(self.0, address, size, perms)
+        })
+    }
+
+    fn write(&self, address: u64, bytes: &[u8]) -> Result<()> {
         self.check("Unicorn initialize memory", unsafe {
             uc_mem_write(self.0, address, bytes.as_ptr().cast(), bytes.len() as u64)
         })
@@ -424,27 +431,45 @@ pub fn emulate(request: rpc::EmulateRequest) -> Result<Report> {
         return Err(error("Unicorn reported invalid page size"));
     }
     let code_pages = pages(&code_range, page)?;
-    engine.map_bytes(&code_pages, address, &code, 5)?;
-    let mut mapped = vec![code_pages];
+    let mut mappings: BTreeMap<_, _> = code_pages
+        .step_by(page as usize)
+        .map(|start| (start, PROT_READ | PROT_EXEC))
+        .collect();
     for copy in &memory {
         let window = range(copy.address, copy.contents.len() as u64)?;
-        let page_range = pages(&window, page)?;
-        if mapped.iter().any(|other| intersects(other, &page_range)) {
-            return Err(error(
-                "copied code and memory regions must occupy disjoint emulator pages",
-            ));
+        if intersects(&code_range, &window)
+            || hooks
+                .copy
+                .iter()
+                .any(|other| intersects(&other.window, &window))
+        {
+            return Err(error("copied code and memory byte ranges must not overlap"));
         }
-        engine.map_bytes(
-            &page_range,
-            copy.address,
-            &copy.contents,
-            if copy.writable { 3 } else { 1 },
-        )?;
-        mapped.push(page_range);
+        let perms = PROT_READ | if copy.writable { PROT_WRITE } else { 0 };
+        // ELF code and read-only data can share a page. Hooks still enforce
+        // the exact copied ranges for instruction fetches and data accesses.
+        for start in pages(&window, page)?.step_by(page as usize) {
+            match mappings.entry(start) {
+                Entry::Vacant(entry) => {
+                    entry.insert(perms);
+                }
+                Entry::Occupied(entry) if (entry.get() | perms) & PROT_WRITE != 0 => {
+                    return Err(error("writable copies must occupy disjoint emulator pages"));
+                }
+                Entry::Occupied(_) => {}
+            }
+        }
         hooks.copy.push(Memory {
             window,
             writable: copy.writable,
         });
+    }
+    for (start, perms) in mappings {
+        engine.map(start, page, perms)?;
+    }
+    engine.write(address, &code)?;
+    for copy in &memory {
+        engine.write(copy.address, &copy.contents)?;
     }
     for (name, value) in &requested {
         if name != pc {

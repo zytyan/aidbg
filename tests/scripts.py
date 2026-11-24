@@ -106,8 +106,8 @@ def tests(tool, target, no_dwarf):
             source = source.replace(PREFIX, known_frame, 1).replace("{frame}", "{frame: frame}")
         return source
 
-    def check(source, target_id=target):
-        return tool("script_check", source=with_known_frame(source), target_id=target_id)
+    def check(source):
+        return tool("script_check", source=with_known_frame(source), target_id=target)
 
     def diagnostic(source, code, excerpt=None):
         source = with_known_frame(source)
@@ -137,7 +137,7 @@ def tests(tool, target, no_dwarf):
     assert result["status"] == "complete" and result["expressions"][0]["code"] == "DYNAMIC_EXPRESSION", result
     diagnostic(PREFIX + "dbg.printVal(123, {frame});", "2345", "123")
     diagnostic(PREFIX + print_val("::g_Dta->foo[10].bar->baz"), "UNKNOWN_GLOBAL", "::g_Dta")
-    result = check(PREFIX + print_val(VALID), no_dwarf)
+    result = tool("script_check", target_id=no_dwarf, source=frame_prefix(tool, no_dwarf) + print_val(VALID))
     assert result["status"] == "complete" and result["expressions"][0]["code"] == "NO_DWARF", result
 
     diagnostic(PREFIX + print_val(r"g_Data->foo[10].bar->b\u007Aa"), "UNKNOWN_MEMBER", r"b\u007Aa")

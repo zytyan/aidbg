@@ -12,6 +12,7 @@ jobs:
   linux:
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -29,6 +30,7 @@ jobs:
           python3 -m pip --disable-pip-version-check install --target "$RUNNER_TEMP/zig" ziglang==0.15.2
           echo "$RUNNER_TEMP/zig/ziglang" >> "$GITHUB_PATH"
       - name: Build release binaries
+        id: build
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -46,12 +48,14 @@ jobs:
           python3 tests/scripts.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
             "$RUNNER_TEMP/script-fixture" "$RUNNER_TEMP/script-wrong"
       - name: Verify retained core workflow without helper executables
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 5
         env:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          cc -O0 -g -fno-omit-frame-pointer -Wl,--build-id tests/debug-cases/cases/D01.c -pthread -o "$RUNNER_TEMP/D01"
+          # Exercise a copied instruction and read-only data on the same page.
+          cc -O0 -g -fno-omit-frame-pointer -Wl,--build-id,-z,noseparate-code tests/debug-cases/cases/D01.c -pthread -o "$RUNNER_TEMP/D01"
           cc -O0 -g -Wl,--build-id tests/run_target_fixture.c -pthread -o "$RUNNER_TEMP/run-target"
           python3 tests/core_workflow.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
             "$RUNNER_TEMP/D01" "$RUNNER_TEMP/run-target"
@@ -78,3 +82,24 @@ jobs:
           name: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}
           path: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
+
+  release:
+    needs: linux
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: aidbg-${{ github.ref_name }}-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            "dist/aidbg-$GITHUB_REF_NAME-linux-x86_64.tar.gz" \
+            "dist/aidbg-$GITHUB_REF_NAME-linux-aarch64.tar.gz"

@@ -101,7 +101,7 @@ def verify(tool, socket, fixture, waiting, work):
                      core_memory=[{"address": default_profile, "length": 4}])
     # The copied load writes the uint32 quota to its destination GP register.
     architecture = disassembled["architecture"]
-    assert simulated["status"] == "complete", simulated
+    assert simulated.get("status") == "complete", simulated
     dest = instruction["operands"].split(",")[0]
     dest = ("r" + dest[1:]) if architecture == "x86_64" else ("x" + dest[1:])
     assert simulated["registers"][dest] == "0x40", simulated
