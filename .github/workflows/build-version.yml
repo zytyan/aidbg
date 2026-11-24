@@ -30,6 +30,7 @@ jobs:
           python3 -m pip --disable-pip-version-check install --target "$RUNNER_TEMP/zig" ziglang==0.15.2
           echo "$RUNNER_TEMP/zig/ziglang" >> "$GITHUB_PATH"
       - name: Build release binaries
+        id: build
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -47,6 +48,7 @@ jobs:
           python3 tests/scripts.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
             "$RUNNER_TEMP/script-fixture" "$RUNNER_TEMP/script-wrong"
       - name: Verify retained core workflow without helper executables
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 5
         env:
           TARGET: ${{ matrix.target }}
