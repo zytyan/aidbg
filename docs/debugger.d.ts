@@ -300,7 +300,7 @@ export interface SignalHit {
     /** 导致崩溃的内存地址（从 siginfo_t 提取） */
     readonly faultAddress?: bigint;
 
-    /** 决定是否把信号转发给目标进程（拦截还是放行） */
+    /** 回调结束后放行并恢复线程，或丢弃信号并保持暂停。省略调用时保留待投递信号。 */
     passToTarget(pass: boolean): void;
     /** 取消本信号处理器 */
     removeThisHandler(): void;
@@ -313,6 +313,8 @@ export interface SignalHit {
 export interface Thread {
     readonly tid: number;
     readonly status: ThreadStatus;
+    /** 处理本线程待投递的信号。true 投递并恢复线程，false 丢弃信号并维持暂停。 */
+    passToTarget(pass: boolean): void;
 
     /**
      * 类似 gdb 的 print / inferior call，自动计算作用域；
@@ -512,7 +514,7 @@ export interface Debugger {
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
 
-    /** 无回调时收到信号的线程默认暂停。回调默认放行，也可通过 passToTarget(false) 拦截。 */
+    /** 回调必须明确调用 passToTarget 才会处理待投递信号。 */
     onSignal(signal: number | string, cb: SignalCallback | null): void;
 
     /** 获取单个符号（高频精准查找） */
@@ -613,6 +615,8 @@ export type StoppedEvent =
         readonly signalNumber: number;
         readonly signalName: string;
         readonly faultAddress?: bigint;
+        /** true 投递原信号并恢复线程，false 丢弃信号并保持暂停。只对仍待投递的信号有效。 */
+        passToTarget(pass: boolean): void;
     });
 
 export type StopEvent = StoppedEvent | ExitEvent;

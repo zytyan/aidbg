@@ -328,11 +328,16 @@ def validate_event_queue(client, fixture, owned):
     assert [(sig["signalName"], sig["paused"]) for sig in reported] == [("SIGUSR1", True)], chunks
     stop = client.script("""
         const hit = await dbg.continueForStop(dbg.pid, {until: () => false, timeoutMs:1000});
-        console.log(hit.kind, hit.kind === "signal" && hit.paused);
+        if (hit.kind !== "signal") throw new Error(hit.kind);
+        console.log(hit.kind, hit.paused);
+        const deliver = hit.passToTarget;
+        export function deliverPendingSignal() { deliver(true); }
     """)
     assert logs(stop) == [["signal", True]] and stop["paused_threads"] == [pid], stop
     assert not stop["signals"] and not stop["process_output"]["stdout"], stop
-    chunks.append(client.script("await dbg.resume();"))
+    held = client.script("await dbg.resume(); await dbg.continue(dbg.pid);")
+    assert held["paused_threads"] == [pid] and not held["signals"], held
+    chunks.append(client.script("$.deliverPendingSignal();"))
     while not any("enter data" in row["process_output"]["stdout"] for row in chunks):
         assert time.monotonic() < deadline, chunks
         chunks.append(client.tool("ps"))
@@ -374,7 +379,7 @@ def validate_next_hit(client, fixture, owned):
     pid = target["result"]["pid"]
     owned.add(pid)
     reply = client.script("""
-        dbg.onSignal("SIGUSR1", () => {});
+        dbg.onSignal("SIGUSR1", hit => hit.passToTarget(true));
         dbg.softwareBreakpoint("fixture_stop", async hit => {
             if (hit.hitCount !== 1) return;
             const result = await hit.thread.nextHit(3000);
@@ -410,19 +415,24 @@ def validate_fault_and_kill(client, fixture, owned):
     pid = result["result"]["pid"]
     owned.add(pid)
     hit = client.script("""
+        dbg.onSignal("SIGSEGV", hit => console.log("callback", hit.signalName));
         const stop = await dbg.continueForStop("all", {timeoutMs:3000});
         if (stop.kind !== "signal") throw new Error(stop.kind);
         console.log(stop.signalName, stop.paused, stop.faultAddress === 0n);
     """)
     reported = hit["signals"]
-    if not logs(hit):
-        hit = await_state(client, lambda row: bool(logs(row)))
-        reported += hit["signals"]
-    assert logs(hit) == [["SIGSEGV", True, True]] and hit["paused_threads"] == [pid], hit
+    if len(logs(hit)) < 2:
+        tail = await_state(client, lambda row: not row["running_scripts"])
+        tail["output"] = hit["output"] + tail["output"]
+        reported += tail["signals"]
+        hit = tail
+    assert logs(hit) == [["callback", "SIGSEGV"], ["SIGSEGV", True, True]] and hit["paused_threads"] == [pid], hit
     assert [(sig["signalName"], sig["paused"]) for sig in reported] == [("SIGSEGV", True)], hit
     time.sleep(.1)
     still = client.tool("ps")
     assert still["paused_threads"] == [pid] and not still["signals"] and still["pending_events"] == 0, still
+    suppressed = client.script("dbg.thread(dbg.pid).passToTarget(false);")
+    assert suppressed["paused_threads"] == [pid] and not suppressed["signals"], suppressed
     killed = client.script("await dbg.kill();")
     assert not killed["paused_threads"] and not killed["signals"], killed
     assert client.tool("snapshot", error=True)["error"], killed

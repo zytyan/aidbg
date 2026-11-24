@@ -334,6 +334,12 @@
         return prot;
     };
     function stopEvent(row) {
+        if (row.kind === "signal") {
+            const {tid, sequence} = row, generation = rpc("generation");
+            Object.defineProperty(row, "passToTarget", {
+                value(pass) { rpc("passSignal", {tid, sequence, generation, pass}); },
+            });
+        }
         if (row.address != null) row.address = BigInt(row.address);
         if (row.faultAddress != null) row.faultAddress = BigInt(row.faultAddress);
         else delete row.faultAddress;
@@ -352,6 +358,9 @@
         if (callback?.active) {
             if (options.kind !== "hit") {
                 throw new Error("finish the current callback before waiting for another stop");
+            }
+            if (callback.signal && callback.pass === undefined) {
+                throw new Error("call passToTarget before waiting for the next hit");
             }
             args = {...options, handoff:callback.token, handoffTid:callback.tid,
                 pass:callback.pass, counts:callback.counts};
@@ -437,6 +446,10 @@
             },
             async waitThreadExit(timeoutMs) {
                 return waitEvent({kind:"thread_exit",tid,timeoutMs}, callback?.active ? callback : callbackContext);
+            },
+            passToTarget(pass) {
+                check();
+                rpc("passSignal", {tid, generation, pass});
             },
             async ask(payload, timeoutMs) {
                 check();
@@ -589,7 +602,7 @@
 
     async function dispatch(tid, token, events) {
         const generation = rpc("generation");
-        const context = {tid,token,active:true,pause:null,pass:true,counts:{}};
+        const context = {tid,token,active:true,pause:null,signal:false,pass:undefined,counts:{}};
         const thread = makeThread(tid, true, context);
         const check = () => {
             if (!context.active || rpc("generation") !== generation) throw new Error("the callback no longer controls this stop");
@@ -622,12 +635,17 @@
                         if (callback == null) context.pause = true;
                         else result = callback(Object.freeze(hit));
                     } else {
+                        context.signal = true;
                         const callback = signals.get(event.signalNumber);
                         if (!callback) continue;
                         result = callback(Object.freeze({
                             thread, signalNumber:event.signalNumber, signalName:event.signalName,
                             faultAddress:event.faultAddress == null ? undefined : BigInt(event.faultAddress),
-                            passToTarget(value) { check(); context.pass = !!value; },
+                            passToTarget(value) {
+                                check();
+                                if (typeof value !== "boolean") throw new TypeError("expected a boolean signal decision");
+                                context.pass = value;
+                            },
                             removeThisHandler() {
                                 if (signals.get(event.signalNumber) === callback) dbg.onSignal(event.signalNumber, null);
                             },

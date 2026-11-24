@@ -176,7 +176,7 @@ fn reply(
     let mut prompts = Vec::new();
     if !result.paused_threads.is_empty() {
         prompts.push(
-            "Target threads are paused by the debugger. Inspect them or use dbg.resume(tid).",
+            "Target threads are paused by the debugger. Use dbg.resume(tid) to resume, or dbg.thread(tid).passToTarget(...) to handle a pending signal.",
         );
     }
     if !inputs.is_empty() {

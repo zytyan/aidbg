@@ -464,6 +464,35 @@ impl Live {
                 .is_some_and(|stops| stops.contains(&sequence))
     }
 
+    fn pending_signal(&self, tid: i32) -> bool {
+        matches!(
+            self.trace.threads.get(&tid).and_then(|thread| thread.stop),
+            Some(Stop::Delivery(_) | Stop::UnnamedDelivery(_))
+        )
+    }
+
+    pub(super) fn pass_signal(
+        &mut self,
+        tid: i32,
+        sequence: Option<u64>,
+        pass: bool,
+    ) -> Result<()> {
+        if !self.paused.contains(&tid)
+            || self.callbacks.contains(&tid)
+            || !self.pending_signal(tid)
+            || sequence.is_some_and(|sequence| !self.holds_stop(tid, sequence))
+        {
+            return Err(error("this signal stop is no longer pending"));
+        }
+        if pass {
+            self.resume(tid)?;
+            self.paused.remove(&tid);
+        } else {
+            self.trace.threads.get_mut(&tid).unwrap().stop = Some(Stop::Interrupt);
+        }
+        Ok(())
+    }
+
     fn resume(&mut self, tid: i32) -> Result<()> {
         let Some(thread) = self.trace.threads.get(&tid) else {
             return Err(error("thread no longer exists"));
@@ -532,12 +561,16 @@ impl Live {
             self.identity(tid)?;
         }
         for tid in self.original_tids(tid) {
-            if self.paused.contains(&tid) && !self.callbacks.contains(&tid) {
-                if self.traced(tid) {
-                    self.trace.stop_thread(tid, Instant::now() + DEADLINE)?;
-                } else {
-                    self.resume(tid)?;
-                }
+            if !self.paused.contains(&tid)
+                || self.callbacks.contains(&tid)
+                || self.pending_signal(tid)
+            {
+                continue;
+            }
+            if self.traced(tid) {
+                self.trace.stop_thread(tid, Instant::now() + DEADLINE)?;
+            } else {
+                self.resume(tid)?;
             }
             self.paused.remove(&tid);
         }
@@ -958,10 +991,19 @@ impl Live {
         std::mem::take(&mut self.branches)
     }
 
-    pub fn finish_callback(&mut self, tid: i32, pause: Option<bool>, pass: bool) {
+    pub fn finish_callback(&mut self, tid: i32, pause: Option<bool>, pass: Option<bool>) {
         self.callbacks.remove(&tid);
         self.suppress.remove(&tid);
         if let Some(thread) = self.trace.threads.get_mut(&tid) {
+            let signal = matches!(
+                thread.stop,
+                Some(Stop::Delivery(_) | Stop::UnnamedDelivery(_))
+            );
+            let pause = if signal && pass != Some(true) {
+                pause.or(Some(true))
+            } else {
+                pause
+            };
             match pause {
                 Some(true) => {
                     self.paused.insert(tid);
@@ -971,12 +1013,7 @@ impl Live {
                 }
                 None => {}
             }
-            if !pass
-                && matches!(
-                    thread.stop,
-                    Some(Stop::Delivery(_) | Stop::UnnamedDelivery(_))
-                )
-            {
+            if signal && pass == Some(false) {
                 thread.stop = Some(Stop::Interrupt);
             }
         }

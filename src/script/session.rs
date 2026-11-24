@@ -160,7 +160,7 @@ impl State {
         tid: i32,
         token: u64,
         pause: Option<bool>,
-        pass: bool,
+        pass: Option<bool>,
         counts: &Value,
     ) {
         let Some(sequences) = self
@@ -185,6 +185,13 @@ impl State {
             live.track_stop(tid, sequence);
             self.events
                 .complete(sequence, held, counts[sequence.to_string()].as_u64());
+            if let Some(report) = self
+                .reported_signals
+                .iter_mut()
+                .find(|row| row["sequence"] == sequence)
+            {
+                report["paused"] = json!(held);
+            }
         }
     }
 
@@ -203,11 +210,12 @@ impl State {
                 self.events.remove(id);
                 return Err(error("the callback no longer controls this stop"));
             }
+            let pass = args["pass"].as_bool();
             self.complete_callback(
                 tid as i32,
                 token,
-                Some(true),
-                args["pass"] != false,
+                Some(pass.is_none()),
+                pass,
                 &args["counts"],
             );
         }
@@ -336,10 +344,29 @@ impl State {
                         tid,
                         token,
                         args["pause"].as_bool(),
-                        args["pass"] != false,
+                        args["pass"].as_bool(),
                         &args["counts"],
                     );
                 }
+                Ok(Value::Null)
+            }
+            "passSignal" => {
+                if args["generation"].as_u64() != Some(self.generation) {
+                    return Err(error("this signal stop is no longer pending"));
+                }
+                let tid = args["tid"]
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| error("invalid thread ID"))?;
+                let sequence = serde_json::from_value(args["sequence"].clone())?;
+                let pass = args["pass"]
+                    .as_bool()
+                    .ok_or_else(|| error("expected a boolean signal decision"))?;
+                self.target
+                    .as_mut()
+                    .ok_or_else(no_target)?
+                    .live()?
+                    .pass_signal(tid, sequence, pass)?;
                 Ok(Value::Null)
             }
             "log" => {
@@ -868,9 +895,8 @@ fn tick(
                 } => {
                     let name = nix::sys::signal::Signal::try_from(number)
                         .map_or_else(|_| format!("SIG{number}"), |s| s.to_string());
-                    let paused = matches!(&state.target,Some(Target::Live(live)) if live.paused.contains(&tid));
                     let mut row = json!({"kind":"signal","tid":tid,"signalNumber":number,"signalName":name,
-                        "faultAddress":fault.map(crate::hex),"paused":paused});
+                        "faultAddress":fault.map(crate::hex),"paused":true});
                     let sequence = state.events.push(row.clone(), !callback);
                     if !callback && let Some(Target::Live(live)) = &mut state.target {
                         live.track_stop(tid, sequence);
@@ -929,7 +955,7 @@ fn tick(
         {
             let mut state = state.borrow_mut();
             state.log(0, json!({"kind":"callback_error","error":err.to_string()}));
-            state.complete_callback(tid, token, None, true, &Value::Null);
+            state.complete_callback(tid, token, None, None, &Value::Null);
         }
     }
     Ok(())
