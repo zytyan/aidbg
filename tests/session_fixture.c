@@ -67,6 +67,10 @@ static int event_fixture(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'e') return event_fixture();
+    if (argc > 1 && argv[1][0] == 'f') {
+        volatile uintptr_t inaccessible = 0;
+        return *(volatile int *)inaccessible;
+    }
     if (argc > 1 && argv[1][0] == 'a') {
         if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) < 0) return errno;
         puts("ready");

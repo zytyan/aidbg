@@ -386,6 +386,7 @@
             const event = await waitEvent({kind:"stop", tid:scope(tid), resume:true,
                 timeoutMs:Math.max(0,deadline-rpc("clock"))}, callbackContext);
             if (predicate === undefined || ["exit","ended","timeout"].includes(event.kind)) return event;
+            if (event.kind === "signal" && event.paused) return event;
             if (event.paused && predicate(event) === true) return event;
             if (event.paused) rpc("continue", {tid:event.tid});
             if (rpc("clock") >= deadline) return Object.freeze({kind:"timeout"});

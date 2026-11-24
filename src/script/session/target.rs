@@ -29,7 +29,10 @@ use std::{
     ffi::CString,
     fs::{self, File},
     io::{self, Write},
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -806,11 +809,8 @@ impl Live {
                     events.extend(new_events);
                     if callbacks {
                         self.callbacks.insert(tid);
-                        continue;
-                    }
-                    // Forward signal-delivery stops even for software-stepped threads.
-                    if !self.paused.contains(&tid) {
-                        self.resume(tid)?;
+                    } else {
+                        self.paused.insert(tid);
                     }
                     continue;
                 }
@@ -983,8 +983,33 @@ impl Live {
     }
 
     fn close(&mut self) -> Result<()> {
+        self.close_with_signal_delivery(true)
+    }
+
+    pub(super) fn kill_and_detach(&mut self, signal: i32) -> Result<()> {
+        self.verify()?;
+        let fd = Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) })?;
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        self.verify()?;
+        let cleanup = self.close_with_signal_delivery(false);
+        let delivery = Errno::result(unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        });
+        match delivery {
+            Ok(_) | Err(Errno::ESRCH) => cleanup,
+            Err(issue) => Err(issue.into()),
+        }
+    }
+
+    fn close_with_signal_delivery(&mut self, deliver_signals: bool) -> Result<()> {
         self.release_scratch();
-        let cleanup = self.trace.close();
+        let cleanup = self.trace.close_with_signal_delivery(deliver_signals);
         if self.launched {
             let pid = Pid::from_raw(self.pid);
             if self.trace.exit.is_none() {
@@ -1405,14 +1430,6 @@ impl Target {
             }
             "detach" => {
                 self.live()?.close()?;
-                Ok(Value::Null)
-            }
-            "kill" => {
-                let live = self.live()?;
-                live.verify()?;
-                let signal = args["signal"].as_i64().unwrap_or(libc::SIGINT as i64);
-                let signal = i32::try_from(signal)?;
-                Errno::result(unsafe { libc::kill(live.pid, signal) })?;
                 Ok(Value::Null)
             }
             "syscall" => {

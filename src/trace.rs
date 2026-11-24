@@ -881,12 +881,16 @@ impl Trace {
     }
 
     pub fn close(&mut self) -> Cleanup {
+        self.close_with_signal_delivery(true)
+    }
+
+    pub(crate) fn close_with_signal_delivery(&mut self, deliver_signals: bool) -> Cleanup {
         let before: Vec<_> = self.threads.keys().copied().collect();
         let mut cleanup = Cleanup::default();
         // Release threads already in a ptrace stop before waiting for any
         // uninterruptible thread. Detach forwards real signal-delivery stops.
         if !self.monitored {
-            self.detach_stopped(&mut cleanup);
+            self.detach_stopped(&mut cleanup, deliver_signals);
         }
         if !self.threads.is_empty() {
             let interrupt = self.request_stops().err();
@@ -904,7 +908,7 @@ impl Trace {
                     .map(|e| format!("restore software breakpoints: {e}"));
                 cleanup.software_restore_error = restore_error.or(cleanup.software_restore_error);
             }
-            self.detach_stopped(&mut cleanup);
+            self.detach_stopped(&mut cleanup, deliver_signals);
             self.patches.clear();
             for (tid, _) in std::mem::take(&mut self.threads) {
                 cleanup.threads.push(CleanupThread {
@@ -959,7 +963,7 @@ impl Trace {
         cleanup
     }
 
-    fn detach_stopped(&mut self, result: &mut Cleanup) {
+    fn detach_stopped(&mut self, result: &mut Cleanup, deliver_signals: bool) {
         let tids: Vec<_> = self
             .threads
             .iter()
@@ -972,8 +976,8 @@ impl Trace {
             };
             let stop = thread.stop.expect("selected stopped thread");
             let signal = match stop {
-                Stop::Delivery(sig) => Some(sig as i32),
-                Stop::UnnamedDelivery(sig) => Some(sig),
+                Stop::Delivery(sig) if deliver_signals => Some(sig as i32),
+                Stop::UnnamedDelivery(sig) if deliver_signals => Some(sig),
                 _ => None,
             };
             let rewind = if let Stop::Software { address, .. } = stop {

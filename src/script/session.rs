@@ -383,6 +383,19 @@ impl State {
                 self.replace(None);
                 Ok(Value::Null)
             }
+            "kill" => {
+                let signal = if args.get("signal").is_some() {
+                    signal_number(&args["signal"])?
+                } else {
+                    nix::libc::SIGKILL
+                };
+                let live = self.target.as_mut().ok_or_else(no_target)?.live()?;
+                let result = live.kill_and_detach(signal);
+                if live.trace.threads.is_empty() {
+                    self.replace(None);
+                }
+                result.map(|()| Value::Null)
+            }
             _ => self.target.as_mut().ok_or_else(no_target)?.operation(
                 op,
                 args,

@@ -321,12 +321,24 @@ def validate_event_queue(client, fixture, owned):
     resumed = client.script('await dbg.resume("all");')
     chunks = [resumed]
     deadline = time.monotonic() + 5
+    while not any(row["signals"] for row in chunks):
+        assert time.monotonic() < deadline, chunks
+        chunks.append(client.tool("ps"))
+    reported = [sig for row in chunks for sig in row["signals"]]
+    assert [(sig["signalName"], sig["paused"]) for sig in reported] == [("SIGUSR1", True)], chunks
+    stop = client.script("""
+        const hit = await dbg.continueForStop(dbg.pid, {until: () => false, timeoutMs:1000});
+        console.log(hit.kind, hit.kind === "signal" && hit.paused);
+    """)
+    assert logs(stop) == [["signal", True]] and stop["paused_threads"] == [pid], stop
+    assert not stop["signals"] and not stop["process_output"]["stdout"], stop
+    chunks.append(client.script("await dbg.resume();"))
     while not any("enter data" in row["process_output"]["stdout"] for row in chunks):
         assert time.monotonic() < deadline, chunks
         chunks.append(client.tool("ps"))
         time.sleep(.02)
     assert any("stderr ready" in row["process_output"]["stderr"] for row in chunks), chunks
-    assert any(sig["signalName"] == "SIGUSR1" for row in chunks for sig in row["signals"]), chunks
+    assert sum(len(row["signals"]) for row in chunks) == 1, chunks
     output = client.script(r"""
         console.log(dbg.process.stdout.read().text, dbg.process.stderr.read().text);
         console.log(dbg.process.stdin.write("answer\n"));
@@ -362,6 +374,7 @@ def validate_next_hit(client, fixture, owned):
     pid = target["result"]["pid"]
     owned.add(pid)
     reply = client.script("""
+        dbg.onSignal("SIGUSR1", () => {});
         dbg.softwareBreakpoint("fixture_stop", async hit => {
             if (hit.hitCount !== 1) return;
             const result = await hit.thread.nextHit(3000);
@@ -374,8 +387,14 @@ def validate_next_hit(client, fixture, owned):
         reply = await_state(client, lambda row: bool(logs(row)))
     assert logs(reply) == [[2,True]], reply
     assert reply["paused_threads"] == [pid], reply
+    observed = client.script("""
+        const stops = await dbg.waitStops(16,100);
+        if (stops.kind !== "stops") throw new Error(stops.kind);
+        console.log(stops.events.filter(e => e.kind === "signal").map(e => [e.signalName,e.paused]));
+    """)
+    assert logs(observed) == [[[["SIGUSR1", False]]]], observed
+    os.kill(pid, signal.SIGKILL)
     reply = client.script("""
-        await dbg.kill(9);
         const result = await dbg.waitExit(3000);
         if (result.kind !== "exit" || result.reason !== "signal") throw new Error(result.kind);
         console.log(result.signal);
@@ -384,6 +403,54 @@ def validate_next_hit(client, fixture, owned):
         reply = await_state(client, lambda row: bool(logs(row)))
     assert logs(reply) == [[9]] and not reply["paused_threads"], reply
     owned.remove(pid)
+
+
+def validate_fault_and_kill(client, fixture, owned):
+    result = client.tool("run", path=fixture, arg=["fault"])
+    pid = result["result"]["pid"]
+    owned.add(pid)
+    hit = client.script("""
+        const stop = await dbg.continueForStop("all", {timeoutMs:3000});
+        if (stop.kind !== "signal") throw new Error(stop.kind);
+        console.log(stop.signalName, stop.paused, stop.faultAddress === 0n);
+    """)
+    reported = hit["signals"]
+    if not logs(hit):
+        hit = await_state(client, lambda row: bool(logs(row)))
+        reported += hit["signals"]
+    assert logs(hit) == [["SIGSEGV", True, True]] and hit["paused_threads"] == [pid], hit
+    assert [(sig["signalName"], sig["paused"]) for sig in reported] == [("SIGSEGV", True)], hit
+    time.sleep(.1)
+    still = client.tool("ps")
+    assert still["paused_threads"] == [pid] and not still["signals"] and still["pending_events"] == 0, still
+    killed = client.script("await dbg.kill();")
+    assert not killed["paused_threads"] and not killed["signals"], killed
+    assert client.tool("snapshot", error=True)["error"], killed
+    deadline = time.monotonic() + 3
+    while Path(f"/proc/{pid}").exists():
+        assert time.monotonic() < deadline, pid
+        time.sleep(.02)
+    owned.remove(pid)
+
+    with subprocess.Popen([fixture, "attach"], stdout=subprocess.PIPE, text=True) as target:
+        try:
+            assert target.stdout.readline().strip() == "ready"
+            client.tool("attach", pid=target.pid)
+            os.kill(target.pid, signal.SIGUSR1)
+            waiting = client.script("""
+                const stop = await dbg.continueForStop("all", {timeoutMs:3000});
+                if (stop.kind !== "signal") throw new Error(stop.kind);
+                console.log(stop.signalName, stop.paused);
+            """)
+            if not logs(waiting):
+                waiting = await_state(client, lambda row: bool(logs(row)))
+            assert logs(waiting) == [["SIGUSR1", True]], waiting
+            untraced = client.script("await dbg.kill(15);")
+            assert not untraced["paused_threads"], untraced
+            assert target.wait(timeout=3) == -signal.SIGTERM
+        finally:
+            if target.poll() is None:
+                target.kill()
 
 
 def validate_attach(client, fixture, client_exe, socket, token, lease):
@@ -444,6 +511,7 @@ def main():
                 validate_types_and_input(client)
                 validate_event_queue(client, fixtures[0], owned)
                 validate_next_hit(client, fixtures[0], owned)
+                validate_fault_and_kill(client, fixtures[0], owned)
                 for fixture in fixtures:
                     validate_debugging(client, fixture, directory, object_file, owned)
                     print("validated", Path(fixture).name, flush=True)

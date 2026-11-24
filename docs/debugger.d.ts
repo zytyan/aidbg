@@ -488,7 +488,7 @@ interface WatchpointOptions {
 
 export interface Debugger {
     detach(): Promise<void>;
-    /** 默认信号为 SIGINT */
+    /** 分离调试器并丢弃待投递信号，再发送指定信号。默认 SIGKILL。 */
     kill(signal?: number): Promise<void>;
     /** 消费进程退出事件。正常退出或信号退出都作为结果返回。 */
     waitExit(timeoutMs?: number): Promise<WaitResult<ExitEvent>>;
@@ -512,6 +512,7 @@ export interface Debugger {
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
 
+    /** 无回调时收到信号的线程默认暂停。回调默认放行，也可通过 passToTarget(false) 拦截。 */
     onSignal(signal: number | string, cb: SignalCallback | null): void;
 
     /** 获取单个符号（高频精准查找） */
