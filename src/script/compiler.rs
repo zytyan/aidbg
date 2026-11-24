@@ -1,3 +1,4 @@
+mod session;
 use super::{Diagnostic, ExpressionCheck, Range, Target};
 use crate::{Result, error};
 use serde::Deserialize;
@@ -8,7 +9,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tsrs_api::{Handler, Response, Session, SessionOptions};
-use tsrs_ast::{Kind as SyntaxKind, Node, NodeFlags, SourceFile, Symbol, get_source_file_of_node};
+use tsrs_ast::{
+    Kind as SyntaxKind, Node, NodeFlags, SourceFile, Symbol, get_source_file_of_node,
+    is_declaration_name,
+};
 use tsrs_core::{P, context::Context};
 use tsrs_project::ID;
 use tsrs_scanner::{get_ecma_line_and_utf16_character_of_position, skip_trivia};
@@ -19,24 +23,32 @@ const CONFIG: &str = "/aidbg/tsconfig.json";
 const HOST: &str = "/aidbg/aidbg.d.ts";
 const INPUT: &str = "/aidbg/script.ts";
 const OUTPUT: &str = "/aidbg/script.js";
+const GLOBALS: &str = "/aidbg/globals.d.ts";
 
 pub(super) struct Compiler {
     session: Arc<Session>,
     snapshot: Option<u64>,
     project: String,
     source: String,
+    globals: String,
+    session_api: bool,
 }
 
 impl Compiler {
     pub(super) fn new(declarations: &str) -> Self {
+        Self::with_session_api(declarations, false)
+    }
+
+    pub(super) fn with_session_api(declarations: &str, session_api: bool) -> Self {
         // The session's fallback is another memory FS, so references and imports
         // from submitted scripts cannot access the host's filesystem.
         let lib_dir = bundled::lib_path();
         let mut files = vec![
             (HOST.to_owned(), declarations.to_owned()),
             (INPUT.to_owned(), String::new()),
+            (GLOBALS.to_owned(), String::new()),
         ];
-        let mut roots = vec![HOST.to_owned(), INPUT.to_owned()];
+        let mut roots = vec![HOST.to_owned(), INPUT.to_owned(), GLOBALS.to_owned()];
         // Select declarations for ECMAScript intrinsics only. Shared memory
         // and the Intl object are outside the script runtime.
         for name in [
@@ -96,7 +108,7 @@ impl Compiler {
                 "compilerOptions": {
                     "target": "ES2020", "module": "ES2022", "strict": true,
                     "noLib": true, "types": [], "skipLibCheck": true,
-                    "noEmitOnError": true, "disableSizeLimit": true
+                    "noEmitOnError": !session_api, "declaration": session_api, "disableSizeLimit": true
                 },
                 "files": roots,
             })
@@ -108,6 +120,8 @@ impl Compiler {
             snapshot: None,
             project: String::new(),
             source: String::new(),
+            globals: String::new(),
+            session_api,
         }
     }
 
@@ -121,16 +135,17 @@ impl Compiler {
         }
     }
 
-    fn load(&mut self, source: &str) -> Result<u64> {
+    fn load(&mut self, source: &str, globals: &str) -> Result<u64> {
         if let Some(id) = self.snapshot
             && self.source == source
+            && self.globals == globals
         {
             return Ok(id);
         }
         let changes = json!({
             "ensurePrograms": true,
-            "fileSystem": { "kind": "layer", "files": { INPUT: source } },
-            "fileNotifications": { "changed": [INPUT] },
+            "fileSystem": { "kind": "layer", "files": { INPUT: source, GLOBALS: globals } },
+            "fileNotifications": { "changed": [INPUT, GLOBALS] },
         });
         let previous = self.snapshot;
         let response = if let Some(id) = previous {
@@ -156,6 +171,7 @@ impl Compiler {
                 .to_owned();
         }
         self.source = source.to_owned();
+        self.globals = globals.to_owned();
         Ok(id)
     }
 
@@ -165,7 +181,17 @@ impl Compiler {
         target: Option<&Target>,
         preflight: bool,
     ) -> Result<(Vec<Diagnostic>, Vec<ExpressionCheck>)> {
-        let id = self.load(source)?;
+        self.check_with_globals(source, "", target, preflight)
+    }
+
+    pub(super) fn check_with_globals(
+        &mut self,
+        source: &str,
+        globals: &str,
+        target: Option<&Target>,
+        preflight: bool,
+    ) -> Result<(Vec<Diagnostic>, Vec<ExpressionCheck>)> {
+        let id = self.load(source, globals)?;
         let params = json!({"snapshot": id, "project": self.project});
         let snapshot = self.session.snapshot_data(id)?;
         let program = snapshot.get_program(&ID(self.project.clone()))?;
@@ -198,6 +224,47 @@ impl Compiler {
                 Some(directive.range.end()),
             ));
         }
+        if self.session_api {
+            let mut stack = vec![file.as_node()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == SyntaxKind::Identifier
+                    && is_declaration_name(node)
+                    && matches!(
+                        node.as_identifier().text(),
+                        "$" | "m" | "dbg" | "console" | "__aidbgConsole"
+                    )
+                    && node.parent().is_some_and(|parent| {
+                        !matches!(
+                            parent.kind(),
+                            SyntaxKind::PropertyAssignment
+                                | SyntaxKind::ShorthandPropertyAssignment
+                                | SyntaxKind::PropertySignature
+                                | SyntaxKind::MethodDeclaration
+                                | SyntaxKind::MethodSignature
+                                | SyntaxKind::PropertyDeclaration
+                        )
+                    })
+                {
+                    let start = skip_trivia(file.text(), node.pos().source_offset().unwrap_or(0));
+                    let end = node.end().source_offset().unwrap_or(start);
+                    diagnostics.push(Diagnostic {
+                        source: "aidbg",
+                        code: "RESERVED_GLOBAL".into(),
+                        severity: "error",
+                        message: format!(
+                            "{} is a reserved debugger global",
+                            node.as_identifier().text()
+                        ),
+                        file: Some(INPUT.into()),
+                        range: Some(range(file, start, end)),
+                    });
+                }
+                node.for_each_child(&mut |child| {
+                    stack.push(child);
+                    false
+                });
+            }
+        }
         diagnostics.dedup();
 
         let mut expressions = Vec::new();
@@ -229,18 +296,26 @@ impl Compiler {
     }
 
     pub(super) fn emit(&self) -> Result<String> {
+        self.emit_output(1, OUTPUT)
+    }
+
+    pub(super) fn emit_declarations(&self) -> Result<String> {
+        self.emit_output(2, "/aidbg/script.d.ts")
+    }
+
+    fn emit_output(&self, emit_only: u8, path: &str) -> Result<String> {
         let value = self.request(
             "emitToString",
             json!({
-                "snapshot": self.snapshot, "project": self.project, "emitOnly": 1,
+                "snapshot": self.snapshot, "project": self.project, "emitOnly": emit_only,
             }),
         )?;
         value["outputFiles"]
             .as_array()
-            .and_then(|files| files.iter().find(|file| file["fileName"] == OUTPUT))
+            .and_then(|files| files.iter().find(|file| file["fileName"] == path))
             .and_then(|file| file["text"].as_str())
             .map(str::to_owned)
-            .ok_or_else(|| error(format!("tsrs did not emit script.js: {value}")))
+            .ok_or_else(|| error(format!("tsrs did not emit {path}: {value}")))
     }
 }
 

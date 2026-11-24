@@ -57,18 +57,22 @@ struct Segment {
     offset: u64,
     size: u64,
     executable: bool,
+    flags: u32,
 }
 
 struct Thread {
     stop_signal: u16,
     regs: Registers,
     flags: u64,
+    general: std::collections::BTreeMap<String, String>,
+    fp: Option<Vec<u8>>,
     frames: OnceLock<Vec<OfflineFrame>>,
     frame_metadata: OnceLock<Vec<Value>>,
 }
 
 pub(super) struct Target {
     id: String,
+    pid: Option<i32>,
     file: File,
     segments: Vec<Segment>,
     threads: BTreeMap<i32, Thread>,
@@ -213,6 +217,7 @@ impl Target {
         }
         let mut target = Self {
             id: id.clone(),
+            pid: None,
             file,
             segments: Vec::new(),
             threads: BTreeMap::new(),
@@ -259,6 +264,7 @@ impl Target {
                             offset,
                             size,
                             executable: uint(row, 4, 4) & 1 != 0,
+                            flags: uint(row, 4, 4) as u32,
                         });
                     }
                 }
@@ -555,6 +561,14 @@ impl Target {
             if owner == Some(b"CORE\0") {
                 match kind {
                     elf::NT_FILE => self.read_file_note(desc)?,
+                    elf::NT_PRPSINFO if desc.len() >= 28 => {
+                        self.pid = Some(uint(desc, 24, 4) as i32);
+                    }
+                    elf::NT_FPREGSET if desc.len() <= 4096 => {
+                        if let Some(thread) = note_tid.and_then(|tid| self.threads.get_mut(&tid)) {
+                            thread.fp = Some(desc.to_vec());
+                        }
+                    }
                     elf::NT_PRSTATUS => {
                         let tid = uint(
                             desc.get(..36)
@@ -574,6 +588,8 @@ impl Target {
                                         stop_signal: uint(desc, 12, 2) as u16,
                                         regs,
                                         flags,
+                                        general: regs::general_from_bytes(&desc[112..])?,
+                                        fp: None,
                                         frames: OnceLock::new(),
                                         frame_metadata: OnceLock::new(),
                                     },
@@ -663,7 +679,7 @@ impl Target {
         Ok(())
     }
 
-    fn read_at(&self, mut address: u64, mut output: &mut [u8]) -> Result<()> {
+    pub(super) fn read_at(&self, mut address: u64, mut output: &mut [u8]) -> Result<()> {
         while !output.is_empty() {
             let index = self
                 .segments
@@ -728,6 +744,114 @@ impl Target {
         let (tid, index) = location.split_once(':')?;
         self.frames_for(tid.parse().ok()?)?
             .get(index.parse::<usize>().ok()?)
+    }
+
+    pub(super) fn session_types(
+        &self,
+        pattern: &str,
+        exact: bool,
+        offset: usize,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<(String, crate::symbols::inspect::type_graph::Graph)>> {
+        let mut result = Vec::new();
+        let mut skip = offset;
+        let main = self
+            .entry
+            .and_then(|entry| self.mapped_file(entry).map(|(module, _)| module));
+        let mut images = self.dwarf.iter().cloned().collect::<Vec<_>>();
+        for module in &self.file_modules {
+            if self.dwarf.is_some() && main.is_some_and(|main| std::ptr::eq(main, module)) {
+                continue;
+            }
+            if let Some(address) = module.maps.first().map(|map| map.start)
+                && let Some(image) = self.image_at(address)
+                && let Some(dwarf) = image.dwarf(self)?
+            {
+                images.push(dwarf);
+            }
+        }
+        for dwarf in images {
+            let (rows, matched) = dwarf.type_graphs(
+                pattern,
+                exact,
+                skip,
+                limit.saturating_sub(result.len()),
+                deadline,
+            )?;
+            skip = skip.saturating_sub(matched);
+            for row in rows {
+                if !result.contains(&row) {
+                    result.push(row);
+                }
+            }
+            if result.len() >= limit || (exact && !result.is_empty()) {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn session_pid(&self) -> i32 {
+        self.pid.or_else(|| self.default_tid()).unwrap_or_default()
+    }
+
+    pub(super) fn session_registers(&self, tid: i32, full: bool) -> Result<Value> {
+        let thread = self
+            .threads
+            .get(&tid)
+            .ok_or_else(|| error("thread no longer exists"))?;
+        let mut registers = serde_json::to_value(&thread.general)?;
+        if full {
+            regs::add_vectors(
+                &mut registers,
+                thread.fp.as_deref().ok_or_else(|| {
+                    error("NotSupport: core has no floating-point registers for this thread")
+                })?,
+            )?;
+        }
+        Ok(registers)
+    }
+
+    pub(super) fn session_frames(&self, tid: i32) -> Result<Value> {
+        let frames = self
+            .frames_for(tid)
+            .ok_or_else(|| error("thread no longer exists"))?;
+        let metadata = self.frame_metadata(tid)?;
+        Ok(json!(
+            frames
+                .iter()
+                .zip(metadata)
+                .map(|(frame, site)| {
+                    json!({"pc":hex(frame.pc), "sp":frame.regs.get(regs::SP).ok().map(hex),
+                "fp":frame.regs.get(regs::FP).ok().map(hex), "symbol":site["function"],
+                "file":site["file"], "line":site["line"], "handle":site["handle"]})
+                })
+                .collect::<Vec<_>>()
+        ))
+    }
+
+    pub(super) fn session_mappings(&self) -> Value {
+        json!(
+            self.segments
+                .iter()
+                .map(|segment| {
+                    let named = self.mapped_file(segment.start);
+                    let mut prot = String::new();
+                    for (flag, character) in [(4, 'r'), (2, 'w'), (1, 'x')] {
+                        prot.push(if segment.flags & flag != 0 {
+                            character
+                        } else {
+                            '-'
+                        });
+                    }
+                    prot.push('p');
+                    json!({"start":hex(segment.start), "end":hex(segment.end),
+                "offset":hex(named.map_or(0, |(_, map)| map.offset + (segment.start - map.start))),
+                "prot":prot, "name":named.map(|(module, _)| module.path()).unwrap_or_default()})
+                })
+                .collect::<Vec<_>>()
+        )
     }
 
     pub fn threads(&self) -> Value {

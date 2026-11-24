@@ -21,6 +21,7 @@ use std::{
 
 pub(crate) mod inspect;
 mod overrides;
+pub(crate) mod script_page;
 pub use inspect::{Report as InspectReport, inspect};
 pub use overrides::{Overrides, Rule as OverrideRule};
 

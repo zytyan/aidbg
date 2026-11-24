@@ -287,6 +287,8 @@ export interface WatchpointHit extends BreakpointHit {
     readonly after?: Value.Base;
 }
 
+export type WatchpointCallback = (hit: WatchpointHit) => void | Promise<void>;
+
 export type SignalCallback = (hit: SignalHit) => void | Promise<void>;
 
 export interface SignalHit {
@@ -445,7 +447,7 @@ export interface Debugger {
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
 
-    onSignal(signal: number | string, cb: SignalCallback): void;
+    onSignal(signal: number | string, cb: SignalCallback | null): void;
 
     /** 获取单个符号（高频精准查找） */
     getSymbol(name: string): Promise<SymbolInfo | null>;
@@ -464,12 +466,12 @@ export interface Debugger {
     ): Breakpoint;
     hardwareWatchpoint(
         at: bigint | string,
-        cb: BreakpointCallback,
+        cb: WatchpointCallback,
         opt: WatchpointOptions
     ): Breakpoint;
     softwareWatchpoint(
         at: bigint | string,
-        cb: BreakpointCallback,
+        cb: WatchpointCallback,
         opt: WatchpointOptions
     ): Breakpoint;
 

@@ -1,6 +1,6 @@
 [package]
 name = "aidbg"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.100"
 default-run = "aidbg"
@@ -23,7 +23,7 @@ tonic-prost = "0.14"
 [target.'cfg(target_os = "linux")'.dependencies]
 object = { version = "=0.41.0", default-features = false, features = ["elf", "read_core", "std", "compression"] }
 gimli = { version = "=0.34.0", default-features = false, features = ["read-all"] }
-nix = { version = "=0.31.2", features = ["ptrace", "signal", "uio"] }
+nix = { version = "=0.31.2", features = ["fs", "ptrace", "signal", "uio"] }
 num-bigint = "=0.5.1"
 cpp_demangle = "=0.6.0"
 capstone = { version = "=0.14.0", default-features = false, features = ["std", "full", "arch_x86", "arch_arm64"] }

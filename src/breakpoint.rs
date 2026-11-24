@@ -510,6 +510,20 @@ struct Outcome {
 // will be published. A skipped watchpoint still affects attribution.
 type CapturedHit = (Hit, Outcome);
 type Slots = [Option<Rule>; SLOTS];
+type HardwareSlots = [Option<(u64, Kind)>; SLOTS];
+
+pub(crate) fn session_program(tid: i32, slots: &[Option<(u64, Kind)>]) -> Result<()> {
+    let mut hardware = [None; SLOTS];
+    if slots.len() > hardware.len() {
+        return Err(error("hardware breakpoint slots exhausted"));
+    }
+    hardware[..slots.len()].copy_from_slice(slots);
+    hardware::program_raw(tid, &hardware)
+}
+
+pub(crate) fn session_prepare_resume(tid: i32, execution: bool) -> Result<()> {
+    hardware::prepare_resume(tid, execution)
+}
 
 fn live_result(
     breakpoint_ids: Vec<u64>,
@@ -2623,7 +2637,7 @@ pub(crate) fn disarm(tid: i32) -> Result<()> {
 
 #[cfg(target_arch = "x86_64")]
 mod hardware {
-    use super::{Kind, Slots};
+    use super::{HardwareSlots, Kind, Slots};
     use crate::Result;
     use nix::{errno::Errno, libc, sys::ptrace, unistd::Pid};
 
@@ -2647,13 +2661,20 @@ mod hardware {
     }
 
     pub(super) fn program(tid: i32, slots: &Slots) -> Result<()> {
+        program_raw(
+            tid,
+            &slots.map(|rule| rule.map(|rule| (rule.address, rule.kind))),
+        )
+    }
+
+    pub(super) fn program_raw(tid: i32, slots: &HardwareSlots) -> Result<()> {
         debug_register(tid, 7, 0)?;
         let mut control = 0;
         for (index, slot) in slots.iter().enumerate() {
-            if let Some(rule) = slot {
-                debug_register(tid, index, rule.address)?;
+            if let Some((address, kind)) = *slot {
+                debug_register(tid, index, address)?;
                 control |= 1 << (2 * index); // Local enable.
-                if let Kind::Watch { length, access } = rule.kind {
+                if let Kind::Watch { length, access } = kind {
                     let width = match length {
                         1 => 0,
                         2 => 1,

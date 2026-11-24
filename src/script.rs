@@ -6,6 +6,7 @@ pub(crate) use core::memory::{live_missing_memory, pointer_chain_with, read_rang
 pub use core::memory::{pointer_chain_live, read_live, search_live};
 pub(crate) mod live;
 mod runtime;
+pub mod session;
 pub mod synchronization;
 pub use live::RunResult as LiveRunResult;
 pub(crate) mod signal;

@@ -339,6 +339,29 @@ impl Trace {
         Err(error("thread set did not stabilize"))
     }
 
+    pub(crate) fn stop_thread(&mut self, tid: i32, deadline: Instant) -> Result<()> {
+        let thread = self
+            .threads
+            .get_mut(&tid)
+            .ok_or_else(|| error("thread no longer exists"))?;
+        if thread.stop.is_none() && !thread.requested && !thread.newborn {
+            ptrace::interrupt(Pid::from_raw(tid))?;
+            thread.requested = true;
+        }
+        loop {
+            self.poll()?;
+            self.detach_foreign_children()?;
+            match self.threads.get(&tid) {
+                Some(thread) if thread.stop.is_some() => return Ok(()),
+                None => return Err(error("thread no longer exists")),
+                _ if Instant::now() >= deadline => {
+                    return Err(error("timed out waiting for thread"));
+                }
+                _ => sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+
     fn request_stops(&mut self) -> Result<()> {
         let mut failure = None;
         for (&tid, thread) in &mut self.threads {
@@ -723,6 +746,10 @@ impl Trace {
         Ok(())
     }
 
+    pub(crate) fn stepping(&self, tid: i32) -> bool {
+        self.threads.get(&tid).is_some_and(|thread| thread.stepping)
+    }
+
     pub fn step_one(&mut self, tid: i32, deadline: Instant) -> Result<Option<Stop>> {
         if Instant::now() >= deadline {
             return Err(error("single-step deadline reached"));
@@ -751,7 +778,21 @@ impl Trace {
         ptrace::step(Pid::from_raw(tid), None)?;
         thread.stop = None;
         thread.stepping = true;
-        self.wait_for_stops(deadline)?;
+        loop {
+            self.poll()?;
+            self.detach_foreign_children()?;
+            if self
+                .threads
+                .get(&tid)
+                .is_none_or(|thread| thread.stop.is_some())
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(error("single-step deadline reached"));
+            }
+            sleep(Duration::from_millis(1));
+        }
         let stop = self.threads.get(&tid).and_then(|thread| thread.stop);
         // Some kernels first report the synthetic trap from completing exec.
         // User-directed traps and traps from executed instructions are retained.
@@ -839,11 +880,15 @@ impl Trace {
                 .wait_for_stops(Instant::now() + Duration::from_millis(250))
                 .err();
             if !self.patches.is_empty() && !self.exec_observed() && !self.threads.is_empty() {
-                cleanup.software_restore_error = self
+                if let Err(error) = self.rewind_software_stops() {
+                    cleanup.software_restore_error = Some(error.to_string());
+                }
+                let restore_error = self
                     .stopped_tid()
                     .and_then(|tid| self.restore_bytes(tid, &self.root))
                     .err()
                     .map(|e| format!("restore software breakpoints: {e}"));
+                cleanup.software_restore_error = restore_error.or(cleanup.software_restore_error);
             }
             self.detach_stopped(&mut cleanup);
             self.patches.clear();

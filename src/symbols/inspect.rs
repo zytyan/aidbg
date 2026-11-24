@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod cache;
 mod expression;
+pub(crate) mod type_graph;
 pub(crate) use cache::warm as warm_dwarf;
 pub(crate) mod offline;
 use expression::Number;

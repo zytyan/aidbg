@@ -51,9 +51,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rustc-env=AIDBG_BUILD_VERSION={version}");
     }
     println!("cargo:rerun-if-changed=proto/aidbg.proto");
+    println!("cargo:rerun-if-changed=proto/backend.proto");
     let mut cfg = prost_build::Config::new();
     cfg.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
-    tonic_prost_build::configure().compile_with_config(cfg, &["proto/aidbg.proto"], &["proto"])?;
+    tonic_prost_build::configure().compile_with_config(
+        cfg,
+        &["proto/aidbg.proto", "proto/backend.proto"],
+        &["proto"],
+    )?;
     #[cfg(unix)]
     if std::env::var("CARGO_CFG_TARGET_OS")?.as_str() == "linux" {
         engines::build()?;

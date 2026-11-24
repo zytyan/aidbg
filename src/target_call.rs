@@ -140,7 +140,7 @@ fn regset(request: libc::c_uint, tid: i32, note: usize, data: &mut [u8]) -> Resu
     Ok(iov.iov_len)
 }
 
-fn read_vectors(tid: i32) -> Result<Vec<u8>> {
+pub(crate) fn read_vectors(tid: i32) -> Result<Vec<u8>> {
     let mut data = vec![0; 65_536];
     let len = regset(libc::PTRACE_GETREGSET as _, tid, VECTOR_NOTE, &mut data)?;
     #[cfg(target_arch = "x86_64")]
@@ -154,7 +154,7 @@ fn read_vectors(tid: i32) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn set_vectors(tid: i32, data: &mut [u8]) -> Result<()> {
+pub(crate) fn set_vectors(tid: i32, data: &mut [u8]) -> Result<()> {
     let len = regset(libc::PTRACE_SETREGSET as _, tid, VECTOR_NOTE, data)?;
     if len != data.len() {
         return Err(error("short vector register restore"));

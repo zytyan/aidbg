@@ -1,0 +1,8 @@
+{
+  "name": "aidbg-type-tests",
+  "private": true,
+  "types": "../../docs/debugger.d.ts",
+  "scripts": { "test": "tsd" },
+  "devDependencies": { "tsd": "^0.33.0" },
+  "tsd": { "directory": ".", "compilerOptions": { "target": "es2020" } }
+}

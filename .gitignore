@@ -1,3 +1,5 @@
 /target/
 /artifacts/
 __pycache__/
+
+/tests/types/node_modules/

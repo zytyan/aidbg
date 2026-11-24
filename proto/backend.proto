@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package aidbg;
+
+// Data structures shared by the native debugger backends.
+
+message StepRunRequest {
+  string run_id = 1;
+  optional int32 tid = 2;
+  optional uint32 max_steps = 3;
+  optional uint32 timeout_ms = 4;
+  enum Mode {
+    STEP = 0;
+    NEXT = 1;
+    OUT = 2;
+  }
+  Mode mode = 5;
+}
+
+message ReadMemoryRequest {
+  optional string target_id = 1;
+  optional int32 pid = 2;
+  optional string run_id = 3;
+  uint64 address = 4;
+  uint32 length = 5;
+}
+
+message StepWatchRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  uint64 address = 3;
+  uint32 length = 4;
+  uint64 pc_start = 5;
+  uint64 pc_end = 6;
+  optional uint32 max_steps = 7;
+  optional uint32 timeout_ms = 8;
+}
+
+message TargetCallRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  string module = 3;
+  string symbol = 4;
+  optional uint64 instance = 5;
+  repeated string arguments = 6;
+  string return_type = 7;
+  uint64 scratch_address = 8;
+  uint32 scratch_length = 9;
+  optional uint32 max_steps = 10;
+  optional uint32 timeout_ms = 11;
+  bool allow_side_effects = 12;
+}
+
+enum FreezeMode {
+  TRY = 0;
+  NEVER = 1;
+  REQUIRED = 2;
+}
+
+message Selection {
+  repeated string fields = 1;
+  optional int32 tid = 2;
+  optional uint32 frames = 3;
+}
+
+enum CoreMode {
+  CORE_STACK = 0;
+  CORE_LITE = 1;
+  CORE_STACK_4K = 2;
+  CORE_STANDARD = 3;
+  CORE_EXTENDED = 4;
+  CORE_FULL = 5;
+}
+
+enum SymbolMatch {
+  EXACT = 0;
+  GLOB = 1;
+  REGEX = 2;
+}
+
+message SearchSymbolsRequest {
+  int32 pid = 1;
+  string pattern = 2;
+  SymbolMatch match_mode = 3;
+  optional string module = 4;
+  optional uint32 limit = 5;
+  optional string target_id = 6;
+  optional string run_id = 7;
+}
+
+message ResolveAddressRequest {
+  int32 pid = 1;
+  uint64 address = 2;
+  optional string target_id = 3;
+}
+
+message DisassembleRequest {
+  int32 pid = 1;
+  uint64 address = 2;
+  optional uint32 before = 3;
+  optional uint32 after = 4;
+  optional uint64 start = 5;
+  optional string target_id = 6;
+  optional string run_id = 7;
+}
+
+message SearchMemoryRequest {
+  string target_id = 1;
+  bytes pattern = 2;
+  optional uint64 start = 3;
+  optional uint64 end = 4;
+  optional uint32 limit = 5;
+  optional uint32 max_scan_bytes = 6;
+  optional uint32 alignment = 7;
+  optional uint64 pointer_value = 8;
+  bool instruction_references = 9;
+  optional int32 pid = 10;
+  optional string run_id = 11;
+  optional uint64 resume_from = 12;
+}
+
+message PointerChainRequest {
+  string target_id = 1;
+  uint64 base = 2;
+  repeated sint64 offsets = 3;
+  optional int32 pid = 4;
+  optional string run_id = 5;
+}
+
+message InspectRequest {
+  int32 pid = 1;
+  optional int32 tid = 2;
+  string expression = 3;
+  optional string module = 4;
+  optional uint64 instance = 5;
+  optional string run_id = 6;
+  optional uint32 timeout_ms = 7;
+  InspectExpansion expand = 8;
+  optional string target_id = 9;
+  optional uint32 frame_index = 10;
+  repeated string expressions = 11;
+}
+
+message InspectExpansion {
+  uint32 offset = 1;
+  optional uint32 limit = 2;
+}
+
+message AddressRange {
+  uint64 address = 1;
+  uint64 length = 2;
+}
+
+message PatchRequest {
+  uint64 base = 1;
+  uint64 address = 2;
+  bytes original = 3;
+  string source = 4;
+  repeated AddressRange existing = 5;
+  optional string target_id = 6;
+  optional uint32 original_length = 7;
+}
+
+message MemoryCopy {
+  uint64 address = 1;
+  bytes contents = 2;
+  bool writable = 3;
+}
+
+message ObjectProbe {
+  uint64 address = 1;
+  uint64 length = 2;
+  string name = 3;
+  uint32 guard_bytes = 4;
+}
+
+message CoreMemoryCopy {
+  uint64 address = 1;
+  uint32 length = 2;
+  bool writable = 3;
+  repeated MemoryCopy overlays = 4;
+}
+
+message EmulateRequest {
+  uint64 address = 1;
+  bytes code = 2;
+  map<string, uint64> registers = 3;
+  repeated MemoryCopy memory = 4;
+  repeated AddressRange watch = 5;
+  repeated ObjectProbe objects = 6;
+  optional uint32 instruction_limit = 7;
+  optional uint32 timeout_ms = 8;
+  optional string target_id = 9;
+  optional string frame = 10;
+  optional uint32 code_length = 11;
+  repeated CoreMemoryCopy core_memory = 12;
+}

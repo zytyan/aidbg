@@ -207,6 +207,57 @@ impl Target {
         Some(Image::Shared(image, instance))
     }
 
+    pub(crate) fn script_symbols(
+        &self,
+        mut cursor: symbols::script_page::Cursor,
+    ) -> Result<(Vec<Value>, Option<symbols::script_page::Cursor>)> {
+        if cursor.module == 0 {
+            if cursor.instance == 0
+                && let (Some(image), Some(executable)) = (&self.image, &self.executable)
+            {
+                let object = object::File::parse(image.bytes())?;
+                if let Some(rows) = symbols::script_page::read(
+                    &object,
+                    self.debug_image.as_ref(),
+                    &executable.path,
+                    &mut cursor,
+                    |address| image.bias().checked_add(address),
+                ) {
+                    return Ok((rows, Some(cursor)));
+                }
+            }
+            cursor.next_module();
+        }
+        let main = self
+            .entry
+            .and_then(|entry| self.mapped_file(entry).map(|(module, _)| module));
+        while let Some(module) = self.file_modules.get(cursor.module - 1) {
+            if self.image.is_some() && main.is_some_and(|main| std::ptr::eq(main, module)) {
+                cursor.next_module();
+                continue;
+            }
+            let Some(image) = self.shared_image(module) else {
+                cursor.next_module();
+                continue;
+            };
+            let Some(instance) = image.layout.instances.get(cursor.instance) else {
+                cursor.next_module();
+                continue;
+            };
+            let object = object::File::parse(image.unwind.bytes())?;
+            if let Some(rows) = symbols::script_page::read(
+                &object,
+                image.debug.as_ref(),
+                &image.path,
+                &mut cursor,
+                |address| u64::try_from(instance.bias + i128::from(address)).ok(),
+            ) {
+                return Ok((rows, Some(cursor)));
+            }
+        }
+        Ok((Vec::new(), None))
+    }
+
     pub fn symbols(&self, request: &crate::rpc::SearchSymbolsRequest) -> Result<Value> {
         use std::os::unix::ffi::OsStrExt;
         let limit = request.limit.unwrap_or(256);
