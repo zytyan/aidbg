@@ -870,6 +870,31 @@ fn tick(
         state.events.resurrect(active);
         for event in rows {
             match event {
+                Event::Fork {
+                    parent,
+                    old_threads,
+                    tid,
+                } => {
+                    state.events.follow_fork(old_threads);
+                    state.dispatches.clear();
+                    state.reported_signals.clear();
+                    let sequence = state.events.push(
+                        json!({"kind":"fork","parentPid":parent,"tid":tid,"paused":true}),
+                        true,
+                    );
+                    if let Some(Target::Live(live)) = &mut state.target {
+                        live.track_stop(tid, sequence);
+                    }
+                }
+                Event::Exec { tid, executable } => {
+                    let sequence = state.events.push(
+                        json!({"kind":"exec","tid":tid,"executable":executable,"paused":true}),
+                        true,
+                    );
+                    if let Some(Target::Live(live)) = &mut state.target {
+                        live.track_stop(tid, sequence);
+                    }
+                }
                 Event::Breakpoint {
                     tid,
                     id,
@@ -931,12 +956,6 @@ fn tick(
                         for sequence in sequences {
                             state.events.complete(sequence, false, None);
                         }
-                    }
-                }
-                Event::Step { tid, address } => {
-                    let sequence=state.events.push(json!({"kind":"step","tid":tid,"address":crate::hex(address),"paused":true}),true);
-                    if let Some(Target::Live(live)) = &mut state.target {
-                        live.track_stop(tid, sequence);
                     }
                 }
             }

@@ -8,6 +8,8 @@ expectError(m.u64().value(1));
 expectType<Thread>(dbg.thread(17));
 expectType<Promise<ControlledThread>>(dbg.pause(17));
 expectType<Promise<ControlledThread[]>>(dbg.pause("all"));
+expectType<Promise<ControlledThread>>(dbg.pauseThread(17));
+expectType<Promise<ControlledThread[]>>(dbg.pauseAll());
 expectError(dbg.thread(1).next());
 expectType<bigint>(dbg.memory.readPointer(1n));
 expectError(dbg.memory.readPointer(1));

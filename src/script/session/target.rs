@@ -27,11 +27,12 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
-    fs::{self, File},
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::ffi::OsStrExt,
+        unix::fs::OpenOptionsExt,
     },
     path::{Path, PathBuf},
     thread,
@@ -55,6 +56,12 @@ struct Point {
     software_watch: bool,
 }
 
+struct PendingPoint {
+    name: String,
+    module: Option<String>,
+    site: Option<symbols::BreakpointSite>,
+}
+
 pub(super) struct Live {
     pub pid: i32,
     start: u64,
@@ -67,12 +74,13 @@ pub(super) struct Live {
     pub callbacks: BTreeSet<i32>,
     stop_sequences: BTreeMap<i32, BTreeSet<u64>>,
     points: BTreeMap<u32, Point>,
+    pending_points: BTreeMap<u32, PendingPoint>,
+    loader_hook: Option<u64>,
     handled_stops: BTreeSet<i32>,
     programmed: BTreeMap<i32, u64>,
     watch_values: BTreeMap<u32, u64>,
     branch_record: BTreeMap<i32, (u64, bool)>,
     branches: Vec<Value>,
-    steps: Vec<Event>,
     suppress: BTreeSet<i32>,
     last_software_tid: i32,
     linked: Vec<(std::ops::Range<u64>, Vec<Value>)>,
@@ -80,6 +88,15 @@ pub(super) struct Live {
 }
 
 pub(super) enum Event {
+    Fork {
+        parent: i32,
+        old_threads: Vec<i32>,
+        tid: i32,
+    },
+    Exec {
+        tid: i32,
+        executable: Option<PathBuf>,
+    },
     Breakpoint {
         tid: i32,
         id: u32,
@@ -97,10 +114,6 @@ pub(super) enum Event {
         process: bool,
         result: Option<crate::trace::LaunchExit>,
     },
-    Step {
-        tid: i32,
-        address: u64,
-    },
 }
 
 pub(super) struct WatchHit {
@@ -108,6 +121,30 @@ pub(super) struct WatchHit {
     pub before: Option<u64>,
     pub after: Option<u64>,
     pub access: Option<&'static str>,
+}
+
+impl WatchHit {
+    fn new(
+        length: usize,
+        configured: WatchAccess,
+        before: Option<u64>,
+        after: Option<u64>,
+    ) -> Self {
+        let access = match configured {
+            WatchAccess::Read => Some("read"),
+            WatchAccess::Write => Some("write"),
+            WatchAccess::ReadWrite if before.zip(after).is_some_and(|(a, b)| a != b) => {
+                Some("write")
+            }
+            WatchAccess::ReadWrite => None,
+        };
+        Self {
+            length,
+            before,
+            after,
+            access,
+        }
+    }
 }
 
 impl Live {
@@ -125,12 +162,13 @@ impl Live {
             callbacks: BTreeSet::new(),
             stop_sequences: BTreeMap::new(),
             points: BTreeMap::new(),
+            pending_points: BTreeMap::new(),
+            loader_hook: None,
             handled_stops: BTreeSet::new(),
             programmed: BTreeMap::new(),
             watch_values: BTreeMap::new(),
             branch_record: BTreeMap::new(),
             branches: Vec::new(),
-            steps: Vec::new(),
             suppress: BTreeSet::new(),
             last_software_tid: 0,
             linked: Vec::new(),
@@ -331,7 +369,7 @@ impl Live {
             for tid in live.original_tids(tid) {
                 let registers = regs::api_read(tid, false)?;
                 let frames = live.frames(tid, 64)?;
-                let locals = live.locals_at(tid, 0).unwrap_or_default();
+                let locals = frames.first().map(flatten_frame_values).unwrap_or_default();
                 threads
                     .push(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}));
             }
@@ -358,45 +396,43 @@ impl Live {
         let maps = modules::read(&self.root)?;
         let exe = fs::metadata(self.root.join("exe")).ok();
         let mut images = Images::new();
-        let mut fps = Vec::new();
+        let mut frame_registers = Vec::new();
+        let deadline = Instant::now() + DEADLINE;
         let mut stack = images.walk_registers(
             &self.trace,
             regs,
             &maps,
             &self.root,
             exe.as_ref(),
-            Instant::now() + DEADLINE,
-            |_, registers| fps.push(registers.get(regs::FP).ok().map(hex)),
+            deadline,
+            |_, registers| frame_registers.push(registers),
         );
         images.symbolize(&mut stack);
         stack
             .frames
             .into_iter()
-            .zip(fps)
+            .zip(frame_registers)
             .take(limit)
-            .map(|(frame, fp)| {
+            .map(|(frame, registers)| {
                 let frame = serde_json::to_value(frame)?;
-                Ok(
-                    json!({"pc":frame["pc"], "sp":frame["sp"], "fp":fp,"symbol":frame["function"],
-                "file":frame["file"],"line":frame["line"]}),
-                )
+                let fp = registers.get(regs::FP).ok().map(hex);
+                let values = self
+                    .frame_values(registers, deadline)
+                    .unwrap_or(Value::Null);
+                Ok(json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
+                    "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
+                    "file":frame["file"],"line":frame["line"],
+                    "locals":values["locals"],"parameters":values["parameters"]}))
             })
             .collect()
     }
 
-    fn locals_at(&self, tid: i32, limit: usize) -> Result<Vec<Value>> {
-        let deadline = Instant::now() + DEADLINE;
-        let registers = regs::read(tid)?.stack;
-        let page = symbols::inspect::discover_stopped(
-            &self.root,
-            &self.trace,
-            registers,
-            symbols::inspect::Discovery::Locals,
-            "*",
-            (0, if limit == 0 { 64 } else { limit }),
-            deadline,
-        )?;
-        locals_from(page, |name| self.evaluate(tid, name.to_owned()))
+    fn frame_values(&self, registers: regs::Registers, deadline: Instant) -> Result<Value> {
+        if Instant::now() >= deadline {
+            return Err(error("frame inspection deadline"));
+        }
+        let (dwarf, frame) = symbols::inspect::stopped_dwarf(&self.root, &self.trace, registers)?;
+        dwarf.frame_values(&self.trace, &frame, 64, deadline)
     }
 
     fn evaluate(&self, tid: i32, expression: String) -> Result<Value> {
@@ -613,6 +649,73 @@ impl Live {
         })
     }
 
+    fn refresh_pending_points(&mut self) -> Result<()> {
+        for id in self.pending_points.keys().copied().collect::<Vec<_>>() {
+            let pending = &self.pending_points[&id];
+            if let Some(site) = &pending.site {
+                if site.still_mapped(&self.root)? {
+                    continue;
+                }
+                self.update_point(id, None)?;
+                self.pending_points.get_mut(&id).unwrap().site = None;
+            }
+            let pending = &self.pending_points[&id];
+            let resolved = symbols::unique_breakpoint_location(
+                self.pid,
+                &self.root,
+                pending.module.as_deref(),
+                &pending.name,
+                None,
+                0,
+                true,
+                &[],
+            );
+            if let Ok((address, Some(site))) = resolved
+                && !self.points.values().any(|point| {
+                    point.active && point.kind == Kind::Software && point.address == address
+                })
+                && self.loader_hook != Some(address)
+            {
+                self.add_point(id, "software_breakpoint", address, &Value::Null)?;
+                self.pending_points.get_mut(&id).unwrap().site = Some(site);
+            }
+        }
+        Ok(())
+    }
+
+    fn install_loader_hook(&mut self) -> Result<()> {
+        if self.loader_hook.is_some() || self.pending_points.is_empty() {
+            return Ok(());
+        }
+        // The GNU loader also exposes its hook before DT_DEBUG is populated.
+        let address = self.loader_rendezvous().map(|(addr, _)| addr).or_else(|| {
+            symbols::unique_breakpoint_location(
+                self.pid,
+                &self.root,
+                None,
+                "_dl_debug_state",
+                None,
+                0,
+                true,
+                &[],
+            )
+            .ok()
+            .map(|(addr, _)| addr)
+        });
+        let Some(address) = address else {
+            return Ok(());
+        };
+        self.with_frozen(|live| live.trace.patch(address))?;
+        self.loader_hook = Some(address);
+        Ok(())
+    }
+
+    fn loader_rendezvous(&self) -> Option<(u64, u32)> {
+        coredump::loader::rendezvous(&self.root, |at, bytes| self.trace.read_memory(at, bytes))
+            .ok()
+            .flatten()
+    }
+
     fn add_point(&mut self, id: u32, kind: &str, address: u64, args: &Value) -> Result<()> {
         let software_watch = kind == "software_watchpoint";
         let kind = match kind {
@@ -682,10 +785,38 @@ impl Live {
 
     pub fn tick(&mut self, signals: &BTreeSet<i32>) -> Result<Vec<Event>> {
         self.trace.poll()?;
+        if self.trace.awaiting_fork() {
+            if let Some((pid, start, root, trace)) = self.trace.take_fork_child()? {
+                let parent = self.pid;
+                let old_threads = self.tids();
+                let mut child = Self::new(pid, root, start, trace, false);
+                child.paused.insert(pid);
+                child.stdio = self.stdio.take();
+                child.pending_points = std::mem::take(&mut self.pending_points);
+                for point in child.pending_points.values_mut() {
+                    point.site = None;
+                }
+                self.close()?;
+                *self = child;
+                self.install_loader_hook()?;
+                self.refresh_pending_points()?;
+                return Ok(vec![Event::Fork {
+                    parent,
+                    old_threads,
+                    tid: pid,
+                }]);
+            }
+            return Ok(Vec::new());
+        }
+        let mut events = Vec::new();
         // A successful exec invalidates breakpoints and the scratch mapping.
         if self.trace.exec_observed() {
             self.trace.clear_patches();
             self.points.clear();
+            self.loader_hook = None;
+            for pending in self.pending_points.values_mut() {
+                pending.site = None;
+            }
             self.programmed.clear();
             self.watch_values.clear();
             self.branch_record.clear();
@@ -693,11 +824,20 @@ impl Live {
             self.scratch = None;
             self.paused
                 .retain(|tid| self.trace.threads.contains_key(tid));
-            for thread in self.trace.threads.values_mut() {
+            for (&tid, thread) in &mut self.trace.threads {
                 if matches!(thread.stop, Some(Stop::Event(_, libc::PTRACE_EVENT_EXEC))) {
                     thread.stop = Some(Stop::ExecBoundary);
+                    self.paused.insert(tid);
+                    self.handled_stops.remove(&tid);
+                    self.stop_sequences.remove(&tid);
+                    events.push(Event::Exec {
+                        tid,
+                        executable: fs::read_link(self.root.join("exe")).ok(),
+                    });
                 }
             }
+            self.install_loader_hook()?;
+            self.refresh_pending_points()?;
         }
         self.trace.detach_foreign_children()?;
         self.paused
@@ -713,7 +853,6 @@ impl Live {
                 .get(tid)
                 .is_some_and(|thread| thread.identity == *identity)
         });
-        let mut events = std::mem::take(&mut self.steps);
         let retired = self
             .trace
             .retired
@@ -742,11 +881,19 @@ impl Live {
             if self.callbacks.contains(&tid) {
                 continue;
             }
-            let Some(stop) = self.trace.threads[&tid].stop else {
+            let Some(stop) = self.trace.threads.get(&tid).and_then(|thread| thread.stop) else {
                 continue;
             };
+            if matches!(stop, Stop::Software { address, .. } if Some(address) == self.loader_hook) {
+                if self.loader_rendezvous().is_none_or(|(_, state)| state == 0) {
+                    self.with_frozen(|live| live.refresh_pending_points())?;
+                }
+                self.resume(tid)?;
+                continue;
+            }
             if !self.handled_stops.contains(&tid) {
                 let identity = self.identity(tid)?;
+                let mut handled = true;
                 let new_events: Vec<_> = match stop {
                     Stop::Software { address, .. } => self
                         .points
@@ -764,38 +911,16 @@ impl Live {
                             watch: None,
                         })
                         .collect(),
-                    Stop::Breakpoint { slots, address, .. } => self
-                        .slots(tid)
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(index, (_, point))| {
-                            if cfg!(target_arch = "x86_64") {
-                                slots & (1 << index) != 0
-                            } else {
-                                address.is_some_and(|addr| match point.kind {
-                                    Kind::Watch { length, .. } => {
-                                        addr >= point.address
-                                            && addr - point.address < length as u64
-                                    }
-                                    _ => addr == point.address,
-                                })
-                            }
-                        })
-                        .map(|(_, (id, point))| {
-                            let watch = match point.kind {
-                                Kind::Watch { length, access } => {
-                                    Some(self.watch_hit(id, point.address, length, access))
-                                }
-                                _ => None,
-                            };
-                            Event::Breakpoint {
-                                tid,
-                                id,
-                                address: point.address,
-                                watch,
-                            }
-                        })
-                        .collect(),
+                    Stop::Breakpoint { slots, address, .. } => {
+                        let (hits, stepped) = self.hardware_hits(tid, slots, address)?;
+                        // A real signal or breakpoint can interrupt the ARM watch step.
+                        handled = !stepped
+                            || matches!(
+                                self.trace.threads.get(&tid).and_then(|thread| thread.stop),
+                                Some(Stop::Step)
+                            );
+                        hits
+                    }
                     Stop::Delivery(signal) => {
                         let fault = matches!(
                             signal,
@@ -825,7 +950,9 @@ impl Live {
                     }
                     _ => Vec::new(),
                 };
-                self.handled_stops.insert(tid);
+                if handled {
+                    self.handled_stops.insert(tid);
+                }
                 if !new_events.is_empty() {
                     if matches!(stop, Stop::Software { .. }) {
                         self.trace.rewind_software_stops()?;
@@ -862,6 +989,101 @@ impl Live {
         Ok(events)
     }
 
+    fn hardware_hits(
+        &mut self,
+        tid: i32,
+        slots: u64,
+        address: Option<u64>,
+    ) -> Result<(Vec<Event>, bool)> {
+        let points: Vec<_> = self
+            .slots(tid)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, (_, point))| {
+                if cfg!(target_arch = "x86_64") {
+                    slots & (1 << index) != 0
+                } else {
+                    address.is_some_and(|at| match point.kind {
+                        Kind::Watch { length, .. } => at
+                            .checked_sub(point.address)
+                            .is_some_and(|offset| offset < length as u64),
+                        _ => at == point.address,
+                    })
+                }
+            })
+            .map(|(_, point)| point)
+            .collect();
+        let mut hits: Vec<_> = points
+            .into_iter()
+            .map(|(id, point)| {
+                let watch = match point.kind {
+                    Kind::Watch { length, access } if cfg!(target_arch = "aarch64") => {
+                        Some(WatchHit::new(length, access, None, None))
+                    }
+                    Kind::Watch { length, access } => {
+                        Some(self.watch_hit(id, point.address, length, access))
+                    }
+                    _ => None,
+                };
+                Event::Breakpoint {
+                    tid,
+                    id,
+                    address: point.address,
+                    watch,
+                }
+            })
+            .collect();
+        let step = cfg!(target_arch = "aarch64")
+            && hits
+                .iter()
+                .any(|hit| matches!(hit, Event::Breakpoint { watch: Some(_), .. }));
+        if step {
+            self.with_frozen(|live| {
+                // ARM reports the watched instruction before it accesses memory.
+                for hit in &mut hits {
+                    if let Event::Breakpoint {
+                        address,
+                        watch: Some(watch),
+                        ..
+                    } = hit
+                    {
+                        watch.before = live.trace.read_word(*address, watch.length).ok();
+                    }
+                }
+                breakpoint::disarm(tid)?;
+                let stopped = live.trace.step_one(tid, Instant::now() + DEADLINE);
+                if live
+                    .trace
+                    .threads
+                    .get(&tid)
+                    .is_some_and(|thread| thread.stop.is_some())
+                    && !live.trace.exec_observed()
+                {
+                    live.program(tid)?;
+                }
+                if matches!(stopped?, Some(Stop::Step)) {
+                    for hit in &mut hits {
+                        if let Event::Breakpoint {
+                            address,
+                            watch: Some(watch),
+                            ..
+                        } = hit
+                        {
+                            watch.after = live.trace.read_word(*address, watch.length).ok();
+                            if watch.access.is_none()
+                                && watch.before.zip(watch.after).is_some_and(|(a, b)| a != b)
+                            {
+                                watch.access = Some("write");
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok((hits, step))
+    }
+
     fn watch_hit(
         &mut self,
         id: u32,
@@ -874,20 +1096,7 @@ impl Live {
         if let Some(value) = current {
             self.watch_values.insert(id, value);
         }
-        let access = match configured {
-            WatchAccess::Read => Some("read"),
-            WatchAccess::Write => Some("write"),
-            WatchAccess::ReadWrite if before.zip(current).is_some_and(|(a, b)| a != b) => {
-                Some("write")
-            }
-            WatchAccess::ReadWrite => None,
-        };
-        WatchHit {
-            length,
-            before,
-            after: current,
-            access,
-        }
+        WatchHit::new(length, configured, before, current)
     }
 
     fn traced(&self, tid: i32) -> bool {
@@ -1134,12 +1343,8 @@ impl Target {
                 };
                 let mut threads = Vec::new();
                 for tid in tids {
-                    let mut frames = core.session_frames(tid)?;
-                    let locals = core_locals(core, tid).unwrap_or_default();
-                    if let Some(frame) = frames.as_array_mut().and_then(|frames| frames.first_mut())
-                    {
-                        frame.as_object_mut().unwrap().remove("handle");
-                    }
+                    let frames = core.session_frames(tid, 64)?;
+                    let locals = flatten_frame_values(&frames[0]);
                     threads.push(json!({"tid":tid,"registers":core.session_registers(tid,false)?,"frames":frames,"locals":locals}));
                 }
                 Ok(json!({"timestamp":procfs::epoch_ms(), "threads":threads,
@@ -1202,21 +1407,18 @@ impl Target {
             })?,
         };
         let mut rows:Vec<_> = report["matches"].as_array().into_iter().flatten().map(|item| json!({
-            "name":item["name"],"address":item["runtime_address"],"size":item["size"],"module":item["module"]["path"]
+            "name":item["name"],"demangledName":item["demangled_name"],
+            "address":item["runtime_address"],"size":item["size"],"module":item["module"]["path"]
         })).collect();
         if let Self::Live(live) = self {
-            let regex = (mode == SymbolMatch::Regex)
-                .then(|| regex::Regex::new(pattern))
-                .transpose()?;
+            let matcher = symbols::Matcher::new(mode, pattern)?;
             rows.extend(
                 live.linked
                     .iter()
                     .flat_map(|(_, symbols)| symbols)
                     .filter(|symbol| {
                         let name = symbol["name"].as_str().unwrap_or_default();
-                        regex
-                            .as_ref()
-                            .map_or(name == pattern, |regex| regex.is_match(name))
+                        matcher.matches(name)
                     })
                     .cloned(),
             );
@@ -1238,6 +1440,23 @@ impl Target {
                 }
             }
             None => Err(error("expected an address or symbol name")),
+        }
+    }
+
+    fn source_location(&self, address: u64) -> Result<Value> {
+        let resolved = match self {
+            Self::Live(live) => {
+                live.verify()?;
+                serde_json::to_value(symbols::resolve(live.pid, address, &[])?)?
+            }
+            Self::Core(core) => core.resolve(address)?,
+        };
+        match (
+            resolved["source_line"]["file"].as_str(),
+            resolved["source_line"]["line"].as_u64(),
+        ) {
+            (Some(file), Some(line)) => Ok(json!({"file":file,"line":line})),
+            _ => Ok(Value::Null),
         }
     }
 
@@ -1423,21 +1642,21 @@ impl Target {
                     Self::Live(live) => {
                         live.with_stopped(tid, |live| Ok(json!(live.frames(tid, limit)?)))
                     }
-                    Self::Core(core) => Ok(json!(
-                        core.session_frames(tid)?
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .take(limit)
-                            .collect::<Vec<_>>()
-                    )),
+                    Self::Core(core) => core.session_frames(tid, limit),
                 }
             }
             "locals" => match self {
                 Self::Live(live) => {
-                    live.with_stopped(tid()?, |live| Ok(json!(live.locals_at(tid()?, 0)?)))
+                    let tid = tid()?;
+                    live.with_stopped(tid, |live| {
+                        let values =
+                            live.frame_values(regs::read(tid)?.stack, Instant::now() + DEADLINE)?;
+                        Ok(json!(flatten_frame_values(&values)))
+                    })
                 }
-                Self::Core(core) => Ok(json!(core_locals(core, tid()?)?)),
+                Self::Core(core) => Ok(json!(flatten_frame_values(
+                    &core.session_top_values(tid()?, Instant::now() + DEADLINE)?
+                ))),
             },
             "eval" => {
                 let text = args["expr"]
@@ -1463,6 +1682,15 @@ impl Target {
             "pause" => Ok(json!(self.live()?.pause(selector()?)?)),
             "continue" => {
                 self.live()?.continue_threads(selector()?)?;
+                Ok(Value::Null)
+            }
+            "followFork" => {
+                let follow = match args["mode"].as_str() {
+                    Some("parent") => false,
+                    Some("child") => true,
+                    _ => return Err(error("expected parent or child")),
+                };
+                self.live()?.trace.follow_fork = follow;
                 Ok(Value::Null)
             }
             "detach" => {
@@ -1546,23 +1774,15 @@ impl Target {
                 };
                 Ok(json!(address.map(hex)))
             }
-            "addrToLine" => {
-                let address = parse_address(&args["address"])?;
-                let resolved = match self {
-                    Self::Live(live) => {
-                        live.verify()?;
-                        serde_json::to_value(symbols::resolve(live.pid, address, &[])?)?
-                    }
-                    Self::Core(core) => core.resolve(address)?,
-                };
-                Ok(
-                    match (
-                        resolved["source_line"]["file"].as_str(),
-                        resolved["source_line"]["line"].as_u64(),
-                    ) {
-                        (Some(file), Some(line)) => json!({"file":file,"line":line}),
-                        _ => Value::Null,
-                    },
+            "addrToLine" => self.source_location(parse_address(&args["address"])?),
+            "listSource" => {
+                let radius = args["radius"].as_u64().unwrap_or(5);
+                if radius > 50 {
+                    return Err(error("source context must be between 0 and 50 lines"));
+                }
+                list_source(
+                    self.source_location(parse_address(&args["address"])?)?,
+                    radius,
                 )
             }
             "address" => Ok(json!(hex(self.address(&args["at"])?))),
@@ -1597,7 +1817,23 @@ impl Target {
                 let pattern = args["pattern"]
                     .as_str()
                     .ok_or_else(|| error("expected symbol pattern"))?;
-                self.symbols(pattern, SymbolMatch::Exact, 1)
+                let exact = self.symbols(pattern, SymbolMatch::Exact, 1)?;
+                if exact.as_array().is_some_and(|rows| !rows.is_empty()) {
+                    return Ok(exact);
+                }
+                for mode in [SymbolMatch::CppSignature, SymbolMatch::CppName] {
+                    let found = self.symbols(pattern, mode, 2)?;
+                    match found.as_array().map_or(0, Vec::len) {
+                        0 => {}
+                        1 => return Ok(found),
+                        _ => {
+                            return Err(error(format!(
+                                "symbol {pattern} is ambiguous; use a full C++ signature or a mangled name"
+                            )));
+                        }
+                    }
+                }
+                Ok(exact)
             }
             "disassemble" => self.disassemble(
                 self.address(&args["at"])?,
@@ -1622,6 +1858,14 @@ impl Target {
             "point" => {
                 let live = self.live()?;
                 let id = number(&args, "id")? as u32;
+                let pending = live.pending_points.contains_key(&id);
+                if pending {
+                    if live.points.contains_key(&id) {
+                        live.update_point(id, None)?;
+                    }
+                    live.pending_points.remove(&id);
+                    return Ok(Value::Null);
+                }
                 let existing = live
                     .points
                     .get(&id)
@@ -1636,13 +1880,46 @@ impl Target {
                 )?;
                 Ok(Value::Null)
             }
+            "addPendingPoint" => {
+                let live = self.live()?;
+                let id = u32::try_from(number(&args, "id")?)?;
+                let name = args["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty() && name.len() <= 1024)
+                    .ok_or_else(|| error("expected a symbol name of up to 1024 bytes"))?;
+                let module = serde_json::from_value(args["module"].clone())?;
+                live.pending_points.insert(
+                    id,
+                    PendingPoint {
+                        name: name.to_owned(),
+                        module,
+                        site: None,
+                    },
+                );
+                if let Err(issue) = live
+                    .install_loader_hook()
+                    .and_then(|()| live.refresh_pending_points())
+                {
+                    live.pending_points.remove(&id);
+                    return Err(issue);
+                }
+                Ok(Value::Null)
+            }
+            "pendingPointAddress" => {
+                let live = self.live()?;
+                let id = u32::try_from(number(&args, "id")?)?;
+                Ok(json!(
+                    live.pending_points
+                        .get(&id)
+                        .and_then(|point| point.site.as_ref())
+                        .map(|site| hex(site.address))
+                ))
+            }
             "step" => {
                 let live = self.live()?;
                 let tid = tid()?;
                 live.stop_sequences.remove(&tid);
                 live.step(tid, &args)?;
-                let address = regs::read(tid)?.stack.get(regs::PC)?;
-                live.steps.push(Event::Step { tid, address });
                 Ok(Value::Null)
             }
             "recordBranch" => {
@@ -1814,30 +2091,53 @@ struct ThreadId {
     tid: i32,
 }
 
-fn locals_from(page: Value, mut evaluate: impl FnMut(&str) -> Result<Value>) -> Result<Vec<Value>> {
-    let mut rows = Vec::new();
-    for item in page["items"].as_array().into_iter().flatten() {
-        let Some(name) = item["name"].as_str() else {
-            continue;
-        };
-        let report = if item["readable"] == true {
-            evaluate(name)?
-        } else {
-            Value::Null
-        };
-        rows.push(
-            json!({ "name":name, "type":report["result"]["type"]["name"],
-            "address":report["result"]["address"], "value":report["result"]["value"] }),
-        );
-    }
-    Ok(rows)
+fn flatten_frame_values(frame: &Value) -> Vec<Value> {
+    ["locals", "parameters"]
+        .into_iter()
+        .flat_map(|field| {
+            frame[field]
+                .as_object()
+                .into_iter()
+                .flat_map(|rows| rows.values())
+        })
+        .cloned()
+        .collect()
 }
 
-fn core_locals(core: &Core, tid: i32) -> Result<Vec<Value>> {
-    let handle = format!("session-core:{tid}:0");
-    let deadline = Instant::now() + DEADLINE;
-    let page = core.locals(&handle, 0, 64, deadline)?;
-    locals_from(page, |name| Ok(core.inspect(name, &handle, deadline, None)))
+fn list_source(location: Value, radius: u64) -> Result<Value> {
+    let Some((path, line)) = location["file"].as_str().zip(location["line"].as_u64()) else {
+        return Ok(Value::Null);
+    };
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Value::Null),
+        Err(err) => return Err(err.into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(Value::Null);
+    }
+    const MAX_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(error("source file exceeds 4 MiB"));
+    }
+    let lower = line.saturating_sub(radius).max(1);
+    let upper = line.saturating_add(radius);
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<_> = text
+        .lines()
+        .enumerate()
+        .map(|(index, text)| (index as u64 + 1, text))
+        .skip_while(|(number, _)| *number < lower)
+        .take_while(|(number, _)| *number <= upper)
+        .map(|(number, text)| json!({"line":number,"text":text}))
+        .collect();
+    Ok(json!({"file":path,"line":line,"lines":lines}))
 }
 
 fn evaluation(report: Value) -> Result<Value> {

@@ -493,6 +493,136 @@ def validate_attach(client, fixture, client_exe, socket, token, lease):
             client.close()
 
 
+def validate_process_lifecycle(client, fixture, library, owned):
+    def launch(*args):
+        result = client.tool("run", path=fixture, arg=list(args))
+        pid = result["result"]["pid"]
+        owned.add(pid)
+        return pid
+
+    def check(source, expected):
+        reply = client.script(source)
+        if len(logs(reply)) < len(expected):
+            tail = await_state(client, lambda row: not row["running_scripts"])
+            reply["output"] += tail["output"]
+        assert logs(reply) == expected, reply
+
+    parent = launch("kid")
+    check("""
+        const parent = dbg.pid;
+        const pending = dbg.pendingBreakpoint("fixture_stop", null);
+        if (pending.address === null) throw new Error("initial symbol was not bound");
+        dbg.followFork("child");
+        const fork = await dbg.continueForStop(parent, {timeoutMs:3000});
+        if (fork.kind !== "fork") throw new Error(fork.kind);
+        console.log(fork.parentPid === parent && fork.tid !== parent && dbg.pid === fork.tid, fork.paused);
+        const exec = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+        if (exec.kind !== "exec") throw new Error(exec.kind);
+        console.log(exec.paused, pending.address !== null);
+        const hit = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+        if (hit.kind !== "breakpoint") throw new Error(hit.kind);
+        console.log(hit.breakpointId === pending.id && hit.address === pending.address);
+        await dbg.resume();
+        const exit = await dbg.waitExit(3000);
+        console.log(exit.kind === "exit" && exit.reason === "code" && exit.code);
+    """, [[True, True], [True, True], [True], [23]])
+    owned.remove(parent)
+
+    child = launch("dlopen", library)
+    check("""
+        const point = dbg.pendingBreakpoint("fixture_linked", null, {module:"session-test.so"});
+        console.log(point.address === null);
+        for (let i = 1; i <= 2; ++i) {
+            const hit = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+            if (hit.kind !== "breakpoint") throw new Error(hit.kind);
+            console.log(hit.breakpointId === point.id && hit.address === point.address, hit.hitCount);
+        }
+        await dbg.resume();
+        const exit = await dbg.waitExit(3000);
+        console.log(exit.kind === "exit" && exit.reason === "code" && exit.code, point.address === null);
+    """, [[True], [True, 1], [True, 2], [24, True]])
+    owned.remove(child)
+
+
+def validate_debug_cases(client, fixtures, owned):
+    def launch(case):
+        target = client.tool("run", path=str(fixtures / case), arg=[])
+        pid = target["result"]["pid"]
+        owned.add(pid)
+        return pid
+
+    def script(source, expected):
+        result = client.script(source)
+        if len(logs(result)) < len(expected):
+            tail = await_state(client, lambda row: not row["running_scripts"])
+            result["output"] += tail["output"]
+        assert logs(result) == expected, result
+
+    for case, symbol, offset, before, after in (("D06", "flags", 0, 5, 2), ("D08", "rows", 16, 101, 0)):
+        pid = launch(case)
+        script(f"""
+            import type {{Value}} from "aidbg";
+            const at = (await dbg.getSymbol("{symbol}"))!.address + {offset}n;
+            dbg.hardwareWatchpoint(at, null, {{length:4, access:"write"}});
+            const stop = await dbg.continueForStop(dbg.pid, {{timeoutMs:3000}});
+            if (stop.kind !== "watchpoint") throw new Error(stop.kind);
+            console.log((stop.before as Value.Scalar<number>).$read(),
+                        (stop.after as Value.Scalar<number>).$read(), dbg.memory.readUint32(at));
+        """, [[before, after, after]])
+        client.script("await dbg.kill();")
+        owned.remove(pid)
+
+    pid = launch("D09")
+    script("""
+        const mangled = await dbg.getSymbol("_ZL14schedule_retryv");
+        const short = await dbg.getSymbol("schedule_retry");
+        const full = await dbg.getSymbol("schedule_retry()");
+        console.log(short?.demangledName, short?.address === mangled?.address,
+                    full?.address === mangled?.address);
+    """, [["schedule_retry()", True, True]])
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+    pid = launch("D10")
+    script("""
+        const at = (await dbg.getSymbol("Reader::read"))!.address;
+        const point = dbg.softwareBreakpoint(at);
+        const first = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+        if (first.kind !== "breakpoint") throw new Error(first.kind);
+        const untypedTid: any = first.tid;
+        const thread = await dbg.pauseThread(untypedTid);
+        if (thread.locals().length !== 0) throw new Error("unreadable locals at entry");
+        if ((await dbg.pauseAll()).length !== 1) throw new Error("unexpected thread count");
+        await thread.next(1);
+        const next = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+        if (next.kind !== "breakpoint") throw new Error(next.kind);
+        console.log(next.breakpointId === point.id, next.hitCount);
+    """, [[True, 2]])
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+    pid = launch("D05")
+    script("""
+        dbg.softwareBreakpoint("blocks_for");
+        const stop = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
+        if (stop.kind !== "breakpoint") throw new Error(stop.kind);
+        const [callee, caller] = dbg.thread(stop.tid).backtrace(2);
+        const listing = dbg.list(caller, 2);
+        console.log(callee.symbol, caller.symbol, caller.locals?.bytes?.value,
+                    listing?.lines.some(row => row.text.includes("blocks_for(bytes)")));
+        const controlled = await dbg.pauseThread(stop.tid);
+        let parameter: import("aidbg").Variable["value"] = null;
+        for (let i = 0; i < 5; ++i) {
+            await controlled.next(1);
+            parameter = controlled.backtrace(1)[0].parameters?.bytes?.value ?? null;
+            if (parameter === 4464) break;
+        }
+        console.log(parameter);
+    """, [["blocks_for", "main", 70000, True], [4464]])
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("client")
@@ -500,6 +630,8 @@ def main():
     parser.add_argument("fixtures", nargs="+")
     parser.add_argument("--object")
     parser.add_argument("--lease", action="store_true")
+    parser.add_argument("--cases", type=Path)
+    parser.add_argument("--library")
     args = parser.parse_args()
     client_exe, server_exe = map(os.path.abspath, (args.client, args.server))
     fixtures = list(map(os.path.abspath, args.fixtures))
@@ -522,6 +654,10 @@ def main():
                 validate_event_queue(client, fixtures[0], owned)
                 validate_next_hit(client, fixtures[0], owned)
                 validate_fault_and_kill(client, fixtures[0], owned)
+                if args.cases:
+                    validate_debug_cases(client, args.cases.resolve(), owned)
+                if args.library:
+                    validate_process_lifecycle(client, fixtures[0], os.path.abspath(args.library), owned)
                 for fixture in fixtures:
                     validate_debugging(client, fixture, directory, object_file, owned)
                     print("validated", Path(fixture).name, flush=True)

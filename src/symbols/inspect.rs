@@ -75,6 +75,38 @@ pub(crate) fn discover_stopped(
     page: (usize, usize),
     deadline: Instant,
 ) -> Result<serde_json::Value> {
+    let (dwarf, frame) = stopped_dwarf(root, memory, registers)?;
+    let (offset, limit) = page;
+    let result = match kind {
+        Discovery::Locals => {
+            dwarf.variables(memory, Some(&frame), pattern, offset, limit, deadline)
+        }
+        Discovery::Parameters => dwarf.parameters(memory, &frame, limit, deadline),
+        Discovery::Globals => dwarf.variables(memory, None, pattern, offset, limit, deadline),
+        Discovery::Types => dwarf.types(pattern, offset, limit, deadline),
+    };
+    result.map_err(|error| {
+        if error
+            .downcast_ref::<Failure>()
+            .is_some_and(|failure| failure.0 == "limit_reached")
+        {
+            crate::Diagnostic::new(
+                "LIMIT_REACHED",
+                error.to_string(),
+                Some("Use a smaller page or increase the callback timeout."),
+            )
+            .into()
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn stopped_dwarf(
+    root: &Path,
+    memory: &dyn crate::unwind::UnwindMemory,
+    registers: Registers,
+) -> Result<(offline::DwarfImage, crate::unwind::OfflineFrame)> {
     let pc = registers.get(PC)?;
     let exe = fs::metadata(root.join("exe")).ok();
     let no_dwarf = || {
@@ -106,49 +138,25 @@ pub(crate) fn discover_stopped(
             .cloned()
             .ok_or_else(no_dwarf)?,
     };
-    let (offset, limit) = page;
-    let result = match kind {
-        Discovery::Locals | Discovery::Parameters => {
-            let cfa = crate::unwind::canonical_frame_address(
-                cached.bytes.clone(),
-                &module,
-                link,
-                bias,
-                memory,
-                registers,
-            )
-            .ok();
-            let frame = crate::unwind::OfflineFrame {
-                pc,
-                regs: registers,
-                link: Some(link),
-                lookup_pc: pc,
-                cfa,
-            };
-            if matches!(kind, Discovery::Parameters) {
-                dwarf.parameters(memory, &frame, limit, deadline)
-            } else {
-                dwarf.variables(memory, Some(&frame), pattern, offset, limit, deadline)
-            }
-        }
-        Discovery::Globals => dwarf.variables(memory, None, pattern, offset, limit, deadline),
-        Discovery::Types => dwarf.types(pattern, offset, limit, deadline),
-    };
-    result.map_err(|error| {
-        if error
-            .downcast_ref::<Failure>()
-            .is_some_and(|failure| failure.0 == "limit_reached")
-        {
-            crate::Diagnostic::new(
-                "LIMIT_REACHED",
-                error.to_string(),
-                Some("Use a smaller page or increase the callback timeout."),
-            )
-            .into()
-        } else {
-            error
-        }
-    })
+    let cfa = crate::unwind::canonical_frame_address(
+        cached.bytes.clone(),
+        &module,
+        link,
+        bias,
+        memory,
+        registers,
+    )
+    .ok();
+    Ok((
+        dwarf,
+        crate::unwind::OfflineFrame {
+            pc,
+            regs: registers,
+            link: Some(link),
+            lookup_pc: pc,
+            cfa,
+        },
+    ))
 }
 
 pub(crate) fn enrich_arguments(

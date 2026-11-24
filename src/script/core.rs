@@ -813,22 +813,42 @@ impl Target {
         Ok(registers)
     }
 
-    pub(super) fn session_frames(&self, tid: i32) -> Result<Value> {
+    pub(super) fn session_frames(&self, tid: i32, limit: usize) -> Result<Value> {
         let frames = self
             .frames_for(tid)
             .ok_or_else(|| error("thread no longer exists"))?;
         let metadata = self.frame_metadata(tid)?;
+        let deadline = Instant::now() + std::time::Duration::from_millis(750);
         Ok(json!(
             frames
                 .iter()
                 .zip(metadata)
+                .take(limit)
                 .map(|(frame, site)| {
-                    json!({"pc":hex(frame.pc), "sp":frame.regs.get(regs::SP).ok().map(hex),
-                "fp":frame.regs.get(regs::FP).ok().map(hex), "symbol":site["function"],
-                "file":site["file"], "line":site["line"], "handle":site["handle"]})
+                    let values = self.session_frame_values(frame, deadline).unwrap_or(Value::Null);
+                    json!({"pc":hex(frame.pc), "lookupPc":hex(frame.lookup_pc),
+                        "sp":frame.regs.get(regs::SP).ok().map(hex), "fp":frame.regs.get(regs::FP).ok().map(hex),
+                        "symbol":site["function"], "file":site["file"], "line":site["line"],
+                        "locals":values["locals"], "parameters":values["parameters"]})
                 })
                 .collect::<Vec<_>>()
         ))
+    }
+
+    fn session_frame_values(&self, frame: &OfflineFrame, deadline: Instant) -> Result<Value> {
+        if Instant::now() >= deadline {
+            return Err(error("frame inspection deadline"));
+        }
+        self.frame_dwarf(frame)?
+            .frame_values(self, frame, 64, deadline)
+    }
+
+    pub(super) fn session_top_values(&self, tid: i32, deadline: Instant) -> Result<Value> {
+        let frame = self
+            .frames_for(tid)
+            .and_then(|frames| frames.first())
+            .ok_or_else(|| error("thread has no captured frame"))?;
+        self.session_frame_values(frame, deadline)
     }
 
     pub(super) fn session_mappings(&self) -> Value {

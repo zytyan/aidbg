@@ -11,17 +11,12 @@ fn word(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
-// GDB reads the live SVR4 linker rendezvous to locate shared objects in a core.
-pub(super) fn ranges(
+fn debug_record(
     root: &Path,
-    page: u64,
-    read: impl Fn(u64, &mut [u8]) -> Result<()>,
-    limit: &CaptureLimit<'_>,
-) -> Result<Vec<Range<u64>>> {
+    read: &impl Fn(u64, &mut [u8]) -> Result<()>,
+) -> Result<Option<(Range<u64>, u64)>> {
     const PROGRAM_HEADER_SIZE: u64 = 56;
     const MAX_DYNAMIC_BYTES: u64 = 64 * 1024;
-    const MAX_LINKS: usize = 16 * 1024;
-
     let auxv = fs::read(root.join("auxv"))?;
     let aux = |kind: libc::c_ulong| {
         auxv.chunks_exact(16)
@@ -29,7 +24,7 @@ pub(super) fn ranges(
             .map_or(0, |entry| word(entry, 8))
     };
     if aux(libc::AT_BASE) == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let phdr = aux(libc::AT_PHDR);
     let phnum = aux(libc::AT_PHNUM);
@@ -57,12 +52,46 @@ pub(super) fn ranges(
         .ok_or_else(|| error("invalid PT_DYNAMIC address"))?;
     let mut dynamic = vec![0; size as usize];
     read(address, &mut dynamic)?;
-    let mut ranges = vec![address..address + size];
-    let mut debug = dynamic
+    let debug = dynamic
         .chunks_exact(16)
         .take_while(|entry| word(entry, 0) != DT_NULL.0 as u64)
         .find(|entry| word(entry, 0) == DT_DEBUG.0 as u64)
         .map_or(0, |entry| word(entry, 8));
+    let end = address
+        .checked_add(size)
+        .ok_or_else(|| error("invalid PT_DYNAMIC extent"))?;
+    Ok(Some((address..end, debug)))
+}
+
+pub(crate) fn rendezvous(
+    root: &Path,
+    read: impl Fn(u64, &mut [u8]) -> Result<()>,
+) -> Result<Option<(u64, u32)>> {
+    let Some((_, debug)) = debug_record(root, &read)? else {
+        return Ok(None);
+    };
+    if debug == 0 {
+        return Ok(None);
+    }
+    let mut current = [0; 40];
+    read(debug, &mut current)?;
+    let hook = word(&current, 16);
+    let state = u32::from_le_bytes(current[24..28].try_into().unwrap());
+    Ok((hook != 0).then_some((hook, state)))
+}
+
+// GDB reads the live SVR4 linker rendezvous to locate shared objects in a core.
+pub(super) fn ranges(
+    root: &Path,
+    page: u64,
+    read: impl Fn(u64, &mut [u8]) -> Result<()>,
+    limit: &CaptureLimit<'_>,
+) -> Result<Vec<Range<u64>>> {
+    const MAX_LINKS: usize = 16 * 1024;
+    let Some((dynamic, mut debug)) = debug_record(root, &read)? else {
+        return Ok(Vec::new());
+    };
+    let mut ranges = vec![dynamic];
 
     let mut visited = BTreeSet::new();
     while debug != 0 && visited.len() < MAX_LINKS && visited.insert(debug) {

@@ -112,6 +112,7 @@ pub struct Thread {
     pub stop: Option<Stop>,
     requested: bool,
     pub newborn: bool,
+    private_fork: bool,
     stepping: bool,
 }
 
@@ -150,6 +151,8 @@ pub struct Trace {
     launched: bool,
     pub(crate) exit: Option<LaunchExit>,
     pub(crate) retired: Option<Vec<(i32, Option<LaunchExit>)>>,
+    pub(crate) follow_fork: bool,
+    follow_child: Option<i32>,
     patches: BTreeMap<u64, Patch>,
     pub foreign_software: bool,
     _same_thread: PhantomData<Rc<()>>,
@@ -189,6 +192,26 @@ fn forward_signal(request: libc::c_uint, tid: i32, signal: i32) -> nix::Result<(
     Errno::result(unsafe { libc::ptrace(request as _, tid, 0_usize, signal as usize) }).map(|_| ())
 }
 
+fn fork_copies_vm(tid: i32) -> bool {
+    let Ok(regs) = ptrace::getregs(Pid::from_raw(tid)) else {
+        return false;
+    };
+    #[cfg(target_arch = "x86_64")]
+    let (syscall, argument) = (regs.orig_rax, regs.rdi);
+    #[cfg(target_arch = "aarch64")]
+    let (syscall, argument) = (regs.regs[8], regs.regs[0]);
+    #[cfg(target_arch = "x86_64")]
+    if syscall == libc::SYS_fork as u64 {
+        return true;
+    }
+    let flags = match syscall as libc::c_long {
+        libc::SYS_clone => Some(argument),
+        libc::SYS_clone3 => read_process_word(tid, argument, 8).ok(),
+        _ => None,
+    };
+    flags.is_some_and(|flags| flags & libc::CLONE_VM as u64 == 0)
+}
+
 struct Patch {
     original: u32,
     mapping: modules::CodeMapping,
@@ -207,6 +230,8 @@ impl Trace {
             launched: false,
             exit: None,
             retired: None,
+            follow_fork: false,
+            follow_child: None,
             patches: BTreeMap::new(),
             foreign_software: false,
             _same_thread: PhantomData,
@@ -241,6 +266,7 @@ impl Trace {
                 stop: None,
                 requested: false,
                 newborn: false,
+                private_fork: false,
                 stepping: false,
             },
         );
@@ -305,6 +331,7 @@ impl Trace {
                                 stop: None,
                                 requested: false,
                                 newborn: false,
+                                private_fork: false,
                                 stepping: false,
                             },
                         );
@@ -436,7 +463,14 @@ impl Trace {
                             | libc::PTRACE_EVENT_VFORK
                     ) {
                         match ptrace::getevent(Pid::from_raw(tid)) {
-                            Ok(child) => children.push(child as i32),
+                            Ok(child) => {
+                                let private_fork =
+                                    event == libc::PTRACE_EVENT_FORK && fork_copies_vm(tid);
+                                children.push((child as i32, private_fork));
+                                if self.follow_fork && private_fork {
+                                    self.follow_child.get_or_insert(child as i32);
+                                }
+                            }
                             Err(e) => {
                                 failure.get_or_insert_with(|| error(e.to_string()));
                             }
@@ -538,19 +572,23 @@ impl Trace {
             }
         }
         for tid in exited {
+            if self.follow_child == Some(tid) {
+                self.follow_child = None;
+            }
             if let Some(t) = self.threads.remove(&tid)
                 && !self.monitored
             {
                 self.observed.insert(tid, t.before);
             }
         }
-        for tid in children {
+        for (tid, private_fork) in children {
             self.threads.entry(tid).or_insert_with(|| Thread {
                 identity: next_thread_identity(),
                 before: Status::read(&task_path(&self.root, tid)).ok(),
                 stop: None,
                 requested: false,
                 newborn: true,
+                private_fork,
                 stepping: false,
             });
         }
@@ -592,11 +630,15 @@ impl Trace {
     pub fn detach_foreign_children(&mut self) -> Result<()> {
         let mut foreign = Vec::new();
         for (&tid, thread) in &self.threads {
-            if thread.newborn && thread.stop.is_some() && !task_path(&self.root, tid).is_dir() {
+            if self.follow_child != Some(tid)
+                && thread.newborn
+                && thread.stop.is_some()
+                && !task_path(&self.root, tid).is_dir()
+            {
                 if !self.patches.is_empty() {
                     // A fork can inherit patched bytes. vfork or a foreign
                     // CLONE_VM task can also share the parent's address space.
-                    self.foreign_software = true;
+                    self.foreign_software |= !thread.private_fork;
                     self.restore_bytes(tid, Path::new(&format!("/proc/{tid}")))?;
                 }
                 match ptrace::detach(Pid::from_raw(tid), None) {
@@ -609,6 +651,43 @@ impl Trace {
             self.threads.remove(&tid);
         }
         Ok(())
+    }
+
+    pub(crate) fn awaiting_fork(&self) -> bool {
+        self.follow_child.is_some()
+    }
+
+    pub(crate) fn take_fork_child(&mut self) -> Result<Option<(i32, u64, PathBuf, Self)>> {
+        let Some(pid) = self.follow_child else {
+            return Ok(None);
+        };
+        if self
+            .threads
+            .get(&pid)
+            .is_none_or(|thread| thread.stop.is_none())
+        {
+            return Ok(None);
+        }
+        let root = PathBuf::from(format!("/proc/{pid}"));
+        let start = start_ticks(&root)?;
+        self.restore_bytes(pid, &root)?;
+        crate::breakpoint::disarm(pid)?;
+        ptrace::setoptions(
+            Pid::from_raw(pid),
+            ptrace::Options::PTRACE_O_TRACEEXEC
+                | ptrace::Options::PTRACE_O_TRACECLONE
+                | ptrace::Options::PTRACE_O_TRACEFORK
+                | ptrace::Options::PTRACE_O_TRACEVFORK,
+        )?;
+        let mut thread = self.threads.remove(&pid).unwrap();
+        thread.stop = Some(Stop::Interrupt);
+        thread.newborn = false;
+        self.follow_child = None;
+        let mut child = Self::new(pid, &root, start);
+        child.monitor();
+        child.follow_fork = self.follow_fork;
+        child.threads.insert(pid, thread);
+        Ok(Some((pid, start, root, child)))
     }
 
     fn stopped_tid(&self) -> Result<i32> {
@@ -885,6 +964,8 @@ impl Trace {
     }
 
     pub(crate) fn close_with_signal_delivery(&mut self, deliver_signals: bool) -> Cleanup {
+        self.follow_fork = false;
+        self.follow_child = None;
         let before: Vec<_> = self.threads.keys().copied().collect();
         let mut cleanup = Cleanup::default();
         // Release threads already in a ptrace stop before waiting for any

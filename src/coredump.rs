@@ -1,5 +1,5 @@
 mod elf;
-mod loader;
+pub(crate) mod loader;
 mod memory;
 
 mod config;

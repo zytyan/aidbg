@@ -37,6 +37,13 @@ pub(crate) struct DwarfImage {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariableMode {
+    Declarations,
+    Parameters,
+    Values,
+}
+
 impl DwarfImage {
     pub fn load(obj: &object::File<'_>, bias: u64, path: PathBuf) -> Result<Option<Self>> {
         if obj.section_by_name(".debug_info").is_none() {
@@ -82,7 +89,15 @@ impl DwarfImage {
         limit: usize,
         deadline: Instant,
     ) -> Result<Json> {
-        self.variable_page(memory, Some(frame), "*", 0, limit, deadline, true)
+        self.variable_page(
+            memory,
+            Some(frame),
+            "*",
+            0,
+            limit,
+            deadline,
+            VariableMode::Parameters,
+        )
     }
 
     pub fn variables(
@@ -94,7 +109,59 @@ impl DwarfImage {
         limit: usize,
         deadline: Instant,
     ) -> Result<Json> {
-        self.variable_page(memory, frame, pattern, offset, limit, deadline, false)
+        self.variable_page(
+            memory,
+            frame,
+            pattern,
+            offset,
+            limit,
+            deadline,
+            VariableMode::Declarations,
+        )
+    }
+
+    pub(crate) fn frame_values(
+        &self,
+        memory: &dyn UnwindMemory,
+        frame: &crate::unwind::OfflineFrame,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Json> {
+        let page = self.variable_page(
+            memory,
+            Some(frame),
+            "*",
+            0,
+            limit,
+            deadline,
+            VariableMode::Values,
+        )?;
+        let mut visible = std::collections::BTreeMap::new();
+        for item in page["items"].as_array().into_iter().flatten() {
+            let name = item["name"].as_str().unwrap();
+            let depth = item["scope_depth"].as_u64().unwrap();
+            let current = visible.entry(name).or_insert((depth, item));
+            if depth > current.0 {
+                *current = (depth, item);
+            }
+        }
+        let mut locals = serde_json::Map::new();
+        let mut parameters = serde_json::Map::new();
+        for (name, (_, item)) in visible {
+            let value = &item["value"]["result"];
+            if value.is_null() {
+                continue;
+            }
+            let rows = if item["kind"] == "parameter" {
+                &mut parameters
+            } else {
+                &mut locals
+            };
+            rows.insert(name.to_owned(),json!({
+                "name":name, "type":value["type"]["name"], "address":value["address"], "value":value["value"],
+            }));
+        }
+        Ok(json!({"locals":locals,"parameters":parameters}))
     }
 
     fn variable_page(
@@ -105,7 +172,7 @@ impl DwarfImage {
         offset: usize,
         limit: usize,
         deadline: Instant,
-        parameters: bool,
+        mode: VariableMode,
     ) -> Result<Json> {
         if pattern.len() > 1024 {
             return Err(crate::Diagnostic::new(
@@ -157,7 +224,9 @@ impl DwarfImage {
                 Some(&mut |qualified, local, tag, candidate| {
                     if local != frame.is_some()
                         || !pattern.matches(qualified)
-                        || (parameters && tag != gimli::DW_TAG_formal_parameter)
+                        || (mode == VariableMode::Parameters
+                            && tag != gimli::DW_TAG_formal_parameter)
+                        || (mode == VariableMode::Values && !candidate.active)
                     {
                         return true;
                     }
@@ -169,14 +238,19 @@ impl DwarfImage {
                         truncated = true;
                         return false;
                     }
-                    if parameters {
+                    if mode != VariableMode::Declarations {
                         let outcome = Outcome::from_result(evaluate_candidate(
                             &eval,
                             candidate,
                             &[],
                             self.path.clone(),
                         ));
-                        items.push(json!({"name": qualified, "value": outcome}));
+                        items.push(if mode == VariableMode::Values {
+                            json!({"name": qualified, "value":outcome, "scope_depth":candidate.priority,
+                                "kind":if tag == gimli::DW_TAG_formal_parameter {"parameter"} else {"variable"}})
+                        } else {
+                            json!({"name": qualified, "value": outcome})
+                        });
                         return true;
                     }
                     prologue |= candidate.prologue;
@@ -236,10 +310,10 @@ impl DwarfImage {
                 }));
                     true
                 }),
-                frame.is_some() && !parameters,
+                frame.is_some() && mode == VariableMode::Declarations,
                 function,
             )?;
-            if truncated || (parameters && !items.is_empty()) {
+            if truncated || (mode == VariableMode::Parameters && !items.is_empty()) {
                 break;
             }
         }

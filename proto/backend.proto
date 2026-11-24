@@ -76,6 +76,8 @@ enum SymbolMatch {
   EXACT = 0;
   GLOB = 1;
   REGEX = 2;
+  CPP_SIGNATURE = 3;
+  CPP_NAME = 4;
 }
 
 message SearchSymbolsRequest {

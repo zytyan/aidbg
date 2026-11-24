@@ -1,10 +1,12 @@
 #include <errno.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 struct Node {
@@ -65,7 +67,32 @@ static int event_fixture(void) {
     return signal_count == 1 ? 37 : 93;
 }
 
+static int child_fixture(void) {
+    fixture_stop(&packet);
+    return 23;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'c') return child_fixture();
+    if (argc > 1 && argv[1][0] == 'k') {
+        pid_t child = fork();
+        if (child == 0) {
+            execl(argv[0], argv[0], "child", (char *)NULL);
+            _exit(96);
+        }
+        int status;
+        return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status)
+            ? WEXITSTATUS(status) : 97;
+    }
+    if (argc > 2 && argv[1][0] == 'd') {
+        for (int i = 0; i < 2; ++i) {
+            void *library = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+            if (!library) return 94;
+            int (*function)(int) = (int (*)(int))dlsym(library, "fixture_linked");
+            if (!function || function(i) != i + 9 || dlclose(library) != 0) return 95;
+        }
+        return 24;
+    }
     if (argc > 1 && argv[1][0] == 'e') return event_fixture();
     if (argc > 1 && argv[1][0] == 'f') {
         volatile uintptr_t inaccessible = 0;

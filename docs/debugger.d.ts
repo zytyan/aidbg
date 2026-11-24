@@ -67,6 +67,7 @@ export interface Module {
 
 export interface SymbolInfo {
     readonly name: string;
+    readonly demangledName?: string;
     readonly address: bigint;
     readonly size?: number;
     readonly module?: string;
@@ -224,6 +225,8 @@ export type RegisterSnapshot =
 
 export interface StackFrame {
     readonly pc: bigint;
+    /** 调用者帧用于查找源码和变量作用域的地址。 */
+    readonly lookupPc: bigint;
     readonly sp: bigint;
     /** Frame Pointer */
     readonly fp: bigint;
@@ -232,8 +235,10 @@ export interface StackFrame {
     readonly symbol?: string;
     /** 距离函数入口的偏移 */
     readonly offset?: number;
-    /** 本地变量（若有 DWARF 信息） */
+    /** 此帧可读的局部变量。缺少 DWARF 或无法恢复帧上下文时省略。 */
     readonly locals?: LocalVariables;
+    /** 此帧可读的形参。 */
+    readonly parameters?: LocalVariables;
     /** 若dwarf信息存在，则显示文件名与行号 */
     readonly file?: string;
     readonly line?: number;
@@ -244,6 +249,12 @@ export interface ThreadSnapshot {
     readonly registers: RegisterSnapshot;
     readonly frames: readonly StackFrame[];
     readonly locals?: readonly Variable[];
+}
+
+export interface SourceListing {
+    readonly file: string;
+    readonly line: number;
+    readonly lines: readonly { readonly line: number; readonly text: string }[];
 }
 
 export interface DebugSnapshot {
@@ -265,6 +276,10 @@ export interface Breakpoint {
     disable(): void;
     /** 删除该断点 */
     remove(): void;
+}
+
+export interface PendingBreakpoint extends Omit<Breakpoint, "address"> {
+    readonly address: bigint | null;
 }
 
 export interface BreakpointHit {
@@ -331,7 +346,7 @@ export interface Thread {
     injectSyscall(id: bigint, ...args: bigint[]): bigint[];
     /** 获取调用栈 */
     backtrace(limit?: number): readonly StackFrame[];
-    /** 获取当前位置的局部变量（若有 DWARF 信息） */
+    /** 获取当前位置作用域内可读的局部变量（若有 DWARF 信息）。 */
     locals(): Variable[];
 
     /** 消费该线程最早的停点事件。仅观察，不恢复线程。默认等待 180 秒。 */
@@ -343,6 +358,7 @@ export interface Thread {
 }
 
 export interface ControlledThread extends Thread {
+    /** 步进完成时线程仍暂停。步进完成本身不进入公共停点队列。 */
     next(n?: number): Promise<void>;
     /** 走到下 n 个分支指令时断住 */
     nextBranch(n?: number): Promise<void>;
@@ -490,6 +506,8 @@ interface WatchpointOptions {
 
 export interface Debugger {
     detach(): Promise<void>;
+    /** 新的 fork 默认跟踪父进程。child 模式切换至子进程并暂停在 fork 边界。 */
+    followFork(mode: "parent" | "child"): void;
     /** 分离调试器并丢弃待投递信号，再发送指定信号。默认 SIGKILL。 */
     kill(signal?: number): Promise<void>;
     /** 消费进程退出事件。正常退出或信号退出都作为结果返回。 */
@@ -517,11 +535,13 @@ export interface Debugger {
     /** 回调必须明确调用 passToTarget 才会处理待投递信号。 */
     onSignal(signal: number | string, cb: SignalCallback | null): void;
 
-    /** 获取单个符号（高频精准查找） */
+    /** 依次查找 ELF 原名、完整 C++ 签名、唯一 C++ 函数名。C++ 匹配有歧义时抛错。 */
     getSymbol(name: string): Promise<SymbolInfo | null>;
     /** 流式遍历符号（模糊搜索、全量扫描） */
     iterSymbols(pattern: RegExp): AsyncIterableIterator<SymbolInfo>;
     /** 暂停预算暂时有意不加 */
+    /** 按原始 ELF 符号持续绑定软件断点。映像或共享库尚未加载时 address 为 null。 */
+    pendingBreakpoint(name: string, callback: BreakpointCallback | null, options?: { module?: string }): PendingBreakpoint;
     hardwareBreakpoint(
         at: bigint | string,
         cb?: BreakpointCallback | null,
@@ -559,6 +579,8 @@ export interface Debugger {
 
     pause(tid: number): Promise<ControlledThread>;
     pause(tid: "all"): Promise<ControlledThread[]>;
+    pauseThread(tid: number): Promise<ControlledThread>;
+    pauseAll(): Promise<ControlledThread[]>;
     /** 立即恢复指定范围，默认 "all"。 */
     resume(tid?: number | "all"): Promise<void>;
     /** resume 的同义词。立即返回，不消费停点。 */
@@ -573,6 +595,8 @@ export interface Debugger {
     /** 返回唯一匹配的运行时地址。无匹配或存在多个地址时返回 null。 */
     lineToAddr(file: string, line: number): bigint | null;
     addrToLine(addr: bigint): { file: string; line: number } | null;
+    /** 从调试服务端读取地址或帧对应的源码。默认前后各 5 行，找不到源码时返回 null。 */
+    list(at: bigint | StackFrame, radius?: number): SourceListing | null;
 }
 
 export type WaitResult<T> = T | { readonly kind: "timeout" } | { readonly kind: "ended" };
@@ -609,7 +633,8 @@ export type BreakpointStop = EventLocation & {
 
 export type StoppedEvent =
     | BreakpointStop
-    | (EventLocation & { readonly kind: "step"; readonly address: bigint })
+    | (EventLocation & { readonly kind: "fork"; readonly parentPid: number })
+    | (EventLocation & { readonly kind: "exec"; readonly executable: string | null })
     | (EventLocation & {
         readonly kind: "signal";
         readonly signalNumber: number;

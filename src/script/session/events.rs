@@ -57,7 +57,7 @@ impl Wait {
                     || (tid_matches
                         && (terminal || row["kind"] == "breakpoint" || row["kind"] == "watchpoint"))
             }
-            Kind::Batch | Kind::Stop => process || tid_matches,
+            Kind::Batch | Kind::Stop => process || row["kind"] == "fork" || tid_matches,
         }
     }
 }
@@ -83,6 +83,14 @@ impl Queue {
         self.waiters.clear();
         self.terminal = false;
         self.exited.clear();
+    }
+
+    pub fn follow_fork(&mut self, old_threads: Vec<i32>) {
+        self.events.clear();
+        self.terminal = false;
+        self.exited.clear();
+        self.exited
+            .extend(old_threads.into_iter().map(|tid| (tid, self.sequence)));
     }
 
     pub fn len(&self) -> usize {

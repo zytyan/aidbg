@@ -318,7 +318,11 @@
     }
     function frame(raw) {
         const {handle, ...row} = raw;
+        const variables = values => values == null ? undefined : Object.freeze(
+            Object.fromEntries(Object.entries(values).map(([name, item]) => [name, Object.freeze(variable(item))]))
+        );
         return Object.freeze({...row, pc:BigInt(raw.pc), sp:BigInt(raw.sp ?? 0), fp:BigInt(raw.fp ?? 0),
+            lookupPc:BigInt(raw.lookupPc ?? raw.pc), locals:variables(raw.locals), parameters:variables(raw.parameters),
             symbol:optional(raw.symbol), file:optional(raw.file), line:optional(raw.line)});
     }
     function snapshot(raw) {
@@ -482,14 +486,23 @@
         if (callback != null && typeof callback !== "function") throw new TypeError("expected breakpoint callback");
         const generation = rpc("generation");
         const id = ++nextPoint;
-        const address = BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...options}));
+        const pending = type === "pending";
+        const address = pending
+            ? rpc("addPendingPoint", {id, name:at, ...options})
+            : BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...options}));
         const change = remove => {
             if (generation !== rpc("generation")) throw new Error("breakpoint no longer exists");
             rpc("point", {id, remove});
             points.delete(id);
         };
         const point = Object.freeze({
-            id, type, address,
+            id, type:pending ? "software_breakpoint" : type,
+            get address() {
+                if (!pending) return address;
+                if (generation !== rpc("generation")) return null;
+                const bound = rpc("pendingPointAddress", {id});
+                return bound == null ? null : BigInt(bound);
+            },
             get tid() {
                 if (generation !== rpc("generation")) return Object.freeze([]);
                 return Object.freeze(options.tid === undefined ? rpc("threads") : [options.tid]);
@@ -506,7 +519,8 @@
         return point;
     }
 
-    const symbol = row => Object.freeze({...row, address:BigInt(row.address), module:optional(row.module)});
+    const symbol = row => Object.freeze({...row, address:BigInt(row.address), module:optional(row.module),
+        demangledName:optional(row.demangledName)});
     const processIo = Object.freeze({
         stdin:Object.freeze({
             write:data => rpc("stdio",{operation:"write",data}),
@@ -527,8 +541,14 @@
         mappings:() => Object.freeze(rpc("mappings").map(mapping)),
         async snapshot(tid) { return snapshot(rpc("snapshot", {tid})); },
         async pause(tid) {
-            const threads = rpc("pause", {tid}).map(tid => makeThread(tid, true));
-            return tid === "all" ? threads : threads[0];
+            return tid === "all" ? dbg.pauseAll() : dbg.pauseThread(tid);
+        },
+        async pauseThread(tid) {
+            if (scope(tid) === undefined) throw new TypeError("pauseThread requires a numeric thread ID");
+            return makeThread(rpc("pause", {tid})[0], true);
+        },
+        async pauseAll() {
+            return rpc("pause", {tid:"all"}).map(tid => makeThread(tid, true));
         },
         async resume(tid = "all") { rpc("continue", {tid:scope(tid) ?? "all"}); },
         async continue(tid = "all") { return dbg.resume(tid); },
@@ -537,6 +557,7 @@
         async waitStops(limit, timeoutMs) { return waitEvent({kind:"batch",limit,timeoutMs},callbackContext); },
         async ask(payload, timeoutMs) { return ask(payload,timeoutMs,callbackTid); },
         async detach() { rpc("detach"); },
+        followFork(mode) { rpc("followFork", {mode}); },
         async kill(signal) { rpc("kill", {signal}); },
         async prepare() { rpc("prepare"); },
         async prepareScratchPad() { rpc("prepareScratchPad"); },
@@ -551,6 +572,10 @@
             return result == null ? null : BigInt(result);
         },
         addrToLine(address) { return rpc("addrToLine",{address:word(address)}); },
+        list(at, radius = 5) {
+            return rpc("listSource", {address:word(typeof at === "bigint" ? at : at.lookupPc),
+                radius:integer(radius,"invalid source context")});
+        },
         async getSymbol(name) {
             const rows = rpc("symbols", {pattern:name});
             return rows.length ? symbol(rows[0]) : null;
@@ -579,6 +604,7 @@
             yield* matches(rpc("linkedSymbols"));
         },
         hardwareBreakpoint(at, callback, tid) { return install("hardware_breakpoint",at,callback,{tid}); },
+        pendingBreakpoint(name, callback, options) { return install("pending",name,callback,options); },
         softwareBreakpoint(at, callback, tid) { return install("software_breakpoint",at,callback,{tid}); },
         hardwareWatchpoint(at, callback, options) { return install("hardware_watchpoint",at,callback,options); },
         softwareWatchpoint(at, callback, options) { return install("software_watchpoint",at,callback,options); },

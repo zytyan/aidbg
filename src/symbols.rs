@@ -345,14 +345,16 @@ fn find_symbols(
     (results, truncated)
 }
 
-enum Matcher<'a> {
+pub(crate) enum Matcher<'a> {
     Exact(&'a str),
     Glob(glob::Pattern),
     Regex(regex::Regex),
+    CppSignature(&'a str),
+    CppName(&'a str),
 }
 
 impl<'a> Matcher<'a> {
-    fn new(mode: SymbolMatch, pattern: &'a str) -> Result<Self> {
+    pub(crate) fn new(mode: SymbolMatch, pattern: &'a str) -> Result<Self> {
         if pattern.is_empty() || pattern.len() > 1024 {
             return Err(error("symbol pattern must contain 1–1024 bytes"));
         }
@@ -364,14 +366,41 @@ impl<'a> Matcher<'a> {
                     .size_limit(1024 * 1024)
                     .build()?,
             ),
+            SymbolMatch::CppSignature => Self::CppSignature(pattern),
+            SymbolMatch::CppName => Self::CppName(pattern),
         })
     }
 
-    fn matches(&self, name: &str) -> bool {
+    pub(crate) fn matches(&self, name: &str) -> bool {
         match self {
             Self::Exact(pattern) => name == *pattern,
             Self::Glob(pattern) => pattern.matches(name),
             Self::Regex(pattern) => pattern.is_match(name),
+            Self::CppSignature(pattern) => {
+                let names = crate::cpp_names::names(name);
+                names
+                    .demangled_name
+                    .as_deref()
+                    .is_some_and(|full| full == *pattern || names.display_name == *pattern)
+            }
+            Self::CppName(pattern) => cpp_demangle::Symbol::new(name.as_bytes())
+                .ok()
+                .and_then(|symbol| {
+                    symbol
+                        .demangle_with_options(
+                            &cpp_demangle::DemangleOptions::default()
+                                .no_params()
+                                .no_return_type(),
+                        )
+                        .ok()
+                })
+                .is_some_and(|qualified| {
+                    qualified == *pattern
+                        || (!pattern.contains("::")
+                            && qualified
+                                .strip_suffix(pattern)
+                                .is_some_and(|prefix| prefix.ends_with("::")))
+                }),
         }
     }
 }

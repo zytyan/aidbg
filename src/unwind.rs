@@ -597,7 +597,11 @@ impl Images {
                         if next.get(SP)? < sp {
                             return Err(error("caller SP moved backwards"));
                         }
-                        regs = next;
+                        regs = if via == "frame_pointer" {
+                            frame_pointer_registers(next)
+                        } else {
+                            next
+                        };
                         method = via;
                     }
                 }
@@ -666,6 +670,16 @@ pub(crate) struct OfflineFrame {
     pub cfa: Option<u64>,
 }
 
+fn frame_pointer_registers(next: Registers) -> Registers {
+    // A frame record alone does not recover the caller's general registers.
+    let mut recovered = Registers::empty();
+    recovered.set_instruction_pac_mask(next.instruction_pac_mask());
+    for register in [PC, SP, FP] {
+        recovered.set(register, next.get(register).ok());
+    }
+    recovered
+}
+
 pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
     memory: &dyn UnwindMemory,
     image_at: impl Fn(u64) -> Option<(I, u64)>,
@@ -726,13 +740,7 @@ pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
             break;
         }
         regs = if method == "frame_pointer" {
-            // The fallback recovered the frame record only.
-            let mut recovered = Registers::empty();
-            recovered.set_instruction_pac_mask(next.instruction_pac_mask());
-            for register in [PC, SP, FP] {
-                recovered.set(register, next.get(register).ok());
-            }
-            recovered
+            frame_pointer_registers(next)
         } else {
             next
         };
