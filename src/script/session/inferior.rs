@@ -81,12 +81,16 @@ impl Live {
             loop {
                 let stop = self.trace.step_one(tid, deadline)?;
                 let at = regs::read(tid)?.stack.get(regs::PC)?;
+                // ARM64 Linux can report the single-step after SVC as
+                // SI_USER with sender 0. The PC check below ties it to SVC.
                 let synthetic_trap = matches!(stop, Some(Stop::Delivery(Signal::SIGTRAP)))
                     && ptrace::getsiginfo(pid).is_ok_and(|info| {
                         matches!(
                             info.si_code,
                             libc::TRAP_TRACE | libc::TRAP_BRKPT | libc::SI_KERNEL
-                        )
+                        ) || (cfg!(target_arch = "aarch64")
+                            && info.si_code == libc::SI_USER
+                            && unsafe { info.si_pid() } == 0)
                     });
                 if at == instruction + SYSCALL.len() as u64
                     && (matches!(stop, Some(Stop::Step)) || synthetic_trap)

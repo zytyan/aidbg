@@ -279,6 +279,7 @@ def validate_event_queue(client, fixture, owned):
     result = client.tool("run", path=fixture, arg=["events"])
     pid = result["result"]["pid"]
     owned.add(pid)
+    assert result["result"]["scratchpad"] and not result["signals"], result
     reply = client.script("""
         const addr = (await dbg.getSymbol("fixture_stop"))!.address;
         const line = dbg.addrToLine(addr)!;
