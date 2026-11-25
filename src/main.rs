@@ -1,30 +1,56 @@
 use aidbg::{Result, rpc::*};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex;
 use tonic::{Request, metadata::AsciiMetadataValue};
 
 const API_URI: &str = "aidbg://debugger.d.ts";
 const NODE_API_URI: &str = "aidbg://node.d.ts";
 
+const START_SERVER: &str =
+    "Start aidbg-server on the Linux debugging host. For a local Unix socket:
+
+  state_dir=\"$(mktemp -d)\"
+  aidbg-server --state-dir \"$state_dir\" --socket \"$state_dir/aidbg.sock\"
+
+For TCP (including Windows clients), use a trusted network or SSH forwarding:
+
+  state_dir=\"$(mktemp -d)\"
+  aidbg-server --state-dir \"$state_dir\" --listen HOST:PORT
+
+Configure the MCP host to run aidbg with args [\"mcp\"]. Then call the connect tool
+with socket set to the absolute socket path or endpoint set to http://HOST:PORT.
+Use the optional session token to reconnect to the same debugging session within 30 seconds.";
+
 #[derive(Parser)]
-#[command(about = "Expose the aidbg debugger over MCP stdio", version = aidbg::BUILD_VERSION)]
+#[command(about = "Expose the aidbg debugger over MCP stdio", after_help = START_SERVER)]
 struct Args {
-    #[arg(
-        long,
-        conflicts_with = "endpoint",
-        required_unless_present = "endpoint"
-    )]
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the MCP stdio process.
+    #[command(after_help = START_SERVER)]
+    Mcp,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ConnectArgs {
+    #[schemars(description = "Absolute path to the server Unix socket")]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[schemars(description = "TCP endpoint in the form http://HOST:PORT")]
     endpoint: Option<String>,
-    /// Use the same token to reconnect within 30 seconds.
-    #[arg(long)]
+    #[schemars(
+        description = "Session token to reuse within 30 seconds (24–128 ASCII letters, digits, hyphens, or underscores)"
+    )]
     session: Option<String>,
 }
 
@@ -94,13 +120,18 @@ struct PerfArgs {
     tid: Option<i32>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Mcp {
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
+#[derive(Clone)]
+struct Connection {
     client: Client,
     session: AsciiMetadataValue,
 }
 
-impl Mcp {
+impl Connection {
     fn request<T>(&self, value: T) -> Request<T> {
         let mut request = Request::new(value);
         request
@@ -108,13 +139,20 @@ impl Mcp {
             .insert("aidbg-session", self.session.clone());
         request
     }
+
+    async fn heartbeat(&self) -> std::result::Result<(), tonic::Status> {
+        let mut request = self.request(HeartbeatRequest {});
+        request.set_timeout(Duration::from_secs(2));
+        self.client.clone().heartbeat(request).await?;
+        Ok(())
+    }
 }
 
 impl rmcp::ServerHandler for Mcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(rmcp::model::ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(rmcp::model::Implementation::new("aidbg", aidbg::BUILD_VERSION))
-            .with_instructions("Select a target with run, attach or core_open. Use script_run for TypeScript debugging. Read aidbg://debugger.d.ts and aidbg://node.d.ts for the script APIs. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
+            .with_instructions("Call connect with a Unix socket or TCP endpoint first. Select a target with run, attach or core_open. Use script_run for TypeScript debugging. Read aidbg://debugger.d.ts and aidbg://node.d.ts for the script APIs. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
     }
 
     fn list_tools(
@@ -127,7 +165,11 @@ impl rmcp::ServerHandler for Mcp {
     + '_ {
         async {
             Ok(rmcp::model::ListToolsResult::with_all_items(
-                Self::tool_router().list_all(),
+                Self::tool_router()
+                    .list_all()
+                    .into_iter()
+                    .chain(Connection::tool_router().list_all())
+                    .collect(),
             ))
         }
     }
@@ -169,11 +211,76 @@ impl rmcp::ServerHandler for Mcp {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
-        Self::tool_router()
-            .call(rmcp::handler::server::tool::ToolCallContext::new(
-                self, request, context,
-            ))
-            .await
+        use rmcp::handler::server::tool::ToolCallContext;
+
+        if request.name == "connect" {
+            return Self::tool_router()
+                .call(ToolCallContext::new(self, request, context))
+                .await;
+        }
+        let connection = self.connection.lock().await.clone();
+        match connection {
+            Some(connection) => {
+                Connection::tool_router()
+                    .call(ToolCallContext::new(&connection, request, context))
+                    .await
+            }
+            None => Ok(CallToolResult::structured_error(json!({
+                "error": "Call connect with a server socket or endpoint first."
+            }))
+            .into()),
+        }
+    }
+}
+
+#[tool_router]
+impl Mcp {
+    #[tool(
+        description = "Connect to an aidbg-server. Supply exactly one of socket or endpoint. Reuse the returned session token to reconnect to the same session."
+    )]
+    async fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> CallToolResult {
+        match self.open_connection(args).await {
+            Ok(result) => CallToolResult::structured(result),
+            Err(error) => CallToolResult::structured_error(json!({"error": error.to_string()})),
+        }
+    }
+
+    async fn open_connection(&self, args: ConnectArgs) -> Result<Value> {
+        if args.socket.is_some() == args.endpoint.is_some() {
+            return Err("provide exactly one of socket or endpoint".into());
+        }
+        let endpoint = endpoint(args.socket.as_deref(), args.endpoint.as_deref())?
+            .expect("exactly one address was provided");
+        let session = match args.session {
+            Some(session) => session,
+            None => {
+                let file = tempfile::Builder::new()
+                    .prefix("session-")
+                    .rand_bytes(32)
+                    .tempfile()?;
+                file.path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        let mut active = self.connection.lock().await;
+        let connection = Connection {
+            client: connect(endpoint).await?,
+            session: session.parse()?,
+        };
+        connection.heartbeat().await?;
+        *active = Some(connection);
+
+        let mut result = json!({"status": "connected", "session": session});
+        if let Some(socket) = args.socket {
+            result["socket"] = json!(socket);
+        }
+        if let Some(endpoint) = args.endpoint {
+            result["endpoint"] = json!(endpoint);
+        }
+        Ok(result)
     }
 }
 
@@ -246,7 +353,7 @@ fn reply(
 }
 
 #[tool_router]
-impl Mcp {
+impl Connection {
     #[tool(description = "Run a program on the debugger server and stop at exec.")]
     async fn run(&self, Parameters(args): Parameters<RunArgs>) -> CallToolResult {
         reply(
@@ -410,37 +517,22 @@ impl Mcp {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let endpoint = endpoint(args.socket.as_deref(), args.endpoint.as_deref())?
-        .expect("clap validates the endpoint");
-    let session = args.session.map_or_else(
-        || {
-            let file = tempfile::Builder::new()
-                .prefix("session-")
-                .rand_bytes(32)
-                .tempfile()?;
-            Ok::<_, std::io::Error>(
-                file.path()
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        },
-        Ok,
-    )?;
-    let mcp = Mcp {
-        client: connect_lazy(endpoint),
-        session: session.parse()?,
-    };
+    match Args::parse().command {
+        Command::Mcp => serve_mcp().await,
+    }
+}
+
+async fn serve_mcp() -> Result<()> {
+    let mcp = Mcp::default();
     let heartbeat = mcp.clone();
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             interval.tick().await;
-            let mut request = heartbeat.request(HeartbeatRequest {});
-            request.set_timeout(Duration::from_secs(2));
-            let _ = heartbeat.client.clone().heartbeat(request).await;
+            let active = heartbeat.connection.lock().await.clone();
+            if let Some(active) = active {
+                let _ = active.heartbeat().await;
+            }
         }
     });
     let service = mcp.serve(rmcp::transport::stdio()).await?;

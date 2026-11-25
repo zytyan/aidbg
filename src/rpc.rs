@@ -40,7 +40,7 @@ pub fn endpoint(socket: Option<&Path>, tcp: Option<&str>) -> Result<Option<Endpo
                 .is_some_and(|path| path.as_str() != "/")
         {
             return Err(crate::error(
-                "use --endpoint http://HOST:PORT with a reachable server address",
+                "use endpoint http://HOST:PORT with a reachable server address",
             ));
         }
         return Ok(Some(
@@ -52,7 +52,7 @@ pub fn endpoint(socket: Option<&Path>, tcp: Option<&str>) -> Result<Option<Endpo
     #[cfg(windows)]
     if socket.is_some() {
         Err(crate::error(
-            "--socket requires Linux. Use --endpoint for a TCP connection.",
+            "socket requires Linux. Use endpoint for a TCP connection.",
         ))
     } else {
         Ok(None)
@@ -67,8 +67,4 @@ fn client(channel: Channel) -> Client {
 
 pub async fn connect(endpoint: Endpoint) -> Result<Client> {
     Ok(client(endpoint.connect().await?))
-}
-
-pub fn connect_lazy(endpoint: Endpoint) -> Client {
-    client(endpoint.connect_lazy())
 }

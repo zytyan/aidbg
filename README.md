@@ -18,14 +18,15 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 
 在需要非压缩指针的 AArch64 系统上，从源码构建时加上 `--features plain-ptrs`。
 
-在 MCP 客户端配置中，将 `command` 设为 `aidbg` 可执行文件的绝对路径，并传入 `["--socket", "/absolute/path/to/aidbg.sock"]`。跨主机使用服务端的 `--listen HOST:PORT` 和客户端的 `--endpoint http://HOST:PORT`。Windows 客户端使用 TCP。明文服务应仅绑定可信网络或通过 SSH 转发访问。
+在 MCP 客户端配置中，将 `command` 设为 `aidbg` 可执行文件的绝对路径，`args` 设为 `["mcp"]`。启动后调用 MCP 工具 `connect`，传入 `{"socket": "/absolute/path/to/aidbg.sock"}`。跨主机或从 Windows 连接时，在服务端使用 `--listen HOST:PORT`，再向 `connect` 传入 `{"endpoint": "http://HOST:PORT"}`。明文服务应仅绑定可信网络或通过 SSH 转发访问。`aidbg help mcp` 提供两种服务端启动方式。
 
-每个 MCP 客户端会话拥有一个调试目标。指定 `--session` 可以在客户端重启时复用同一个会话令牌，令牌须包含 24 至 128 个字母、数字、连字符或下划线。服务端在 30 秒内未收到客户端请求或心跳后释放调试目标。
+每个调试会话拥有一个调试目标。`connect` 返回 `session` 令牌，客户端重启后可将该令牌传给 `connect` 以恢复同一个会话。也可以指定自己的令牌，须包含 24 至 128 个 ASCII 字母、数字、连字符或下划线。服务端在 30 秒内未收到客户端请求或心跳后释放调试目标。
 
 ## MCP 工具
 
 | 工具 | 参数和用法 |
 | --- | --- |
+| `connect` | 连接服务端。填写 `socket` 或 `endpoint`，可传入 `session` 复用会话。 |
 | `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标在 exec 后暂停。 |
 | `attach` | `pid` 是进程 ID。附加后线程暂停。 |
 | `core_open` | `path` 是服务端上的 ELF core 或 zstd 压缩的 core，可指定 `executable` 和 `debug_symbols`。 |

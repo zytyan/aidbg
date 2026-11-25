@@ -10,19 +10,25 @@ import subprocess
 import tempfile
 import time
 
-TOOLS = {"run", "attach", "script_run", "core_open", "send_input", "interrupt_input",
+TOOLS = {"connect", "run", "attach", "script_run", "core_open", "send_input", "interrupt_input",
          "snapshot", "perf", "ps", "set_fork_policy"}
 
 
 class Client:
     def __init__(self, executable, socket, token):
         self.process = subprocess.Popen(
-            [executable, "--socket", socket, "--session", token],
+            [executable, "mcp"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.counter = 0
         self.rpc("initialize", protocolVersion="2024-11-05", capabilities={},
                  clientInfo={"name": "aidbg integration test", "version": "1"})
         self.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        disconnected = self.rpc("tools/call", name="ps", arguments={})
+        assert disconnected["isError"] and "connect" in disconnected["structuredContent"]["error"], disconnected
+        connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token})
+        assert connected["structuredContent"] == {"status": "connected", "socket": socket, "session": token}, connected
+        failed = self.rpc("tools/call", name="connect", arguments={"socket": socket + ".missing"})
+        assert failed["isError"], failed
 
     def write(self, message):
         self.process.stdin.write(json.dumps(message).encode() + b"\n")
