@@ -1,9 +1,11 @@
 mod events;
+mod files;
 mod inferior;
 mod instruction;
 mod link;
 mod process_io;
 mod source_map;
+mod syscalls;
 mod target;
 
 use self::target::{Event, Live, Target};
@@ -43,7 +45,8 @@ pub enum Command {
     Script(String),
     Input(String, std::result::Result<String, String>),
     Snapshot(Option<i32>),
-    Processes,
+    Processes(bool),
+    SetForkPolicy(String),
     Result(Result<Value>),
 }
 
@@ -99,12 +102,13 @@ impl Drop for Worker {
 
 struct Waiting {
     tid: Option<i32>,
-    deadline: Option<Instant>,
-    payload: Option<Value>,
+    deadline: Instant,
+    payload: Value,
 }
 
 struct State {
     target: Option<Target>,
+    follow_fork: bool,
     generation: u64,
     state_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
@@ -127,6 +131,9 @@ struct State {
 impl State {
     fn replace(&mut self, target: Option<Target>) {
         self.target = target;
+        if let Some(Target::Live(live)) = &mut self.target {
+            live.trace.follow_fork = self.follow_fork;
+        }
         self.generation += 1;
         self.signals.clear();
         self.events.reset();
@@ -315,8 +322,8 @@ impl State {
                     handler.clone(),
                     Waiting {
                         tid,
-                        payload: Some(payload.clone()),
-                        deadline: Some(Instant::now() + Duration::from_millis(timeout)),
+                        payload: payload.clone(),
+                        deadline: Instant::now() + Duration::from_millis(timeout),
                     },
                 );
                 Ok(json!(handler))
@@ -376,29 +383,21 @@ impl State {
                 self.log(id, args["value"].clone());
                 Ok(Value::Null)
             }
-            "wait" => {
-                if self.waiting.len() >= MAX_PENDING {
-                    return Err(error("too many waiting input handlers"));
-                }
-                let deadline = match args["seconds"].as_f64() {
-                    Some(seconds) if (0.0..=86400.0).contains(&seconds) => {
-                        Some(Instant::now() + Duration::from_secs_f64(seconds))
+            "setForkPolicy" => {
+                self.follow_fork = match args["mode"].as_str() {
+                    Some("parent") => false,
+                    Some("child") => true,
+                    Some("both") => {
+                        return Err(error(
+                            "NotSupport: following both processes requires multi-instance debugging",
+                        ));
                     }
-                    Some(_) => return Err(error("timeoutSec must be between 0 and 86400")),
-                    None => None,
+                    _ => return Err(error("expected parent, child, or both")),
                 };
-                let tid = args["tid"].as_i64().and_then(|tid| i32::try_from(tid).ok());
-                self.next_handler += 1;
-                let handler = format!("input-{}", self.next_handler);
-                self.waiting.insert(
-                    handler.clone(),
-                    Waiting {
-                        tid,
-                        deadline,
-                        payload: None,
-                    },
-                );
-                Ok(json!(handler))
+                if let Some(Target::Live(live)) = &mut self.target {
+                    live.trace.follow_fork = self.follow_fork;
+                }
+                Ok(Value::Null)
             }
             "detach" => {
                 self.target.as_mut().ok_or_else(no_target)?.operation(
@@ -451,10 +450,7 @@ impl State {
                 .map(|(handler, state)| WaitingInput {
                     handler: handler.clone(),
                     tid: state.tid,
-                    payload_json: state
-                        .payload
-                        .as_ref()
-                        .map_or_else(Vec::new, |events| events.to_string().into_bytes()),
+                    payload_json: state.payload.to_string().into_bytes(),
                 })
                 .collect(),
             script_output: self.output.drain(..).collect(),
@@ -559,10 +555,12 @@ impl Exports {
 
 fn declarations() -> String {
     let api = include_str!("../../docs/debugger.d.ts").replace("export declare ", "export ");
+    let node = include_str!("session/node.d.ts");
     format!(
         r#"declare module "aidbg" {{
 {api}
 }}
+{node}
 interface AidbgGlobals {{}}
 declare const dbg: import("aidbg").Debugger;
 declare const m: import("aidbg").TypeSystem;
@@ -586,6 +584,7 @@ fn run(
     let deadline = Rc::new(std::cell::Cell::new(Instant::now() + SCRIPT_SLICE));
     let flag = cancelled.clone();
     let runtime = Runtime::new()?;
+    files::install(&runtime);
     runtime.set_memory_limit(96 * 1024 * 1024);
     runtime.set_max_stack_size(512 * 1024);
     let limit = deadline.clone();
@@ -595,6 +594,7 @@ fn run(
     let context = Context::full(&runtime)?;
     let state = Rc::new(RefCell::new(State {
         target: None,
+        follow_fork: false,
         generation: 0,
         state_dir,
         cancelled: cancelled.clone(),
@@ -614,7 +614,8 @@ fn run(
         next_timer: 0,
     }));
     let mut compiler = Compiler::with_session_api(&declarations(), true);
-    context.with(|ctx| {
+    let result = context.with(|ctx| {
+        ctx.store_userdata(files::Jobs::default()).map_err(|_| error("cannot initialize filesystem jobs"))?;
         let mut pending = Vec::new();
         let mut exports = Exports::default();
         let mut next_script = 0;
@@ -648,6 +649,7 @@ fn run(
             deadline.set(Instant::now() + SCRIPT_SLICE);
             tick(&state, &dispatch, &input, &ctx)?;
             fire_timers(&state,&fire_timer)?;
+            files::poll(&ctx)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
             resolve_events(&state,&event_result)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
@@ -724,7 +726,8 @@ fn run(
                         pending.push(Pending { id, generation, module, promise, declarations });
                         Ok(json!({"script_id":id,"status":"accepted"}))
                     }
-                    Command::Processes => processes(),
+                    Command::Processes(threads) => processes(threads),
+                    Command::SetForkPolicy(mode) => state.borrow_mut().operation("setForkPolicy", json!({"mode":mode})),
                     Command::Result(result) => result,
                 }
             })();
@@ -767,7 +770,11 @@ fn run(
         }
         state.borrow_mut().replace(None);
         Ok(())
-    })
+    });
+    context.with(|ctx| {
+        let _ = ctx.remove_userdata::<files::Jobs>();
+    });
+    result
 }
 
 fn sync_generation(
@@ -815,7 +822,7 @@ fn tick(
         .borrow()
         .waiting
         .iter()
-        .filter(|(_, wait)| wait.deadline.is_some_and(|time| now >= time))
+        .filter(|(_, wait)| now >= wait.deadline)
         .map(|(handler, _)| handler.clone())
         .collect();
     for handler in expired {
@@ -909,6 +916,10 @@ fn tick(
                         row["after"] = json!(watch.after.map(crate::hex));
                         row["access"] = json!(watch.access);
                     }
+                    row["sequence"] = json!(state.events.push(row.clone(), false));
+                    by_tid.entry(tid).or_default().push(row);
+                }
+                Event::Syscall { tid, mut row } => {
                     row["sequence"] = json!(state.events.push(row.clone(), false));
                     by_tid.entry(tid).or_default().push(row);
                 }
@@ -1099,7 +1110,9 @@ fn exception_text<'js>(ctx: &Ctx<'js>, error: rquickjs::CaughtError<'js>) -> Str
     }
 }
 
-fn processes() -> Result<Value> {
+fn processes(threads: bool) -> Result<Value> {
+    use std::fmt::Write;
+
     let mut rows = Vec::new();
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
@@ -1110,18 +1123,53 @@ fn processes() -> Result<Value> {
         let Ok(status) = procfs::Status::read(&path) else {
             continue;
         };
+        if procfs::is_kernel_thread(&path, &status) {
+            continue;
+        }
+        let ppid = status.field("PPid").unwrap_or("?").to_owned();
+        let count = status.field("Threads").unwrap_or("?").to_owned();
         let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
-        let args: Vec<_> = cmdline
+        let args = cmdline
             .strip_suffix(&[0])
             .unwrap_or(&cmdline)
             .split(|&byte| byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(String::from_utf8_lossy)
-            .collect();
-        rows.push((pid, json!({"pid":pid,"ppid":status.field("PPid").and_then(|n| n.parse::<u32>().ok()),
-            "uid":status.field("Uid").and_then(|uid| uid.split_whitespace().next()?.parse::<u32>().ok()),
-            "name":status.name(),"state":status.state(),"arg":args})));
+            .map(|arg| String::from_utf8_lossy(arg).escape_debug().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let args = if args.is_empty() {
+            format!("[{}]", status.name().unwrap_or_default().escape_debug())
+        } else {
+            args
+        };
+        let mut tids = Vec::new();
+        if threads {
+            let Ok(tasks) = fs::read_dir(path.join("task")) else {
+                continue;
+            };
+            tids.extend(
+                tasks
+                    .flatten()
+                    .filter_map(|task| task.file_name().to_str()?.parse::<i32>().ok()),
+            );
+            tids.sort_unstable();
+        }
+        rows.push((pid, ppid, count, args, tids));
     }
-    rows.sort_by_key(|(pid, _)| *pid);
-    Ok(json!({"processes":rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>()}))
+    rows.sort_by_key(|row| row.0);
+    let mut output = if threads {
+        "PID PPID TID ARGS\n"
+    } else {
+        "PID PPID THREADS ARGS\n"
+    }
+    .to_owned();
+    for (pid, ppid, count, args, tids) in rows {
+        if threads {
+            for tid in tids {
+                writeln!(output, "{pid} {ppid} {tid} {args}")?;
+            }
+        } else {
+            writeln!(output, "{pid} {ppid} {count} {args}")?;
+        }
+    }
+    Ok(json!(output))
 }

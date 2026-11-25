@@ -98,6 +98,61 @@ pub(crate) fn live_type_graphs(
 }
 
 impl offline::DwarfImage {
+    pub(crate) fn variable_type_graph(
+        &self,
+        target: &str,
+        link_pc: Option<u64>,
+        deadline: Instant,
+    ) -> Result<Option<Graph>> {
+        let dwarf = self.data.borrow();
+        let mut units = dwarf.units();
+        let mut budget = ScanBudget::foreground(deadline);
+        let mut best = None;
+        while let Some(header) = units.next()? {
+            let unit = dwarf.unit(header)?;
+            let Some(candidate) = find_variable(
+                &dwarf,
+                &unit,
+                target,
+                link_pc,
+                &mut budget,
+                None,
+                None,
+                false,
+                None,
+            )?
+            else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_some_and(|(priority, _)| *priority > candidate.priority)
+            {
+                continue;
+            }
+            let entry = unit.entry(candidate.offset)?;
+            let Ok(offset) = typedef_target(&unit, &entry) else {
+                continue;
+            };
+            let mut builder = Builder {
+                dwarf: &dwarf,
+                unit: &unit,
+                nodes: vec![Node::Void],
+                seen: BTreeMap::new(),
+                deadline,
+            };
+            let root = builder.entry(offset, 0)?;
+            best = Some((
+                candidate.priority,
+                Graph {
+                    root,
+                    nodes: builder.nodes,
+                },
+            ));
+        }
+        Ok(best.map(|(_, graph)| graph))
+    }
+
     pub(crate) fn type_graphs(
         &self,
         pattern: &str,

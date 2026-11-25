@@ -214,14 +214,6 @@
                 rpc("log", {id, value:{kind:"printf", text:sprintf(format, ...args)}});
             },
             sprintf, hexdump, bytesFromHex,
-            waitInput(seconds) {
-                check();
-                if (seconds !== undefined && (typeof seconds !== "number" || !Number.isFinite(seconds))) {
-                    throw new RangeError("invalid input timeout");
-                }
-                const handler = rpc("wait", {id, seconds, tid:callbackTid});
-                return new Promise((resolve, reject) => inputs.set(handler, {resolve, reject}));
-            },
         });
     }
 
@@ -338,6 +330,15 @@
         return prot;
     };
     function stopEvent(row) {
+        if (row.kind === "syscall") {
+            row.args = Object.freeze(row.args.map(BigInt));
+            if (row.result != null) row.result = BigInt(row.result);
+            else { delete row.result; delete row.failed; }
+            if (row.name == null) delete row.name;
+            if (row.pathname == null) delete row.pathname;
+            if (row.parameterNames == null) delete row.parameterNames;
+            else Object.freeze(row.parameterNames);
+        }
         if (row.kind === "signal") {
             const {tid, sequence} = row, generation = rpc("generation");
             Object.defineProperty(row, "passToTarget", {
@@ -530,6 +531,8 @@
         stderr:Object.freeze({read:() => rpc("stdio",{operation:"stderr"})}),
         combinedOutErr:Object.freeze({read:() => rpc("stdio",{operation:"combined"})}),
     });
+    const syscallCatches = new Map();
+    let nextSyscallCatch = 0;
     const dbg = Object.freeze({
         get arch() { return arch; },
         endian:"le",
@@ -540,9 +543,6 @@
         threads:() => Object.freeze(rpc("threads").map(tid => makeThread(tid))),
         mappings:() => Object.freeze(rpc("mappings").map(mapping)),
         async snapshot(tid) { return snapshot(rpc("snapshot", {tid})); },
-        async pause(tid) {
-            return tid === "all" ? dbg.pauseAll() : dbg.pauseThread(tid);
-        },
         async pauseThread(tid) {
             if (scope(tid) === undefined) throw new TypeError("pauseThread requires a numeric thread ID");
             return makeThread(rpc("pause", {tid})[0], true);
@@ -550,14 +550,25 @@
         async pauseAll() {
             return rpc("pause", {tid:"all"}).map(tid => makeThread(tid, true));
         },
-        async resume(tid = "all") { rpc("continue", {tid:scope(tid) ?? "all"}); },
-        async continue(tid = "all") { return dbg.resume(tid); },
+        async resumeThread(tid) {
+            if (scope(tid) === undefined) throw new TypeError("resumeThread requires a numeric thread ID");
+            rpc("continue", {tid});
+        },
+        async resumeAll() { rpc("continue", {tid:"all"}); },
         continueForStop,
         async waitExit(timeoutMs) { return waitEvent({kind:"process_exit",timeoutMs},callbackContext); },
         async waitStops(limit, timeoutMs) { return waitEvent({kind:"batch",limit,timeoutMs},callbackContext); },
         async ask(payload, timeoutMs) { return ask(payload,timeoutMs,callbackTid); },
         async detach() { rpc("detach"); },
-        followFork(mode) { rpc("followFork", {mode}); },
+        setForkPolicy(mode) { rpc("setForkPolicy", {mode}); },
+        catchSyscall(tid, phase, callback) {
+            const key = scope(tid) ?? "all";
+            if (callback != null && typeof callback !== "function") throw new TypeError("expected a syscall callback");
+            const catchId = nextSyscallCatch++;
+            rpc("catchSyscall", {tid:key, phase, catchId});
+            if (phase == null) syscallCatches.delete(key);
+            else syscallCatches.set(key, {id:catchId, callback});
+        },
         async kill(signal) { rpc("kill", {signal}); },
         async prepare() { rpc("prepare"); },
         async prepareScratchPad() { rpc("prepareScratchPad"); },
@@ -641,7 +652,17 @@
                 callbackContext = context;
                 callbackTid = tid;
                 try {
-                    if (event.breakpointId !== undefined) {
+                    if (event.kind === "syscall") {
+                        const installed = [syscallCatches.get(tid), syscallCatches.get("all")]
+                            .find(catchpoint => catchpoint?.id === event.catchId);
+                        if (!installed) continue;
+                        if (installed.callback == null) context.pause = true;
+                        else result = installed.callback(Object.freeze({
+                            ...stopEvent(event), thread,
+                            pause() { check(); context.pause = true; },
+                            continue() { check(); context.pause = false; },
+                        }));
+                    } else if (event.breakpointId !== undefined) {
                         const installed = points.get(event.breakpointId);
                         if (!installed) continue;
                         context.counts[event.sequence] = ++installed.count;
@@ -831,6 +852,10 @@
         },
         lazy(getter) { return descriptor({kind:"lazy",getter}); },
         self() { return selfType; },
+        typeOfVar(name) {
+            const graph = rpc("typeOfVar", {name, tid:callbackTid});
+            return graph == null ? undefined : dwarfType({graph});
+        },
         fromDwarf(name) {
             const rows = Array.from(dwarfRows(name,true));
             if (rows.length !== 1) throw new Error("expected one DWARF type named " + name + ", found " + rows.length);
@@ -1143,6 +1168,7 @@
             for (const waiter of eventWaiters.values()) waiter.reject(new Error("target changed"));
             eventWaiters.clear();
             points.clear();
+            syscallCatches.clear();
             signals.clear();
             for (const key of Object.keys(exports)) delete exports[key];
         },

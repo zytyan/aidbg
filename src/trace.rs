@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 pub enum Stop {
     Interrupt,
     ExecBoundary,
+    Syscall,
     Group(Signal),
     Delivery(Signal),
     UnnamedDelivery(i32),
@@ -63,6 +64,11 @@ impl Stop {
             },
             Self::Breakpoint { .. } => StopInfo {
                 kind: "hardware_breakpoint",
+                signal: libc::SIGTRAP,
+                event: None,
+            },
+            Self::Syscall => StopInfo {
+                kind: "syscall",
                 signal: libc::SIGTRAP,
                 event: None,
             },
@@ -153,6 +159,8 @@ pub struct Trace {
     pub(crate) retired: Option<Vec<(i32, Option<LaunchExit>)>>,
     pub(crate) follow_fork: bool,
     follow_child: Option<i32>,
+    pub(crate) syscall_all: bool,
+    pub(crate) syscall_threads: std::collections::BTreeSet<i32>,
     patches: BTreeMap<u64, Patch>,
     pub foreign_software: bool,
     _same_thread: PhantomData<Rc<()>>,
@@ -232,6 +240,8 @@ impl Trace {
             retired: None,
             follow_fork: false,
             follow_child: None,
+            syscall_all: false,
+            syscall_threads: Default::default(),
             patches: BTreeMap::new(),
             foreign_software: false,
             _same_thread: PhantomData,
@@ -245,7 +255,8 @@ impl Trace {
     pub(crate) fn seize_launched(&mut self, trace_exit: bool) -> Result<()> {
         ptrace::seize(
             self.pid,
-            ptrace::Options::PTRACE_O_TRACEEXEC
+            ptrace::Options::PTRACE_O_TRACESYSGOOD
+                | ptrace::Options::PTRACE_O_TRACEEXEC
                 | ptrace::Options::PTRACE_O_TRACECLONE
                 | ptrace::Options::PTRACE_O_TRACEFORK
                 | ptrace::Options::PTRACE_O_TRACEVFORK
@@ -307,13 +318,15 @@ impl Trace {
                     continue;
                 }
                 let options = if self.launched {
-                    ptrace::Options::PTRACE_O_TRACEEXEC
+                    ptrace::Options::PTRACE_O_TRACESYSGOOD
+                        | ptrace::Options::PTRACE_O_TRACEEXEC
                         | ptrace::Options::PTRACE_O_TRACECLONE
                         | ptrace::Options::PTRACE_O_TRACEFORK
                         | ptrace::Options::PTRACE_O_TRACEVFORK
                         | ptrace::Options::PTRACE_O_EXITKILL
                 } else if self.monitored {
                     ptrace::Options::PTRACE_O_TRACECLONE
+                        | ptrace::Options::PTRACE_O_TRACESYSGOOD
                         | ptrace::Options::PTRACE_O_TRACEEXEC
                         | ptrace::Options::PTRACE_O_TRACEFORK
                         | ptrace::Options::PTRACE_O_TRACEVFORK
@@ -448,6 +461,7 @@ impl Trace {
                 continue;
             }
             thread.stop = match status {
+                Ok(Wait::Named(WaitStatus::PtraceSyscall(_))) => Some(Stop::Syscall),
                 Ok(Wait::Named(WaitStatus::PtraceEvent(_, sig, libc::PTRACE_EVENT_STOP))) => Some(
                     if sig == Signal::SIGTRAP || (self.launched && thread.newborn) {
                         Stop::Interrupt
@@ -602,14 +616,30 @@ impl Trace {
         let thread = self.threads.get_mut(&tid).expect("known thread");
         let stop = thread.stop.expect("stopped thread");
         let pid = Pid::from_raw(tid);
+        let syscall = self.syscall_all || self.syscall_threads.contains(&tid);
+        let resume = |signal| {
+            if syscall {
+                ptrace::syscall(pid, signal)
+            } else {
+                ptrace::cont(pid, signal)
+            }
+        };
         let result = match stop {
             Stop::Group(_) => {
                 Errno::result(unsafe { libc::ptrace(libc::PTRACE_LISTEN, tid, 0_usize, 0_usize) })
                     .map(|_| ())
             }
-            Stop::Delivery(signal) => ptrace::cont(pid, Some(signal)),
-            Stop::UnnamedDelivery(signal) => forward_signal(libc::PTRACE_CONT as _, tid, signal),
-            _ => ptrace::cont(pid, None),
+            Stop::Delivery(signal) => resume(Some(signal)),
+            Stop::UnnamedDelivery(signal) => forward_signal(
+                if syscall {
+                    libc::PTRACE_SYSCALL
+                } else {
+                    libc::PTRACE_CONT
+                } as _,
+                tid,
+                signal,
+            ),
+            _ => resume(None),
         };
         match result {
             Ok(()) => {
@@ -674,7 +704,8 @@ impl Trace {
         crate::breakpoint::disarm(pid)?;
         ptrace::setoptions(
             Pid::from_raw(pid),
-            ptrace::Options::PTRACE_O_TRACEEXEC
+            ptrace::Options::PTRACE_O_TRACESYSGOOD
+                | ptrace::Options::PTRACE_O_TRACEEXEC
                 | ptrace::Options::PTRACE_O_TRACECLONE
                 | ptrace::Options::PTRACE_O_TRACEFORK
                 | ptrace::Options::PTRACE_O_TRACEVFORK,

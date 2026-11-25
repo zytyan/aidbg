@@ -134,7 +134,12 @@ impl Debugger for Service {
             .await
     }
     async fn ps(&self, request: Request<ProcessListRequest>) -> Reply {
-        self.command(request, |_| Command::Processes).await
+        self.command(request, |args| Command::Processes(args.threads))
+            .await
+    }
+    async fn set_fork_policy(&self, request: Request<ForkPolicyRequest>) -> Reply {
+        self.command(request, |args| Command::SetForkPolicy(args.mode))
+            .await
     }
     async fn perf(&self, request: Request<SessionProfileRequest>) -> Reply {
         {

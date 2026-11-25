@@ -506,8 +506,11 @@ interface WatchpointOptions {
 
 export interface Debugger {
     detach(): Promise<void>;
-    /** 新的 fork 默认跟踪父进程。child 模式切换至子进程并暂停在 fork 边界。 */
-    followFork(mode: "parent" | "child"): void;
+    /** 普通 fork 默认跟踪父进程。child 模式切换至子进程并暂停在 fork 边界。both 需要多实例支持。 */
+    setForkPolicy(mode: "parent" | "child" | "both"): void;
+    /** 设置或移除指定范围的系统调用捕获。省略回调时命中会保持暂停。 */
+    catchSyscall(tid: number | "all", phase: "entry" | "exit" | "both" | null,
+        callback?: (hit: SyscallCaught) => void | Promise<void>): void;
     /** 分离调试器并丢弃待投递信号，再发送指定信号。默认 SIGKILL。 */
     kill(signal?: number): Promise<void>;
     /** 消费进程退出事件。正常退出或信号退出都作为结果返回。 */
@@ -577,14 +580,12 @@ export interface Debugger {
      */
     coredump(toFile: string, kind: CoredumpKind): void;
 
-    pause(tid: number): Promise<ControlledThread>;
-    pause(tid: "all"): Promise<ControlledThread[]>;
     pauseThread(tid: number): Promise<ControlledThread>;
     pauseAll(): Promise<ControlledThread[]>;
-    /** 立即恢复指定范围，默认 "all"。 */
-    resume(tid?: number | "all"): Promise<void>;
-    /** resume 的同义词。立即返回，不消费停点。 */
-    continue(tid?: number | "all"): Promise<void>;
+    /** 立即恢复指定线程。 */
+    resumeThread(tid: number): Promise<void>;
+    /** 立即恢复所有线程。 */
+    resumeAll(): Promise<void>;
     /** 先取最早匹配的排队事件。没有时先登记等待，再恢复指定范围。 */
     continueForStop(tid?: number | "all", options?: ContinueOptions): Promise<WaitResult<StopEvent>>;
     /** 等待并消费一批已排队的停点，不恢复线程。默认最多 16 条。 */
@@ -631,8 +632,30 @@ export type BreakpointStop = EventLocation & {
     readonly after?: Value.Base;
 };
 
+export type SyscallStop = EventLocation & {
+    readonly kind: "syscall";
+    readonly catchId: number;
+    readonly phase: "entry" | "exit";
+    readonly number: number;
+    /** Linux audit architecture identifier. */
+    readonly abi: number;
+    readonly name?: string;
+    readonly parameterNames?: readonly string[];
+    readonly pathname?: string;
+    readonly args: readonly bigint[];
+    readonly result?: bigint;
+    readonly failed?: boolean;
+};
+
+export type SyscallCaught = SyscallStop & {
+    readonly thread: ControlledThread;
+    pause(): void;
+    continue(): void;
+};
+
 export type StoppedEvent =
     | BreakpointStop
+    | SyscallStop
     | (EventLocation & { readonly kind: "fork"; readonly parentPid: number })
     | (EventLocation & { readonly kind: "exec"; readonly executable: string | null })
     | (EventLocation & {
@@ -709,11 +732,6 @@ export interface Console {
      */
     printf(fmt: string, ...args: unknown[]): void;
     sprintf(fmt: string, ...args: unknown[]): string;
-    /**
-     * 等待外部通过 MCP `send_input(handler, data)` 发送输入；
-     * 超时或收到 `interrupt_input(handler, msg)` 时抛出异常以跳出循环。
-     */
-    waitInput(timeoutSec?: number): Promise<string>;
     hexdump(data: Uint8Array, options?: HexdumpOptions): string;
     bytesFromHex(s: string): Uint8Array;
 }
@@ -955,8 +973,8 @@ export interface TypeSystem {
 
     /** 第二遍编译根据 DWARF 信息替换为精确类型 */
     fromDwarf<const S extends string>(name: S & LiteralString<S>): any;
-    /** 从变量中获取dwarf信息，有可能返回undefined代表找不到类型 */
-    typeOfVar<const S extends string>(name: S & LiteralString<S>): any;
+    /** 查询当前回调线程（或进程主线程）顶层栈帧中变量的 DWARF 类型。找不到时返回 undefined。 */
+    typeOfVar<const S extends string>(name: S & LiteralString<S>): Type.Base<unknown> | undefined;
 }
 
 export type ExitEvent = {

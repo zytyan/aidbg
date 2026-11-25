@@ -77,6 +77,8 @@ pub(super) struct Live {
     pending_points: BTreeMap<u32, PendingPoint>,
     loader_hook: Option<u64>,
     handled_stops: BTreeSet<i32>,
+    syscall_catches: BTreeMap<Option<i32>, super::syscalls::Catch>,
+    syscall_entries: BTreeMap<i32, super::syscalls::Entry>,
     programmed: BTreeMap<i32, u64>,
     watch_values: BTreeMap<u32, u64>,
     branch_record: BTreeMap<i32, (u64, bool)>,
@@ -102,6 +104,10 @@ pub(super) enum Event {
         id: u32,
         address: u64,
         watch: Option<WatchHit>,
+    },
+    Syscall {
+        tid: i32,
+        row: Value,
     },
     Signal {
         tid: i32,
@@ -165,6 +171,8 @@ impl Live {
             pending_points: BTreeMap::new(),
             loader_hook: None,
             handled_stops: BTreeSet::new(),
+            syscall_catches: BTreeMap::new(),
+            syscall_entries: BTreeMap::new(),
             programmed: BTreeMap::new(),
             watch_values: BTreeMap::new(),
             branch_record: BTreeMap::new(),
@@ -792,6 +800,10 @@ impl Live {
                 let mut child = Self::new(pid, root, start, trace, false);
                 child.paused.insert(pid);
                 child.stdio = self.stdio.take();
+                if let Some(catch) = self.syscall_catches.get(&None).copied() {
+                    child.syscall_catches.insert(None, catch);
+                    child.trace.syscall_all = true;
+                }
                 child.pending_points = std::mem::take(&mut self.pending_points);
                 for point in child.pending_points.values_mut() {
                     point.site = None;
@@ -840,6 +852,13 @@ impl Live {
             self.refresh_pending_points()?;
         }
         self.trace.detach_foreign_children()?;
+        self.syscall_entries
+            .retain(|tid, _| self.trace.threads.contains_key(tid));
+        self.syscall_catches
+            .retain(|tid, _| tid.is_none_or(|tid| self.trace.threads.contains_key(&tid)));
+        self.trace
+            .syscall_threads
+            .retain(|tid| self.trace.threads.contains_key(tid));
         self.paused
             .retain(|tid| self.trace.threads.contains_key(tid));
         self.callbacks
@@ -920,6 +939,16 @@ impl Live {
                                 Some(Stop::Step)
                             );
                         hits
+                    }
+                    Stop::Syscall => {
+                        let catches = [
+                            self.syscall_catches.get(&Some(tid)),
+                            self.syscall_catches.get(&None),
+                        ];
+                        super::syscalls::read_stop(tid, &mut self.syscall_entries, catches)?
+                            .into_iter()
+                            .map(|row| Event::Syscall { tid, row })
+                            .collect()
                     }
                     Stop::Delivery(signal) => {
                         let fault = matches!(
@@ -1679,19 +1708,70 @@ impl Target {
                 };
                 evaluation(report)
             }
+            "typeOfVar" => {
+                let name = args["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty() && name.len() <= 1024)
+                    .ok_or_else(|| error("expected a variable name"))?;
+                let tid = if args["tid"].is_null() {
+                    self.pid()
+                } else {
+                    tid()?
+                };
+                let deadline = Instant::now() + DEADLINE;
+                let graph = match self {
+                    Self::Live(live) => live.with_stopped(tid, |live| {
+                        let registers = regs::read(tid)?.stack;
+                        let Ok((dwarf, frame)) =
+                            symbols::inspect::stopped_dwarf(&live.root, &live.trace, registers)
+                        else {
+                            return Ok(None);
+                        };
+                        dwarf.variable_type_graph(name, frame.link, deadline)
+                    })?,
+                    Self::Core(core) => core.session_variable_type(tid, name, deadline)?,
+                };
+                Ok(json!(graph))
+            }
             "pause" => Ok(json!(self.live()?.pause(selector()?)?)),
             "continue" => {
                 self.live()?.continue_threads(selector()?)?;
                 Ok(Value::Null)
             }
-            "followFork" => {
-                let follow = match args["mode"].as_str() {
-                    Some("parent") => false,
-                    Some("child") => true,
-                    _ => return Err(error("expected parent or child")),
+            "catchSyscall" => {
+                let scope = selector()?;
+                let live = self.live()?;
+                let update = |live: &mut Live| {
+                    if args["phase"].is_null() {
+                        live.syscall_catches.remove(&scope);
+                        if let Some(tid) = scope {
+                            live.trace.syscall_threads.remove(&tid);
+                            if !live.trace.syscall_all {
+                                live.syscall_entries.remove(&tid);
+                            }
+                        } else {
+                            live.trace.syscall_all = false;
+                            live.syscall_entries
+                                .retain(|tid, _| live.trace.syscall_threads.contains(tid));
+                        }
+                    } else {
+                        let catch = super::syscalls::Catch::parse(&args)?;
+                        if live.syscall_catches.is_empty() {
+                            super::syscalls::verify_supported(scope.unwrap_or(live.pid))?;
+                        }
+                        live.syscall_catches.insert(scope, catch);
+                        if let Some(tid) = scope {
+                            live.trace.syscall_threads.insert(tid);
+                        } else {
+                            live.trace.syscall_all = true;
+                        }
+                    }
+                    Ok(Value::Null)
                 };
-                self.live()?.trace.follow_fork = follow;
-                Ok(Value::Null)
+                match scope {
+                    Some(tid) => live.with_stopped(tid, update),
+                    None => live.with_frozen(update),
+                }
             }
             "detach" => {
                 self.live()?.close()?;

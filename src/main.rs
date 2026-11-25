@@ -10,6 +10,7 @@ use std::{path::PathBuf, time::Duration};
 use tonic::{Request, metadata::AsciiMetadataValue};
 
 const API_URI: &str = "aidbg://debugger.d.ts";
+const NODE_API_URI: &str = "aidbg://node.d.ts";
 
 #[derive(Parser)]
 #[command(about = "Expose the aidbg debugger over MCP stdio", version = aidbg::BUILD_VERSION)]
@@ -62,6 +63,26 @@ struct SnapshotArgs {
     tid: Option<i32>,
 }
 #[derive(Deserialize, JsonSchema)]
+struct PsArgs {
+    #[serde(default)]
+    #[schemars(description = "List individual threads and their TIDs")]
+    threads: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum ForkPolicy {
+    Parent,
+    Child,
+    Both,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ForkPolicyArgs {
+    mode: ForkPolicy,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct PerfArgs {
     pid: i32,
     #[serde(default)]
@@ -93,7 +114,7 @@ impl rmcp::ServerHandler for Mcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(rmcp::model::ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(rmcp::model::Implementation::new("aidbg", aidbg::BUILD_VERSION))
-            .with_instructions("Select a target with run, attach or core_open. Use script_run for TypeScript debugging. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
+            .with_instructions("Select a target with run, attach or core_open. Use script_run for TypeScript debugging. Read aidbg://debugger.d.ts and aidbg://node.d.ts for the script APIs. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
     }
 
     fn list_tools(
@@ -119,6 +140,8 @@ impl rmcp::ServerHandler for Mcp {
         Ok(rmcp::model::ListResourcesResult::with_all_items(vec![
             rmcp::model::Resource::new(API_URI, "aidbg TypeScript API")
                 .with_mime_type("text/plain"),
+            rmcp::model::Resource::new(NODE_API_URI, "aidbg file and path module APIs")
+                .with_mime_type("text/plain"),
         ]))
     }
 
@@ -127,13 +150,15 @@ impl rmcp::ServerHandler for Mcp {
         request: rmcp::model::ReadResourceRequestParams,
         _: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
-        if request.uri != API_URI {
-            return Err(rmcp::ErrorData::invalid_params("unknown resource", None));
-        }
+        let text = match request.uri.as_str() {
+            API_URI => include_str!("../docs/debugger.d.ts"),
+            NODE_API_URI => include_str!("script/session/node.d.ts"),
+            _ => return Err(rmcp::ErrorData::invalid_params("unknown resource", None)),
+        };
         Ok(
             rmcp::model::ReadResourceResult::new(vec![rmcp::model::ResourceContents::text(
-                include_str!("../docs/debugger.d.ts"),
-                API_URI,
+                text,
+                request.uri,
             )])
             .into(),
         )
@@ -176,7 +201,7 @@ fn reply(
     let mut prompts = Vec::new();
     if !result.paused_threads.is_empty() {
         prompts.push(
-            "Target threads are paused by the debugger. Use dbg.resume(tid) to resume, or dbg.thread(tid).passToTarget(...) to handle a pending signal.",
+            "Target threads are paused by the debugger. Use dbg.resumeThread(tid) to resume, or dbg.thread(tid).passToTarget(...) to handle a pending signal.",
         );
     }
     if !inputs.is_empty() {
@@ -271,7 +296,7 @@ impl Mcp {
         )
     }
 
-    #[tool(description = "Deliver data to a handler waiting in console.waitInput.")]
+    #[tool(description = "Deliver data to a handler waiting for an ask response.")]
     async fn send_input(&self, Parameters(args): Parameters<InputArgs>) -> CallToolResult {
         reply(
             self.client
@@ -284,7 +309,7 @@ impl Mcp {
         )
     }
 
-    #[tool(description = "Reject a handler's console.waitInput promise with a message.")]
+    #[tool(description = "Reject a handler's ask promise with a message.")]
     async fn interrupt_input(&self, Parameters(args): Parameters<InterruptArgs>) -> CallToolResult {
         reply(
             self.client
@@ -322,14 +347,64 @@ impl Mcp {
         reply(self.client.clone().perf(self.request(request)).await)
     }
 
-    #[tool(description = "List processes on the debugger server.")]
-    async fn ps(&self) -> CallToolResult {
+    #[tool(description = "Set the active target's fork policy.")]
+    async fn set_fork_policy(
+        &self,
+        Parameters(args): Parameters<ForkPolicyArgs>,
+    ) -> CallToolResult {
+        let mode = match args.mode {
+            ForkPolicy::Parent => "parent",
+            ForkPolicy::Child => "child",
+            ForkPolicy::Both => "both",
+        };
         reply(
             self.client
                 .clone()
-                .ps(self.request(ProcessListRequest {}))
+                .set_fork_policy(self.request(ForkPolicyRequest { mode: mode.into() }))
                 .await,
         )
+    }
+
+    #[tool(description = "List processes on the debugger server.")]
+    async fn ps(&self, Parameters(args): Parameters<PsArgs>) -> CallToolResult {
+        let mut result = reply(
+            self.client
+                .clone()
+                .ps(self.request(ProcessListRequest {
+                    threads: args.threads,
+                }))
+                .await,
+        );
+        if result.is_error != Some(true)
+            && let Some(document) = &result.structured_content
+            && let Some(table) = document["result"].as_str()
+        {
+            result.content = vec![rmcp::model::ContentBlock::text(table)];
+            if document["output"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+                || document["signals"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                || document["waiting_inputs"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                || document["paused_threads"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                || document["running_scripts"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                || !document["target_error"].is_null()
+            {
+                let mut status = document.clone();
+                status.as_object_mut().unwrap().remove("result");
+                result
+                    .content
+                    .push(rmcp::model::ContentBlock::text(status.to_string()));
+            }
+        }
+        result
     }
 }
 

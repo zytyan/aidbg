@@ -118,6 +118,52 @@ fn nodes(file: P<SourceFile>) -> Vec<P<Node>> {
     result
 }
 
+fn at_top_level(mut node: P<Node>) -> bool {
+    while let Some(parent) = node.parent() {
+        if tsrs_ast::is_function_like_kind(parent.kind()) {
+            return false;
+        }
+        node = parent;
+    }
+    true
+}
+
+fn directive(file: P<SourceFile>, name: &str) -> bool {
+    file.statements
+        .nodes()
+        .iter()
+        .copied()
+        .take_while(|node| {
+            node.kind() == SyntaxKind::ExpressionStatement
+                && node.as_expression_statement().expression.kind() == SyntaxKind::StringLiteral
+        })
+        .any(|node| string_text(node.as_expression_statement().expression) == name)
+}
+
+fn promise_handled(node: P<Node>) -> bool {
+    let mut node = node;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            SyntaxKind::AwaitExpression => return true,
+            SyntaxKind::ParenthesizedExpression
+            | SyntaxKind::AsExpression
+            | SyntaxKind::NonNullExpression
+            | SyntaxKind::SatisfiesExpression => node = parent,
+            SyntaxKind::PropertyAccessExpression => {
+                let access = parent.as_property_access_expression();
+                return access.expression == node
+                    && key(access.name) == Some("then")
+                    && parent.parent().is_some_and(|call| {
+                        call.kind() == SyntaxKind::CallExpression
+                            && call.as_call_expression().expression == parent
+                    });
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn method(node: P<Node>) -> Option<(&'static str, P<Node>)> {
     if node.kind() != SyntaxKind::CallExpression {
         return None;
@@ -551,7 +597,91 @@ impl Compiler {
         let mut checker = program.get_type_checker_for_file_exclusive(&context, file);
         let mut edits = Vec::new();
         let mut diagnostics = Vec::new();
-        for node in nodes(file) {
+        let all_nodes = nodes(file);
+        let top: Vec<_> = all_nodes
+            .iter()
+            .copied()
+            .filter(|&node| at_top_level(node))
+            .collect();
+        if !directive(file, "I know this is a no-op script")
+            && !top.iter().any(|node| match node.kind() {
+                SyntaxKind::PropertyAccessExpression
+                | SyntaxKind::ElementAccessExpression
+                | SyntaxKind::CallExpression
+                | SyntaxKind::NewExpression
+                | SyntaxKind::TaggedTemplateExpression
+                | SyntaxKind::ThrowStatement
+                | SyntaxKind::DeleteExpression => true,
+                SyntaxKind::BinaryExpression => tsrs_ast::is_assignment_operator(
+                    node.as_binary_expression().operator_token.kind(),
+                ),
+                SyntaxKind::PrefixUnaryExpression => matches!(
+                    node.as_prefix_unary_expression().operator,
+                    SyntaxKind::PlusPlusToken | SyntaxKind::MinusMinusToken
+                ),
+                SyntaxKind::PostfixUnaryExpression => true,
+                _ => false,
+            })
+        {
+            diagnostics.push(record(file, file.as_node(), "SCRIPT_NO_OP",
+                "Script has no top-level operation. Use the \"I know this is a no-op script\" directive to allow it."));
+        }
+        if !directive(file, "I intentionally allow unawaited Promises") {
+            let handled = top
+                .iter()
+                .copied()
+                .filter(|node| node.kind() == SyntaxKind::Identifier && promise_handled(*node))
+                .filter_map(|node| checker.get_symbol_at_location_exported(node))
+                .collect::<Vec<_>>();
+            for node in top
+                .iter()
+                .copied()
+                .filter(|node| node.kind() == SyntaxKind::CallExpression)
+            {
+                if promise_handled(node) || {
+                    let callee = node.as_call_expression().expression;
+                    callee.kind() == SyntaxKind::PropertyAccessExpression && {
+                        let access = callee.as_property_access_expression();
+                        key(access.name) == Some("then") && {
+                            let ty = checker.get_type_at_location(access.expression);
+                            checker.get_promised_type_of_promise(ty).is_some()
+                        }
+                    }
+                } {
+                    continue;
+                }
+                let ty = checker.get_type_at_location(node);
+                if checker.get_promised_type_of_promise(ty).is_none() {
+                    continue;
+                }
+                let mut initializer = node;
+                while let Some(parent) = initializer.parent().filter(|parent| {
+                    matches!(
+                        parent.kind(),
+                        SyntaxKind::ParenthesizedExpression
+                            | SyntaxKind::AsExpression
+                            | SyntaxKind::NonNullExpression
+                            | SyntaxKind::SatisfiesExpression
+                    )
+                }) {
+                    initializer = parent;
+                }
+                let assigned_and_handled = initializer
+                    .parent()
+                    .filter(|parent| parent.kind() == SyntaxKind::VariableDeclaration)
+                    .and_then(|parent| {
+                        checker.get_symbol_at_location_exported(
+                            parent.as_variable_declaration().name(),
+                        )
+                    })
+                    .is_some_and(|symbol| handled.contains(&symbol));
+                if !assigned_and_handled {
+                    diagnostics.push(record(file, node, "SCRIPT_UNAWAITED_PROMISE",
+                        "Handle this top-level Promise with await or .then(), or declare \"I intentionally allow unawaited Promises\"."));
+                }
+            }
+        }
+        for node in all_nodes {
             let kind = node.kind();
             if kind != SyntaxKind::BinaryExpression {
                 continue;

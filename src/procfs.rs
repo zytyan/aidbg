@@ -74,7 +74,7 @@ impl Status {
     }
 }
 
-pub fn start_ticks(base: &Path) -> Result<u64> {
+fn stat_number(base: &Path, field: usize) -> Result<u64> {
     let bytes = fs::read(base.join("stat"))?;
     let stat = String::from_utf8_lossy(&bytes);
     // comm is in parentheses and may itself contain spaces and ')' characters.
@@ -83,9 +83,21 @@ pub fn start_ticks(base: &Path) -> Result<u64> {
         .ok_or_else(|| error("invalid proc stat"))?;
     Ok(rest
         .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| error("missing proc stat starttime"))?
+        .nth(field - 3)
+        .ok_or_else(|| error("missing proc stat field"))?
         .parse()?)
+}
+
+pub fn start_ticks(base: &Path) -> Result<u64> {
+    stat_number(base, 22)
+}
+
+pub(crate) fn is_kernel_thread(base: &Path, status: &Status) -> bool {
+    const PF_KTHREAD: u64 = 0x0020_0000;
+    match status.field("Kthread") {
+        Some(value) => value == "1",
+        None => stat_number(base, 9).is_ok_and(|flags| flags & PF_KTHREAD != 0),
+    }
 }
 
 pub fn epoch_ms() -> u64 {

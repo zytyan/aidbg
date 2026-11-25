@@ -14,6 +14,7 @@ service Debugger {
   rpc Snapshot (SessionSnapshotRequest) returns (ToolReply);
   rpc Perf (SessionProfileRequest) returns (ToolReply);
   rpc Ps (ProcessListRequest) returns (ToolReply);
+  rpc SetForkPolicy (ForkPolicyRequest) returns (ToolReply);
 }
 
 message HeartbeatRequest {}
@@ -37,7 +38,8 @@ message InterruptInputRequest {
   optional string msg = 2;
 }
 message SessionSnapshotRequest { optional int32 tid = 1; }
-message ProcessListRequest {}
+message ProcessListRequest { bool threads = 1; }
+message ForkPolicyRequest { string mode = 1; }
 message SessionProfileRequest {
   int32 pid = 1;
   bool hotspot = 2;

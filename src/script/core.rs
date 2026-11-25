@@ -843,6 +843,21 @@ impl Target {
             .frame_values(self, frame, 64, deadline)
     }
 
+    pub(super) fn session_variable_type(
+        &self,
+        tid: i32,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<Option<crate::symbols::inspect::type_graph::Graph>> {
+        let Some(frame) = self.frames_for(tid).and_then(|frames| frames.first()) else {
+            return Ok(None);
+        };
+        let Ok(dwarf) = self.frame_dwarf(frame) else {
+            return Ok(None);
+        };
+        dwarf.variable_type_graph(name, frame.link, deadline)
+    }
+
     pub(super) fn session_top_values(&self, tid: i32, deadline: Instant) -> Result<Value> {
         let frame = self
             .frames_for(tid)
