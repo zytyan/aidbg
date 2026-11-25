@@ -372,6 +372,41 @@ fn frame_pointer(c: Context<'_>, modules: &[Module]) -> Result<Step> {
     Ok(Step::Next(regs, "frame_pointer"))
 }
 
+fn syscall_return(c: Context<'_>, modules: &[Module]) -> Option<Step> {
+    if !cfg!(target_arch = "x86_64") {
+        return None;
+    }
+    let pc = c.regs.get(PC).ok()?;
+    let syscall = pc.checked_sub(2)?;
+    // Linux reports the PC after SYSCALL. If the next instruction is a
+    // near RET, RSP already points at this frame's return address.
+    if !modules.iter().any(|module| {
+        module
+            .executable_at(syscall)
+            .is_some_and(|mapping| mapping.file_offset(pc).is_some())
+    }) || c.memory.read_word(syscall, 2).ok()? != 0x050f
+        || c.memory.read_word(pc, 1).ok()? != 0xc3
+    {
+        return None;
+    }
+    let sp = c.regs.get(SP).ok()?;
+    let ret = c.memory.read_word(sp, 8).ok()?;
+    let lookup = ret.checked_sub(1)?;
+    if !modules
+        .iter()
+        .any(|module| module.executable_at(lookup).is_some())
+    {
+        return None;
+    }
+    let mut next = Registers::empty();
+    for register in [3, 6, 12, 13, 14, 15].map(gimli::Register) {
+        next.set(register, c.regs.get(register).ok());
+    }
+    next.set(PC, Some(ret));
+    next.set(SP, sp.checked_add(8));
+    Some(Step::Next(next, "syscall_return"))
+}
+
 #[derive(Serialize)]
 pub struct Frame {
     pc: String,
@@ -628,6 +663,11 @@ impl Images {
                 })();
                 frames.push(frame);
                 let step = step.or_else(|cfi| {
+                    if index == 0
+                        && let Some(step) = syscall_return(c, maps)
+                    {
+                        return Ok(step);
+                    }
                     frame_pointer(c, maps)
                         .map_err(|fp| error(format!("CFI: {cfi}; frame pointer: {fp}")))
                 })?;
@@ -759,6 +799,14 @@ pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
             frame.link = Some(link);
             frame.cfa = image.image.cfa(link, context).ok();
             image.image.step(link, context).ok()
+        });
+        let step = step.or_else(|| {
+            if index != 0 {
+                return None;
+            }
+            let step = syscall_return(context, mappings)?;
+            frame.cfa = sp.checked_add(8);
+            Some(step)
         });
         if frame.cfa.is_none()
             && let Ok(fp) = regs.get(FP)
