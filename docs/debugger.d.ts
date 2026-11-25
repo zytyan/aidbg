@@ -583,9 +583,9 @@ export interface Debugger {
     pauseThread(tid: number): Promise<ControlledThread>;
     pauseAll(): Promise<ControlledThread[]>;
     /** 立即恢复指定线程。 */
-    resumeThread(tid: number): Promise<void>;
+    resumeThread(tid: number): void;
     /** 立即恢复所有线程。 */
-    resumeAll(): Promise<void>;
+    resumeAll(): void;
     /** 先取最早匹配的排队事件。没有时先登记等待，再恢复指定范围。 */
     continueForStop(tid?: number | "all", options?: ContinueOptions): Promise<WaitResult<StopEvent>>;
     /** 等待并消费一批已排队的停点，不恢复线程。默认最多 16 条。 */

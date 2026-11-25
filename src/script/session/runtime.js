@@ -550,11 +550,11 @@
         async pauseAll() {
             return rpc("pause", {tid:"all"}).map(tid => makeThread(tid, true));
         },
-        async resumeThread(tid) {
+        resumeThread(tid) {
             if (scope(tid) === undefined) throw new TypeError("resumeThread requires a numeric thread ID");
             rpc("continue", {tid});
         },
-        async resumeAll() { rpc("continue", {tid:"all"}); },
+        resumeAll() { rpc("continue", {tid:"all"}); },
         continueForStop,
         async waitExit(timeoutMs) { return waitEvent({kind:"process_exit",timeoutMs},callbackContext); },
         async waitStops(limit, timeoutMs) { return waitEvent({kind:"batch",limit,timeoutMs},callbackContext); },

@@ -261,7 +261,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
             hit.pause();
             hit.breakpoint.disable();
         });
-        await dbg.resumeAll();
+        dbg.resumeAll();
     """)
     hit_logs = logs(reply)
     if not reply["waiting_inputs"]:
@@ -311,7 +311,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
             await dbg.pauseThread(hit.thread.tid);
             await hit.thread.ask({});
         });
-        await dbg.resumeAll();
+        dbg.resumeAll();
     """)
     events = logs(reply)
     if not reply["waiting_inputs"]:
@@ -351,7 +351,7 @@ def validate_event_queue(client, fixture, owned):
         const roundtrip = dbg.lineToAddr(line.file,line.line);
         if (typeof roundtrip === "bigint") console.log(dbg.addrToLine(roundtrip)?.line === line.line);
         dbg.softwareBreakpoint(addr);
-        await dbg.resumeAll();
+        dbg.resumeAll();
         console.log("resumed");
     """)
     assert logs(reply)[-1] == ["resumed"] and not reply["waiting_events"], reply
@@ -389,7 +389,7 @@ def validate_event_queue(client, fixture, owned):
     thread_table = client.tool("ps", threads=True)["result"]
     tids = {int(row.split(maxsplit=3)[2]) for row in thread_table.splitlines() if row.startswith(f"{pid} ")}
     assert tids == {pid, event["tid"], logs(second)[0][0][0][0]}, tids
-    resumed = client.script('await dbg.resumeAll();')
+    resumed = client.script('dbg.resumeAll();')
     chunks = [resumed]
     deadline = time.monotonic() + 5
     while not any(row["signals"] for row in chunks):
@@ -406,7 +406,11 @@ def validate_event_queue(client, fixture, owned):
     """)
     assert logs(stop) == [["signal", True]] and stop["paused_threads"] == [pid], stop
     assert not stop["signals"] and not stop["process_output"]["stdout"], stop
-    held = client.script("await dbg.resumeAll(); await dbg.resumeThread(dbg.pid);")
+    held = client.script("""
+        if (dbg.resumeAll() !== undefined || dbg.resumeThread(dbg.pid) !== undefined) {
+            throw new Error("resume methods must return undefined synchronously");
+        }
+    """)
     assert held["paused_threads"] == [pid] and not held["signals"], held
     chunks.append(client.script("$.deliverPendingSignal();"))
     while not any("enter data" in row["process_output"]["stdout"] for row in chunks):
@@ -457,7 +461,7 @@ def validate_next_hit(client, fixture, owned):
             if (result.kind !== "breakpoint") throw new Error(result.kind);
             console.log(result.hitCount,result.paused);
         });
-        await dbg.resumeAll();
+        dbg.resumeAll();
     """)
     if not logs(reply):
         reply = await_state(client, lambda row: bool(logs(row)))
@@ -593,7 +597,7 @@ def validate_process_lifecycle(client, fixture, library, owned):
         const hit = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
         if (hit.kind !== "breakpoint") throw new Error(hit.kind);
         console.log(hit.breakpointId === pending.id && hit.address === pending.address);
-        await dbg.resumeAll();
+        dbg.resumeAll();
         const exit = await dbg.waitExit(3000);
         console.log(exit.kind === "exit" && exit.reason === "code" && exit.code);
     """, [[True, True], [True, True], [True], [23]])
@@ -608,7 +612,7 @@ def validate_process_lifecycle(client, fixture, library, owned):
             if (hit.kind !== "breakpoint") throw new Error(hit.kind);
             console.log(hit.breakpointId === point.id && hit.address === point.address, hit.hitCount);
         }
-        await dbg.resumeAll();
+        dbg.resumeAll();
         const exit = await dbg.waitExit(3000);
         console.log(exit.kind === "exit" && exit.reason === "code" && exit.code, point.address === null);
     """, [[True], [True, 1], [True, 2], [24, True]])

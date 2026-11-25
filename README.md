@@ -53,10 +53,10 @@ export const breakpoint = dbg.softwareBreakpoint("main", async hit => {
     const answer = await hit.thread.ask({ prompt: "pause or continue?" }, 30_000);
     if (answer === "pause") hit.pause();
 });
-await dbg.resumeAll();
+dbg.resumeAll();
 ```
 
-`dbg.resumeThread(tid)` 和 `dbg.resumeAll()` 恢复后立即返回。`dbg.continueForStop()` 会取出一个排队的停点或恢复并等待，`dbg.waitStops()` 可以批量取出停点。脚本可用 `dbg.ask({ stop })` 将现场放进工具回包，等待 `send_input` 写回字符串。消费停点和回复输入都不自动恢复线程。
+`dbg.resumeThread(tid)` 和 `dbg.resumeAll()` 同步恢复线程，调用完成后立即返回。`dbg.continueForStop()` 会取出一个排队的停点或恢复并等待，`dbg.waitStops()` 可以批量取出停点。脚本可用 `dbg.ask({ stop })` 将现场放进工具回包，等待 `send_input` 写回字符串。消费停点和回复输入都不自动恢复线程。
 
 顶层脚本至少要有一项执行操作，例如调用函数或读取可能触发 getter 的属性。仅声明或导出的脚本可在开头使用 `"I know this is a no-op script"`。顶层 Promise 调用应使用 `await` 或 `.then()` 处理，可用 `"I intentionally allow unawaited Promises"` 显式豁免。
 

@@ -55,7 +55,7 @@ dbg.continueForStop();
 
 ### 暂停、恢复和进程生命周期
 
-- 顶层 `dbg` 的暂停接口统一为 `pauseThread` 和 `pauseAll`，恢复接口统一为 `resumeThread` 和 `resumeAll`。删除原有的 `dbg.pause`、`dbg.resume`、`dbg.continue`。
+- 顶层 `dbg` 的暂停接口统一为 `pauseThread` 和 `pauseAll`，恢复接口统一为 `resumeThread` 和 `resumeAll`。删除原有的 `dbg.pause`、`dbg.resume`、`dbg.continue`。 两个恢复接口均为同步调用。
 - MCP 工具和脚本均可通过 `setForkPolicy("child" | "parent" | "both")` 配置 fork 跟踪策略。成功执行 `execve` 时应触发暂停。
 - 多实例目标为每个被调试进程一个 QuickJS 实例。只有一个实例时可省略 `session`，有多个实例时必须显式指定 `session`。跟踪 fork 子进程时，子进程的 QuickJS 实例直接从父进程克隆。进程成功执行 `execve` 时清理旧 QuickJS 实例所持有的资源。多实例及其 QuickJS 生命周期管理可视实现复杂度延期。
 
