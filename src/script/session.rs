@@ -4,6 +4,7 @@ mod files;
 mod inferior;
 mod instruction;
 mod link;
+mod native_value;
 mod process_io;
 mod source_map;
 mod syscalls;
@@ -292,7 +293,6 @@ impl State {
 
     fn operation(&mut self, op: &str, args: Value) -> Result<Value> {
         match op {
-            "generation" => Ok(json!(self.generation)),
             "clock" => Ok(json!(self.started.elapsed().as_millis() as u64)),
             "reportError" => {
                 self.report_error(
@@ -705,7 +705,10 @@ fn run(
         })?;
         let api: Object = ctx.eval(include_str!("session/runtime.js")).catch(&ctx).map_err(|err| error(err.to_string()))?;
         let initialize: Function = api.get("initialize")?;
-        initialize.call::<_, ()>((operation, regs::ARCH))?;
+        let generation_state = state.clone();
+        let generation = Function::new(ctx.clone(), move || generation_state.borrow().generation)?;
+        initialize.call::<_, ()>((operation, regs::ARCH, generation))?;
+        native_value::install(&ctx, &api)?;
         let dispatch: Function = api.get("dispatch")?;
         let event_result: Function = api.get("eventResult")?;
         let fire_timer: Function = api.get("fireTimer")?;

@@ -1,7 +1,7 @@
 (() => {
     "use strict";
 
-    let host, arch;
+    let host, arch, targetGeneration;
     let nextPoint = 0;
     let callbackTid;
     let callbackContext;
@@ -102,7 +102,7 @@
             if (typeof value === "function") return String(value);
             if (value instanceof Uint8Array) return Array.from(value);
             if (value && typeof value === "object") {
-                if (values.has(value)) return summarize(value);
+                if (valueStore(value)) return summarize(value);
                 while (ancestors.length && ancestors[ancestors.length - 1] !== this) ancestors.pop();
                 if (ancestors.includes(value)) return "[Circular]";
                 ancestors.push(value);
@@ -119,7 +119,7 @@
                 if (index >= args.length) throw new TypeError("not enough printf arguments");
                 let value = args[index++], text, prefix = "";
                 const digits = precision === undefined ? undefined : Math.min(100, Number(precision));
-                if (kind !== "s" && values.has(value) && value.$read) value = value.$read();
+                if (kind !== "s" && valueStore(value) && value.$read) value = value.$read();
                 if (kind === "s") text = String(value).slice(0, digits ?? Infinity);
                 else if (kind === "c") text = String.fromCodePoint(Number(value));
                 else if ("feg".includes(kind)) {
@@ -202,7 +202,7 @@
 
     function makeConsole(id, generation) {
         const check = () => {
-            if (generation !== rpc("generation")) throw new Error("debugger target changed");
+            if (generation !== targetGeneration()) throw new Error("debugger target changed");
         };
         return Object.freeze({
             log(...values) {
@@ -344,7 +344,7 @@
             else row.parameters = Object.freeze(row.parameters.map(parameter => parameter && Object.freeze(parameter)));
         }
         if (row.kind === "signal") {
-            const {tid, sequence} = row, generation = rpc("generation");
+            const {tid, sequence} = row, generation = targetGeneration();
             Object.defineProperty(row, "passToTarget", {
                 value(pass) { rpc("passSignal", {tid, sequence, generation, pass}); },
             });
@@ -412,11 +412,11 @@
     }
 
     function makeThread(tid, controlled = false, callback) {
-        const generation = rpc("generation");
+        const generation = targetGeneration();
         let identity;
         try { identity = rpc("identity", {tid}); } catch (_) {}
         const exists = () => {
-            if (generation !== rpc("generation") || identity === undefined) return false;
+            if (generation !== targetGeneration() || identity === undefined) return false;
             try { return rpc("identity", {tid}) === identity && rpc("status", {tid}) !== "Unexists"; }
             catch (_) { return false; }
         };
@@ -489,14 +489,14 @@
 
     function install(type, at, callback, options = {}) {
         if (callback != null && typeof callback !== "function") throw new TypeError("expected breakpoint callback");
-        const generation = rpc("generation");
+        const generation = targetGeneration();
         const id = ++nextPoint;
         const pending = type === "pending";
         const address = pending
             ? rpc("addPendingPoint", {id, name:at, ...options})
             : BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...options}));
         const change = remove => {
-            if (generation !== rpc("generation")) throw new Error("breakpoint no longer exists");
+            if (generation !== targetGeneration()) throw new Error("breakpoint no longer exists");
             rpc("point", {id, remove});
             points.delete(id);
         };
@@ -504,12 +504,12 @@
             id, type:pending ? "software_breakpoint" : type,
             get address() {
                 if (!pending) return address;
-                if (generation !== rpc("generation")) return null;
+                if (generation !== targetGeneration()) return null;
                 const bound = rpc("pendingPointAddress", {id});
                 return bound == null ? null : BigInt(bound);
             },
             get tid() {
-                if (generation !== rpc("generation")) return Object.freeze([]);
+                if (generation !== targetGeneration()) return Object.freeze([]);
                 return Object.freeze(options.tid === undefined ? rpc("threads") : [options.tid]);
             },
             get callback() { return callback; },
@@ -670,15 +670,15 @@
     });
 
     async function dispatch(tid, token, events) {
-        const generation = rpc("generation");
+        const generation = targetGeneration();
         const context = {tid,token,active:true,pause:null,signal:false,pass:undefined,counts:{}};
         const thread = makeThread(tid, true, context);
         const check = () => {
-            if (!context.active || rpc("generation") !== generation) throw new Error("the callback no longer controls this stop");
+            if (!context.active || targetGeneration() !== generation) throw new Error("the callback no longer controls this stop");
         };
         try {
             for (const event of parse(events)) {
-                if (!context.active || rpc("generation") !== generation) return;
+                if (!context.active || targetGeneration() !== generation) return;
                 let result;
                 const previousContext = callbackContext, previousTid = callbackTid;
                 callbackContext = context;
@@ -737,7 +737,7 @@
                 await result;
             }
         } catch (error) {
-            if (rpc("generation") === generation) reportError(error);
+            if (targetGeneration() === generation) reportError(error);
         } finally {
             if (context.active) {
                 context.active = false;
@@ -748,6 +748,25 @@
 
     // Type descriptors carry layout. Every value has its own storage and thread binding.
     const types = new WeakMap(), values = new WeakMap();
+    const valueKeys = {
+        address: Symbol(),
+        bytes: Symbol(),
+        root: Symbol(),
+        tid: Symbol(),
+        inheritTid: Symbol(),
+        parent: Symbol(),
+        self: Symbol(),
+        type: Symbol(),
+        info: Symbol(),
+        value: Symbol(),
+        terminatedElement: Symbol(),
+        readBytesMethod: Symbol(),
+        writeBytesMethod: Symbol(),
+        readMethod: Symbol(),
+        inline: Symbol(),
+    };
+    let lookupNativeValue, createCompactValue, compactValueKeys;
+    const valueStore = value => values.get(value) ?? lookupNativeValue(value);
     const typeInfo = type => {
         const info = types.get(type);
         if (!info) throw new TypeError("expected a TypeSystem descriptor");
@@ -790,7 +809,7 @@
         const type = {
             get $size() { return info.kind === "lazy" ? typeInfo(resolve(type)).size : info.size; },
             get $align() { return info.kind === "lazy" ? typeInfo(resolve(type)).align : info.align; },
-            at(address, tid) { word(address); return makeValue(type, {address, tid, root:rpc("generation")}); },
+            at(address, tid) { word(address); return makeValue(type, {[valueKeys.address]:address, [valueKeys.tid]:tid, [valueKeys.root]:targetGeneration()}); },
             $readBytes(address) {
                 word(address);
                 return readBytes(address, staticStorageSize(type));
@@ -834,7 +853,7 @@
             };
         }
         if (info.kind === "scalar" || info.kind === "ptr") {
-            type.value = value => makeValue(type, {bytes:encodeValue(info, value)});
+            type.value = value => makeValue(type, {[valueKeys.bytes]:encodeValue(info, value)});
         }
         if (info.kind === "ptr") {
             type.pointee = () => typeInfo(info.element).kind === "self" ? info.element : resolve(info.element);
@@ -1133,13 +1152,14 @@
     Object.freeze(m);
 
     function bound(store) {
-        if (store.root !== undefined && store.root !== rpc("generation")) throw new Error("value belongs to a previous target");
+        const root = store[valueKeys.root];
+        if (root !== undefined && root !== targetGeneration()) throw new Error("value belongs to a previous target");
     }
 
     function dynamicLength(info, store) {
         if (typeof info.length !== "function") return info.length;
-        let length = info.length(store.parent);
-        if (values.has(length) && length.$read) length = length.$read();
+        let length = info.length(store[valueKeys.parent]);
+        if (valueStore(length) && length.$read) length = length.$read();
         return integer(length,"dynamic length must be a nonnegative safe integer");
     }
 
@@ -1149,171 +1169,257 @@
             return length === undefined ? undefined : integer(length * info.element.$size,"array byte size exceeds safe integer range");
         }
         if (info.tail !== undefined) {
-            const tail = store.value[info.tail].$size;
+            const tail = store[valueKeys.value][info.tail].$size;
             return tail === undefined ? info.size : Math.max(info.size, info.fields[info.tail].offset + tail);
         }
         return info.size;
     }
 
+    function getValueBytes(store) {
+        const info = store[valueKeys.info];
+        bound(store);
+        const bytes = store[valueKeys.bytes];
+        if (bytes !== undefined) return bytes;
+        const size = valueSize(info,store);
+        if (size === undefined) throw new TypeError("value has no known byte size");
+        return readBytes(store[valueKeys.address],size);
+    }
+
+    function setValueBytes(store, bytes) {
+        const info = store[valueKeys.info];
+        bound(store);
+        if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
+        if (bytes.length !== valueSize(info,store)) throw new RangeError("byte length differs from C storage size");
+        if (store[valueKeys.inline]) {
+            store[valueKeys.bytes] = bytes;
+            return;
+        }
+        writeBytes(store[valueKeys.address],bytes);
+    }
+
+    function readScalar(store) {
+        const info = store[valueKeys.info];
+        return view(getValueBytes(store))["get" + scalarSpec[info.scalar][0]](0,info.littleEndian ?? true);
+    }
+
+    function writeScalar(store, value) {
+        setValueBytes(store,encodeValue(store[valueKeys.info],value));
+    }
+
+    function readBitWord(store, bytes) {
+        bound(store);
+        return readBytes(store[valueKeys.address],bytes).reduceRight((value, byte) => (value << 8n) | BigInt(byte), 0n);
+    }
+
+    function readBitfield(store) {
+        const {scalar, bit:[shift,width]} = store[valueKeys.info];
+        const mask = (1n << BigInt(width)) - 1n;
+        const raw = (readBitWord(store,Math.ceil((shift + width) / 8)) >> BigInt(shift)) & mask;
+        const n = scalar.startsWith("i") ? BigInt.asIntN(width,raw) : raw;
+        return scalarSpec[scalar][1] === 8 ? n : Number(n);
+    }
+
+    function writeBitfield(store, value) {
+        const {scalar, bit:[shift,width]} = store[valueKeys.info];
+        scalarBytes(scalar,value);
+        const n = BigInt(value);
+        if (n !== (scalar.startsWith("i") ? BigInt.asIntN(width,n) : BigInt.asUintN(width,n))) {
+            throw new RangeError("integer does not fit the bitfield");
+        }
+        const bytes = Math.ceil((shift + width) / 8);
+        const mask = (1n << BigInt(width)) - 1n;
+        let raw = (readBitWord(store,bytes) & ~(mask << BigInt(shift))) | ((n & mask) << BigInt(shift));
+        const data = new Uint8Array(bytes);
+        for (let i = 0; i < bytes; i++, raw >>= 8n) data[i] = Number(raw & 255n);
+        writeBytes(store[valueKeys.address],data);
+    }
+
+    function valueAddress(store) {
+        bound(store);
+        const address = store[valueKeys.address];
+        if (address === undefined) throw new TypeError("value is not bound to target memory");
+        return address;
+    }
+
+    function valueField(store, name) {
+        const info = store[valueKeys.info];
+        bound(store);
+        const {offset,type} = info.fields[name];
+        return makeValue(type,{[valueKeys.address]:addr(store[valueKeys.address],offset), [valueKeys.parent]:store[valueKeys.value],
+            [valueKeys.inheritTid]:true, [valueKeys.self]:store[valueKeys.type], [valueKeys.root]:store[valueKeys.root]});
+    }
+
+    function valueAtIndex(store, index, checked) {
+        const info = store[valueKeys.info];
+        bound(store);
+        index = integer(index,"array index must be a nonnegative safe integer");
+        const count = checked ? dynamicLength(info,store) : undefined;
+        if (count !== undefined && index >= count) throw new RangeError("index exceeds the length");
+        const element = resolve(info.element,store[valueKeys.self]), size = element.$size;
+        if (checked && info.kind === "array" && count === undefined) throw new TypeError("use $atUnchecked for an unsized array");
+        if (size === undefined && index !== 0) throw new TypeError("element size is unknown");
+        const base = info.kind === "ptr" ? readScalar(store) : store[valueKeys.address];
+        if (info.kind === "ptr" && base === 0n) throw new RangeError("null pointer");
+        return makeValue(element,{[valueKeys.address]:addr(base,BigInt(index) * BigInt(size ?? 0)), [valueKeys.parent]:store[valueKeys.value],
+            [valueKeys.inheritTid]:true, [valueKeys.self]:store[valueKeys.self], [valueKeys.root]:store[valueKeys.root] ?? targetGeneration()});
+    }
+
+    function derefTerminated(store) {
+        const info = store[valueKeys.info], element = store[valueKeys.terminatedElement];
+        const bytes = terminatedBytes(readScalar(store),element,info.terminated);
+        if (element.char) return fromUtf8(bytes);
+        const data = view(bytes);
+        return Array.from({length:bytes.length / element.size}, (_, index) => {
+            const item = data["get" + scalarSpec[element.scalar][0]](index * element.size,element.littleEndian ?? true);
+            return element.terminated === undefined ? item : valueAtIndex(store,index,false).$deref();
+        });
+    }
+
+    function writeTerminated(store, contents) {
+        const info = store[valueKeys.info], element = store[valueKeys.terminatedElement];
+        const base = readScalar(store);
+        const previous = terminatedBytes(base,element,info.terminated);
+        const length = element.char ? (typeof contents === "string" ? utf8(contents) : undefined) : contents;
+        if (element.char ? !length : !Array.isArray(length)) throw new TypeError("invalid terminated sequence contents");
+        const count = length.length;
+        const bytes = new Uint8Array(integer((count + 1) * element.size,"terminated sequence is too large"));
+        for (let index = 0; index < count; index++) {
+            const encoded = element.char ? [length[index]] : encodeValue(element,length[index]);
+            if (encoded.every(byte => byte === 0)) throw new TypeError("sequence content contains a terminator");
+            bytes.set(encoded,index * element.size);
+        }
+        writeBytes(base,bytes);
+        const previousBytes = previous.length + element.size;
+        return bytes.length > previousBytes ?
+            {writtenBytes:bytes.length, previousBytes, warning:"write exceeded the previous sequence extent"} :
+            {writtenBytes:bytes.length, previousBytes};
+    }
+
+    const isIndexed = kind => kind === "ptr" || kind === "array";
+    const arrayIndex = key => typeof key === "string" && /^(?:0|[1-9][0-9]*)$/.test(key);
+    const summarizeValue = store => jsonText(summarize(store[valueKeys.value]));
+    const uncheckedIndex = (store,index) => valueAtIndex(store,index,false);
+    const derefPointer = store => valueAtIndex(store,0,false);
+    const valueTargets = new WeakMap();
+
+    const missingValueProperty = Symbol();
+
+    function getValueProperty(store,key) {
+        const info = store[valueKeys.info];
+        const {kind} = info;
+        switch (key) {
+        case "$type": return store[valueKeys.type];
+        case "$size": return valueSize(info,store);
+        case "$parent": return store[valueKeys.parent];
+        case "$tid": return store[valueKeys.tid] ?? (store[valueKeys.inheritTid] ? store[valueKeys.parent]?.$tid : undefined);
+        case "$toJson":
+        case "$dumpString": return summarizeValue.bind(undefined,store);
+        case "$address":
+            if (kind !== "bitfield") return valueAddress.bind(undefined,store);
+            break;
+        case "$readBytes":
+            if (kind !== "fn" && kind !== "bitfield") {
+                return store[valueKeys.readBytesMethod] ??= getValueBytes.bind(undefined,store);
+            }
+            break;
+        case "$writeBytes":
+            if (kind !== "fn" && kind !== "bitfield") {
+                return store[valueKeys.writeBytesMethod] ??= setValueBytes.bind(undefined,store);
+            }
+            break;
+        case "$read":
+            if (kind === "bitfield") return readBitfield.bind(undefined,store);
+            if (kind === "scalar" || kind === "ptr") {
+                return store[valueKeys.readMethod] ??= readScalar.bind(undefined,store);
+            }
+            break;
+        case "$write":
+            if (kind === "bitfield") return writeBitfield.bind(undefined,store);
+            if (kind === "scalar" || kind === "ptr") return writeScalar.bind(undefined,store);
+            break;
+        case "$length":
+            if (isIndexed(kind)) return dynamicLength(info,store);
+            break;
+        case "$atUnchecked":
+            if (isIndexed(kind)) return uncheckedIndex.bind(undefined,store);
+            break;
+        case "$deref":
+            if (kind === "ptr") {
+                return (store[valueKeys.terminatedElement] ? derefTerminated : derefPointer).bind(undefined,store);
+            }
+            break;
+        case "$writeContents":
+            if (store[valueKeys.terminatedElement]) return writeTerminated.bind(undefined,store);
+            break;
+        }
+        if (info.fields && Object.hasOwn(info.fields,key)) return valueField(store,key);
+        if (isIndexed(kind) && arrayIndex(key)) return valueAtIndex(store,Number(key),true);
+        return missingValueProperty;
+    }
+
+    function setValueProperty(store,key,value) {
+        const info = store[valueKeys.info];
+        if (key === "$tid") {
+            if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new RangeError("invalid TID");
+            store[valueKeys.tid] = value;
+            store[valueKeys.inheritTid] = false;
+            return true;
+        }
+        if (info.fields && Object.hasOwn(info.fields,key)) { assign(valueField(store,key),value); return true; }
+        if (isIndexed(info.kind) && arrayIndex(key)) { assign(valueAtIndex(store,Number(key),true),value); return true; }
+        throw new TypeError("value property is read-only");
+    }
+
+    const valueHandler = {
+        get(object,key) {
+            const value = getValueProperty(valueTargets.get(object),key);
+            return value === missingValueProperty ? Reflect.get(object,key) : value;
+        },
+        set(object,key,value) {
+            return setValueProperty(valueTargets.get(object),key,value);
+        },
+    };
+
+    const nativeValueHooks = {
+        get(store,key) {
+            const value = getValueProperty(store,key);
+            if (value !== missingValueProperty) return value;
+            const prototype = Object.getPrototypeOf(store[valueKeys.value]);
+            return prototype === null ? undefined : Reflect.get(prototype,key,store[valueKeys.value]);
+        },
+        set: setValueProperty,
+    };
+
     function makeValue(original, store) {
-        const type = resolve(original,store.self);
+        const type = resolve(original,store[valueKeys.self]);
         const info = typeInfo(type);
         if (info.kind === "void") return undefined;
-        const object = info.kind === "fn" ? (...args) => invoke(info,store,args) : Object.create(null);
-        const getBytes = () => {
-            bound(store);
-            if (store.bytes) return store.bytes.slice();
-            const size = valueSize(info,store);
-            if (size === undefined) throw new TypeError("value has no known byte size");
-            return readBytes(store.address,size);
-        };
-        const setBytes = bytes => {
-            bound(store);
-            if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
-            if (bytes.length !== valueSize(info,store)) throw new RangeError("byte length differs from C storage size");
-            if (store.bytes) store.bytes.set(bytes);
-            else writeBytes(store.address,bytes);
-        };
-        const read = () => view(getBytes())["get" + scalarSpec[info.scalar][0]](0,info.littleEndian ?? true);
-        const own = {
-            $type:() => type, $size:() => valueSize(info,store), $parent:() => store.parent,
-            $tid:() => store.tid ?? (store.inheritTid ? store.parent?.$tid : undefined),
-            $toJson:() => () => jsonText(summarize(store.value)),
-            $dumpString:() => () => jsonText(summarize(store.value)),
-        };
-        if (info.kind !== "fn" && info.kind !== "bitfield") {
-            own.$readBytes = () => getBytes;
-            own.$writeBytes = () => setBytes;
+        const terminatedElement = info.kind === "ptr" && info.terminated !== undefined
+            ? typeInfo(resolve(info.element)) : undefined;
+        if (info.kind !== "fn") {
+            return createCompactValue(store,type,info,terminatedElement,compactValueKeys);
         }
-        if (info.kind === "scalar" || info.kind === "ptr") {
-            own.$read = () => read;
-            own.$write = () => value => setBytes(encodeValue(info,value));
-        }
-        if (info.kind === "bitfield") {
-            const [shift,width] = info.bit;
-            const bytes = Math.ceil((shift + width) / 8);
-            const readWord = () => {
-                bound(store);
-                return readBytes(store.address,bytes).reduceRight((value, byte) => (value << 8n) | BigInt(byte), 0n);
-            };
-            const native = scalarSpec[info.scalar];
-            const signed = info.scalar.startsWith("i");
-            const mask = (1n << BigInt(width)) - 1n;
-            own.$read = () => () => {
-                const raw = (readWord() >> BigInt(shift)) & mask;
-                const n = signed ? BigInt.asIntN(width,raw) : raw;
-                return native[1] === 8 ? n : Number(n);
-            };
-            own.$write = () => value => {
-                scalarBytes(info.scalar,value);
-                const n = BigInt(value);
-                if (n !== (signed ? BigInt.asIntN(width,n) : BigInt.asUintN(width,n))) {
-                    throw new RangeError("integer does not fit the bitfield");
-                }
-                let raw = (readWord() & ~(mask << BigInt(shift))) | ((n & mask) << BigInt(shift));
-                const data = new Uint8Array(bytes);
-                for (let i = 0; i < bytes; i++, raw >>= 8n) data[i] = Number(raw & 255n);
-                writeBytes(store.address,data);
-            };
-        }
-        if (info.kind !== "bitfield") own.$address = () => () => {
-            bound(store);
-            if (store.address === undefined) throw new TypeError("value is not bound to target memory");
-            return store.address;
-        };
-        const field = name => {
-            bound(store);
-            const {offset,type} = info.fields[name];
-            return makeValue(type,{address:addr(store.address,offset), parent:store.value, inheritTid:true,
-                self:store.selfForFields, root:store.root});
-        };
-        const atIndex = (index, checked) => {
-            bound(store);
-            index = integer(index,"array index must be a nonnegative safe integer");
-            const count = checked ? dynamicLength(info,store) : undefined;
-            if (count !== undefined && index >= count) throw new RangeError("index exceeds the length");
-            const element = resolve(info.element,store.self), size = element.$size;
-            if (checked && info.kind === "array" && count === undefined) throw new TypeError("use $atUnchecked for an unsized array");
-            if (size === undefined && index !== 0) throw new TypeError("element size is unknown");
-            const base = info.kind === "ptr" ? read() : store.address;
-            if (info.kind === "ptr" && base === 0n) throw new RangeError("null pointer");
-            return makeValue(element,{address:addr(base,BigInt(index) * BigInt(size ?? 0)), parent:store.value,
-                inheritTid:true, self:store.self, root:store.root ?? rpc("generation")});
-        };
-        const indexed = info.kind === "ptr" || info.kind === "array";
-        if (indexed) {
-            own.$length = () => dynamicLength(info,store);
-            own.$atUnchecked = () => index => atIndex(index,false);
-        }
-        if (info.kind === "ptr") {
-            own.$deref = () => () => atIndex(0,false);
-            if (info.terminated !== undefined) {
-                const element = typeInfo(resolve(info.element));
-                own.$deref = () => () => {
-                    const bytes = terminatedBytes(read(),element,info.terminated);
-                    if (element.char) return fromUtf8(bytes);
-                    const data = view(bytes);
-                    return Array.from({length:bytes.length / element.size}, (_, index) => {
-                        const item = data["get" + scalarSpec[element.scalar][0]](index * element.size,element.littleEndian ?? true);
-                        return element.terminated === undefined ? item : atIndex(index,false).$deref();
-                    });
-                };
-                own.$writeContents = () => contents => {
-                    const base = read();
-                    const previous = terminatedBytes(base,element,info.terminated);
-                    const length = element.char ? (typeof contents === "string" ? utf8(contents) : undefined) : contents;
-                    if (element.char ? !length : !Array.isArray(length)) throw new TypeError("invalid terminated sequence contents");
-                    const count = length.length;
-                    const bytes = new Uint8Array(integer((count + 1) * element.size,"terminated sequence is too large"));
-                    for (let index = 0; index < count; index++) {
-                        const encoded = element.char ? [length[index]] : encodeValue(element,length[index]);
-                        if (encoded.every(byte => byte === 0)) throw new TypeError("sequence content contains a terminator");
-                        bytes.set(encoded,index * element.size);
-                    }
-                    writeBytes(base,bytes);
-                    const previousBytes = previous.length + element.size;
-                    return bytes.length > previousBytes ?
-                        {writtenBytes:bytes.length, previousBytes, warning:"write exceeded the previous sequence extent"} :
-                        {writtenBytes:bytes.length, previousBytes};
-                };
-            }
-        }
-        const arrayIndex = key => typeof key === "string" && /^(?:0|[1-9][0-9]*)$/.test(key);
-        const proxy = new Proxy(object,{
-            get(object,key) {
-                if (Object.hasOwn(own,key)) return own[key]();
-                if (info.fields && Object.hasOwn(info.fields,key)) return field(key);
-                if (indexed && arrayIndex(key)) return atIndex(key === "0" ? 0 : Number(key),true);
-                return Reflect.get(object,key);
-            },
-            set(_,key,value) {
-                if (key === "$tid") {
-                    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) throw new RangeError("invalid TID");
-                    store.tid = value;
-                    store.inheritTid = false;
-                    return true;
-                }
-                if (info.fields && Object.hasOwn(info.fields,key)) { assign(field(key),value); return true; }
-                if (indexed && arrayIndex(key)) { assign(atIndex(Number(key),true),value); return true; }
-                throw new TypeError("value property is read-only");
-            },
-        });
-        store.value = proxy;
-        store.selfForFields = info.fields ? type : store.self;
-        values.set(proxy,{type,store});
+        if (terminatedElement !== undefined) store[valueKeys.terminatedElement] = terminatedElement;
+        store[valueKeys.type] = type;
+        store[valueKeys.info] = info;
+        const object = (...args) => invoke(info,store,args);
+        const proxy = new Proxy(object,valueHandler);
+        store[valueKeys.value] = proxy;
+        valueTargets.set(object,store);
+        values.set(proxy,store);
         return proxy;
     }
 
     function assign(target, source) {
-        const dest = values.get(target), src = values.get(source);
+        const dest = valueStore(target), src = valueStore(source);
         if (!dest || (!target.$writeBytes && !target.$write)) throw new TypeError("value is not assignable");
         if (!src) {
             if (!target.$write) throw new TypeError("assign a C Value of the same type");
             target.$write(source);
             return;
         }
-        const expected = typeInfo(dest.type), actual = typeInfo(src.type);
-        if (dest.type !== src.type && (expected.kind !== actual.kind || expected.kind !== "scalar" || expected.scalar !== actual.scalar)) {
+        const expected = typeInfo(dest[valueKeys.type]), actual = typeInfo(src[valueKeys.type]);
+        if (dest[valueKeys.type] !== src[valueKeys.type] && (expected.kind !== actual.kind || expected.kind !== "scalar" || expected.scalar !== actual.scalar)) {
             throw new TypeError("incompatible C types");
         }
         if (expected.kind === "scalar" && expected.littleEndian !== actual.littleEndian) target.$write(source.$read());
@@ -1323,7 +1429,7 @@
     }
 
     function summarize(value, depth = 0) {
-        const info = typeInfo(values.get(value).type);
+        const info = typeInfo(valueStore(value)[valueKeys.type]);
         if (value.$read) {
             const result = value.$read();
             return typeof result === "bigint" ? (info.kind === "ptr" ? word(result) : result.toString()) : result;
@@ -1338,26 +1444,26 @@
     }
 
     function invoke(info, store, args) {
-        const tid = store.value.$tid;
+        const tid = store[valueKeys.value].$tid;
         if (tid === undefined) throw new TypeError("bind a thread before calling a C function");
         bound(store);
         if (args.length < info.args.length || (!info.variadic && args.length !== info.args.length)) throw new TypeError("incorrect C argument count");
         const encoded = args.map((value,i) => {
-            const inferred = values.get(value);
-            const type = info.args[i] ?? inferred?.type;
+            const inferred = valueStore(value);
+            const type = info.args[i] ?? inferred?.[valueKeys.type];
             if (!type) throw new TypeError("variadic arguments must be typed C Values");
             const arg = typeInfo(resolve(type));
             if (!arg.scalar) throw new TypeError("unsupported C argument type");
             if (inferred) {
-                if (typeInfo(inferred.type).scalar !== arg.scalar) throw new TypeError("incompatible C argument");
+                if (typeInfo(inferred[valueKeys.type]).scalar !== arg.scalar) throw new TypeError("incompatible C argument");
                 value = value.$read();
             }
             return {kind:arg.scalar, bytes:Array.from(scalarBytes(arg.scalar,value))};
         });
         const ret = typeInfo(resolve(info.returns));
         return Promise.resolve().then(() => {
-            const bytes = rpc("call", {tid,address:word(store.address),args:encoded,returns:ret.scalar ?? ret.kind,fixed:info.args.length,variadic:info.variadic});
-            return ret.kind === "void" ? undefined : makeValue(info.returns, {bytes:Uint8Array.from(bytes)});
+            const bytes = rpc("call", {tid,address:word(store[valueKeys.address]),args:encoded,returns:ret.scalar ?? ret.kind,fixed:info.args.length,variadic:info.variadic});
+            return ret.kind === "void" ? undefined : makeValue(info.returns, {[valueKeys.bytes]:Uint8Array.from(bytes)});
         });
     }
 
@@ -1427,8 +1533,15 @@
     }
 
     return {
-        initialize(operation, architecture) {
-            host = operation; arch = architecture;
+        nativeValueKeys: valueKeys,
+        nativeValueHooks,
+        installCompactValue(create, lookup, keys) {
+            createCompactValue = create;
+            lookupNativeValue = lookup;
+            compactValueKeys = keys;
+        },
+        initialize(operation, architecture, generation) {
+            host = operation; arch = architecture; targetGeneration = generation;
             const scope = new Proxy(exports,{
                 get(target,key) { return target[key]?.[key]; },
                 set() { return false; },
