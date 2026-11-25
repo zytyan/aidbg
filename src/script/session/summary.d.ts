@@ -17,6 +17,8 @@ interface Debugger {
     thread(tid: number): Thread;
     threads(): readonly Thread[];
     snapshot(options?: number | { tid?: number; context?: boolean }): Promise<DebugSnapshot>;
+    backtraceAll(): Promise<Pick<DebugSnapshot, "threads" | "incomplete">>;
+    traceHits(at: bigint | string, options?: { tid?: number; timeoutMs?: number; limit?: number }): Promise<{ stop: WaitResult<StopEvent>; hits: readonly { tid: number; hitCount: number }[]; limitReached: boolean }>;
     waitOutput(tid: number, timeoutMs?: number): Promise<WaitOutputResult>;
     mappings(): readonly MemoryMapping[];
     pauseThread(tid: number): Promise<ControlledThread>;
@@ -39,8 +41,8 @@ interface Debugger {
     iterSymbols(pattern: RegExp): AsyncIterableIterator<SymbolInfo>;
     iterDwarfTypes(pattern: RegExp): AsyncIterableIterator<Type>;
     getDwarfTypes(name: string): AsyncIterableIterator<Type>;
-    softwareBreakpoint(at: bigint | string, callback?: BreakpointCallback | null, tid?: number): Breakpoint;
-    hardwareBreakpoint(at: bigint | string, callback?: BreakpointCallback | null, tid?: number): Breakpoint;
+    softwareBreakpoint(at: bigint | string, callback?: BreakpointCallback | null, options?: number | BreakpointOptions): Breakpoint;
+    hardwareBreakpoint(at: bigint | string, callback?: BreakpointCallback | null, options?: number | BreakpointOptions): Breakpoint;
     pendingBreakpoint(name: string, callback: BreakpointCallback | null, options?: { module?: string }): PendingBreakpoint;
     hardwareWatchpoint(at: bigint | string, callback: WatchpointCallback | null, options: WatchpointOptions): Breakpoint;
     softwareWatchpoint(at: bigint | string, callback: WatchpointCallback | null, options: WatchpointOptions): Breakpoint;
@@ -50,7 +52,8 @@ interface Debugger {
     assemble(at: bigint | string, source: string): Uint8Array;
     addrToLine(address: bigint): { file: string; line: number } | null;
     lineToAddr(file: string, line: number): bigint | null;
-    list(location: bigint | StackFrame, radius?: number): SourceListing | null;
+    list(location: bigint | StackFrame, radius?: number, sourcePaths?: readonly { from: string; to: string }[]): SourceListing | null;
+    stringify(value: unknown): string | undefined;
 }
 
 interface TypeSystem {
@@ -72,7 +75,8 @@ interface TypeSystem {
     lazy(getter: () => Type): Type;
     self(): Type;
     fromDwarf(name: string): Type;
-    findTypes(query: string): readonly { name: string; module: string; size: number | null }[];
+    setPrettyPrinter(type: Type, printer: ((value: CValue) => string | undefined) | null): void;
+    findTypes(query: string, options?: { exact?: boolean; module?: string }): readonly { name: string; module: string; size: number | null }[];
     typeOfVar(name: string): Type | undefined;
 }
 

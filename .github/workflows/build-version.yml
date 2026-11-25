@@ -58,7 +58,7 @@ jobs:
           clang -O0 -g -gdwarf-5 -pthread tests/session_fixture.c -ldl -o "$RUNNER_TEMP/clang-fixture"
           gcc -O0 -fno-pic -c tests/session_link.c -o "$RUNNER_TEMP/link.o"
           gcc -O0 -g -shared -fPIC tests/session_link.c -o "$RUNNER_TEMP/session-test.so"
-          make -C tests/debug-cases OUT="$RUNNER_TEMP/cases" "$RUNNER_TEMP/cases"/{D05,D06,D08,D09,D10}
+          make -C tests/debug-cases OUT="$RUNNER_TEMP/cases" "$RUNNER_TEMP/cases"/{D02,D04,D05,D06,D08,D09,D10}
           python3 tests/session.py "target/$TARGET/release/aidbg" "target/$TARGET/release/aidbg-server" \
             "$RUNNER_TEMP/gcc-fixture" "$RUNNER_TEMP/clang-fixture" --object "$RUNNER_TEMP/link.o" \
             --cases "$RUNNER_TEMP/cases" --library "$RUNNER_TEMP/session-test.so"

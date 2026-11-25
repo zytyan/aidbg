@@ -233,6 +233,12 @@ export interface StackFrame {
     readonly module?: Module;
     /** 尝试解析出的函数名 */
     readonly symbol?: string;
+    /** 覆盖当前地址的逻辑内联帧，由内向外排列。变量由所属物理帧的作用域解析。 */
+    readonly inlineFrames?: readonly {
+        readonly symbol: string;
+        readonly callFile: string | null;
+        readonly callLine: number | null;
+    }[];
     readonly unwindMethod?: string;
     readonly missingDebugSections?: readonly string[];
     /** 距离函数入口的偏移 */
@@ -254,6 +260,7 @@ export interface ThreadSnapshot {
 }
 
 export interface SourceListing {
+    readonly originalFile?: string;
     readonly file: string;
     readonly line: number;
     readonly lines: readonly { readonly line: number; readonly text: string }[];
@@ -263,6 +270,7 @@ export interface DebugSnapshot {
     readonly timestamp: number;
     readonly threads: readonly ThreadSnapshot[];
     readonly mappings: readonly MemoryMapping[];
+    readonly incomplete?: readonly { readonly tid?: number; readonly stage: string; readonly error: string }[];
     readonly consistency: "thread" | "all-stopped" | "best-effort";
     readonly context?: {
         readonly State?: string;
@@ -287,6 +295,12 @@ export interface WaitOutputResult {
 }
 
 export type BreakpointCallback = (hit: BreakpointHit) => void | Promise<void>;
+
+export interface BreakpointOptions {
+    readonly tid?: number;
+    /** 只有返回 true 时执行回调或停下。 */
+    readonly condition?: (hit: BreakpointHit) => boolean;
+}
 
 export interface Breakpoint {
     readonly id: number;
@@ -556,6 +570,13 @@ export interface Debugger {
      */
     prepareScratchPad(): Promise<void>;
     snapshot(options?: number | { tid?: number; context?: boolean }): Promise<DebugSnapshot>;
+    backtraceAll(): Promise<Pick<DebugSnapshot, "threads" | "incomplete">>;
+    /** 记录指定断点的命中并自动继续，直到退出、超时、达到命中上限或遇到其他暂停事件。 */
+    traceHits(at: bigint | string, options?: { tid?: number; timeoutMs?: number; limit?: number }): Promise<{
+        readonly stop: WaitResult<StopEvent>;
+        readonly hits: readonly { readonly tid: number; readonly hitCount: number }[];
+        readonly limitReached: boolean;
+    }>;
     waitOutput(tid: number, timeoutMs?: number): Promise<WaitOutputResult>;
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
@@ -573,12 +594,12 @@ export interface Debugger {
     hardwareBreakpoint(
         at: bigint | string,
         cb?: BreakpointCallback | null,
-        tid?: number
+        options?: number | BreakpointOptions
     ): Breakpoint;
     softwareBreakpoint(
         at: bigint | string,
         cb?: BreakpointCallback | null,
-        tid?: number
+        options?: number | BreakpointOptions
     ): Breakpoint;
     hardwareWatchpoint(
         at: bigint | string,
@@ -622,12 +643,17 @@ export interface Debugger {
     lineToAddr(file: string, line: number): bigint | null;
     addrToLine(addr: bigint): { file: string; line: number } | null;
     /** 从调试服务端读取地址或帧对应的源码。默认前后各 5 行，找不到源码时返回 null。 */
-    list(at: bigint | StackFrame, radius?: number): SourceListing | null;
+    list(at: bigint | StackFrame, radius?: number,
+        sourcePaths?: readonly { readonly from: string; readonly to: string }[]): SourceListing | null;
+    /** 序列化调试值，BigInt 表示为十进制字符串。 */
+    stringify(value: unknown): string | undefined;
 }
 
 export type WaitResult<T> = T | { readonly kind: "timeout" } | { readonly kind: "ended" };
 
 export interface ContinueOptions {
+    /** 只交付仍暂停的停点及退出结果。已恢复的记录保留给其他等待接口。 */
+    pausedOnly?: boolean;
     /** 默认 180 秒。超时不改变目标状态。 */
     timeoutMs?: number;
     /** 只在仍暂停的停点调用。返回 false 时释放该停点并继续等待。 */
@@ -1062,9 +1088,12 @@ export interface TypeSystem {
 
     /** 第二遍编译根据 DWARF 信息替换为精确类型 */
     fromDwarf<const S extends string>(name: S & LiteralString<S>): any;
-    findTypes(query: string): readonly { readonly name: string; readonly module: string; readonly size: number | null }[];
+    /** 为同一类型描述符注册结构化日志和调试值的格式化函数。 */
+    setPrettyPrinter<V>(type: Type.Base<V>, printer: ((value: V) => string | undefined) | null): void;
+    findTypes(query: string, options?: { exact?: boolean; module?: string }): readonly { readonly name: string; readonly module: string; readonly size: number | null }[];
     /** 查询当前回调线程（或进程主线程）顶层栈帧中变量的 DWARF 类型。找不到时返回 undefined。 */
     typeOfVar<const S extends string>(name: S & LiteralString<S>): Type.Base<unknown> | undefined;
+    typeOfVar(name: string): Type.Base<unknown> | undefined;
 }
 
 export type ExitEvent = {

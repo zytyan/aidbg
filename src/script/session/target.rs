@@ -340,13 +340,22 @@ impl Live {
         tid: i32,
         action: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        self.with_stopped_until(tid, Instant::now() + DEADLINE, action)
+    }
+
+    fn with_stopped_until<T>(
+        &mut self,
+        tid: i32,
+        deadline: Instant,
+        action: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         self.verify()?;
         let was_running = self
             .trace
             .threads
             .get(&tid)
             .is_some_and(|thread| thread.stop.is_none());
-        self.trace.stop_thread(tid, Instant::now() + DEADLINE)?;
+        self.trace.stop_thread(tid, deadline)?;
         let result = action(self);
         if was_running
             && matches!(
@@ -363,6 +372,14 @@ impl Live {
         &mut self,
         action: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        self.with_frozen_until(Instant::now() + DEADLINE, action)
+    }
+
+    fn with_frozen_until<T>(
+        &mut self,
+        deadline: Instant,
+        action: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         self.verify()?;
         let previous: BTreeSet<_> = self
             .trace
@@ -370,10 +387,7 @@ impl Live {
             .iter()
             .filter_map(|(&tid, thread)| thread.stop.map(|_| tid))
             .collect();
-        let result = self
-            .trace
-            .freeze(Instant::now() + DEADLINE)
-            .and_then(|()| action(self));
+        let result = self.trace.freeze(deadline).and_then(|()| action(self));
         let mut cleanup = Ok(());
         for tid in self.tids() {
             if !previous.contains(&tid)
@@ -406,27 +420,66 @@ impl Live {
     }
 
     fn snapshot(&mut self, tid: Option<i32>, context: bool) -> Result<Value> {
+        let deadline = Instant::now() + DEADLINE;
+        let mut stage = "stop";
         let collect = |live: &mut Self| -> Result<_> {
+            stage = "rewind";
             live.trace.rewind_software_stops()?;
             let mut threads = Vec::new();
+            let mut incomplete = Vec::new();
+            stage = "threads";
             for tid in live.original_tids(tid) {
-                let registers = regs::api_read(tid, false)?;
-                let frames = live.frames(tid, 64)?;
-                let locals = frames.first().map(flatten_frame_values).unwrap_or_default();
-                threads
-                    .push(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}));
+                if Instant::now() >= deadline {
+                    incomplete.push(
+                        json!({"tid":tid,"stage":"threads","error":"snapshot deadline reached"}),
+                    );
+                    continue;
+                }
+                let thread = (|| -> Result<Value> {
+                    let registers = regs::api_read(tid, false)?;
+                    let frames = live.frames_until(tid, 64, deadline)?;
+                    let locals = frames.first().map(flatten_frame_values).unwrap_or_default();
+                    Ok(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}))
+                })();
+                match thread {
+                    Ok(thread) => {
+                        threads.push(thread);
+                        if Instant::now() >= deadline {
+                            incomplete.push(json!({"tid":tid,"stage":"frames","error":"snapshot deadline reached"}));
+                        }
+                    }
+                    Err(err) => incomplete
+                        .push(json!({"tid":tid,"stage":"threads","error":err.to_string()})),
+                }
             }
-            let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":live.mappings()?,
+            let mappings = if Instant::now() < deadline {
+                match live.mappings() {
+                    Ok(mappings) => mappings,
+                    Err(err) => {
+                        incomplete.push(json!({"stage":"mappings","error":err.to_string()}));
+                        json!([])
+                    }
+                }
+            } else {
+                incomplete.push(json!({"stage":"mappings","error":"snapshot deadline reached"}));
+                json!([])
+            };
+            let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":mappings,
                 "consistency":if tid.is_some() { "thread" } else { "all-stopped" }});
-            if context {
+            if context && Instant::now() < deadline {
                 snapshot["context"] = live.process_context();
             }
+            if !incomplete.is_empty() {
+                snapshot["incomplete"] = json!(incomplete);
+            }
+            stage = "restore";
             Ok(snapshot)
         };
         match tid {
-            Some(tid) => self.with_stopped(tid, collect),
-            None => self.with_frozen(collect),
+            Some(tid) => self.with_stopped_until(tid, deadline, collect),
+            None => self.with_frozen_until(deadline, collect),
         }
+        .map_err(|err| error(format!("snapshot {stage}: {err}")))
     }
 
     fn process_context(&self) -> Value {
@@ -473,12 +526,15 @@ impl Live {
     }
 
     fn frames(&self, tid: i32, limit: usize) -> Result<Vec<Value>> {
+        self.frames_until(tid, limit, Instant::now() + DEADLINE)
+    }
+
+    fn frames_until(&self, tid: i32, limit: usize, deadline: Instant) -> Result<Vec<Value>> {
         let regs = regs::read(tid)?.stack;
         let maps = modules::read(&self.root)?;
         let exe = fs::metadata(self.root.join("exe")).ok();
         let mut images = Images::new();
         let mut frame_registers = Vec::new();
-        let deadline = Instant::now() + DEADLINE;
         let mut stack = images.walk_registers(
             &self.trace,
             regs,
@@ -488,21 +544,33 @@ impl Live {
             deadline,
             |_, registers| frame_registers.push(registers),
         );
-        images.symbolize(&mut stack);
+        stack.frames.truncate(limit);
+        images.symbolize_until(&mut stack, deadline);
         stack
             .frames
             .into_iter()
             .zip(frame_registers)
-            .take(limit)
             .map(|(frame, registers)| {
+                let inline_frames = if Instant::now() < deadline {
+                    self.dwarf.iter().rev().find_map(|attached| {
+                        let link = attached.link_address(frame.lookup_address)?;
+                        let frames = attached.image.inline_frames(link, deadline).ok()?;
+                        (!frames.is_empty()).then_some(frames)
+                    }).unwrap_or(frame.inline_frames.clone())
+                } else {
+                    frame.inline_frames.clone()
+                };
                 let frame = serde_json::to_value(frame)?;
                 let fp = registers.get(regs::FP).ok().map(hex);
                 let values = self
                     .frame_values(registers, deadline)
                     .unwrap_or(Value::Null);
-                let source = self
-                    .attached_source(registers.get(regs::PC)?)
-                    .ok()
+                let source = (Instant::now() < deadline)
+                    .then(|| {
+                        self.attached_source(registers.get(regs::PC).ok()?)
+                            .ok()
+                            .flatten()
+                    })
                     .flatten();
                 let (file, line) = source.map_or_else(
                     || (frame["file"].clone(), frame["line"].clone()),
@@ -511,7 +579,7 @@ impl Live {
                 Ok(json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
                     "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
                     "file":file,"line":line,"unwindMethod":frame["method"],
-                    "missingDebugSections":frame["missing_debug_sections"],
+                    "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames,
                     "locals":values["locals"],"parameters":values["parameters"]}))
             })
             .collect()
@@ -2018,6 +2086,7 @@ impl Target {
                 list_source(
                     self.source_location(parse_address(&args["address"])?)?,
                     radius,
+                    args["sourcePaths"].as_array().map_or(&[], Vec::as_slice),
                 )
             }
             "address" => Ok(json!(hex(self.address(&args["at"])?))),
@@ -2278,6 +2347,7 @@ impl Target {
                 let rows = self.type_graphs(
                     args["pattern"].as_str().unwrap_or("*"),
                     args["exact"] == true,
+                    args["typesOnly"] != true,
                     offset,
                     33,
                 )?;
@@ -2294,7 +2364,7 @@ impl Target {
         if matches!(self, Self::Core(_)) {
             return Err(error("NotSupport: inferior calls require a live target"));
         }
-        let mut graphs = self.type_graphs(name, true, 0, 2)?;
+        let mut graphs = self.type_graphs(name, true, true, 0, 2)?;
         if graphs.len() != 1 {
             return Err(error(
                 "inferior call requires a unique DWARF function declaration",
@@ -2352,6 +2422,7 @@ impl Target {
         &self,
         pattern: &str,
         exact: bool,
+        include_functions: bool,
         offset: usize,
         limit: usize,
     ) -> Result<Vec<(String, symbols::inspect::type_graph::Graph)>> {
@@ -2360,7 +2431,9 @@ impl Target {
         }
         let deadline = Instant::now() + DEADLINE;
         match self {
-            Self::Core(core) => core.session_types(pattern, exact, offset, limit, deadline),
+            Self::Core(core) => {
+                core.session_types(pattern, exact, include_functions, offset, limit, deadline)
+            }
             Self::Live(live) => {
                 live.verify()?;
                 let mut rows = Vec::new();
@@ -2369,6 +2442,7 @@ impl Target {
                     let (items, scanned) = attached.image.type_graphs(
                         pattern,
                         exact,
+                        include_functions,
                         skip,
                         limit - rows.len(),
                         deadline,
@@ -2383,6 +2457,7 @@ impl Target {
                     &live.root,
                     pattern,
                     exact,
+                    include_functions,
                     skip,
                     limit - rows.len(),
                     deadline,
@@ -2396,7 +2471,7 @@ impl Target {
         &self,
         name: &str,
     ) -> Result<symbols::inspect::type_graph::Graph> {
-        let mut matches = self.type_graphs(name, true, 0, 5)?;
+        let mut matches = self.type_graphs(name, true, true, 0, 5)?;
         if matches.len() == 1 {
             return Ok(matches.pop().unwrap().1);
         }
@@ -2411,7 +2486,7 @@ impl Target {
                 .take(12)
                 .collect();
             if !stem.is_empty() {
-                matches = self.type_graphs(&format!("*{stem}*"), false, 0, 5)?;
+                matches = self.type_graphs(&format!("*{stem}*"), false, false, 0, 5)?;
             }
         }
         let candidates = matches
@@ -2454,16 +2529,38 @@ fn flatten_frame_values(frame: &Value) -> Vec<Value> {
         .collect()
 }
 
-fn list_source(location: Value, radius: u64) -> Result<Value> {
+fn list_source(location: Value, radius: u64, source_paths: &[Value]) -> Result<Value> {
     let Some((path, line)) = location["file"].as_str().zip(location["line"].as_u64()) else {
         return Ok(Value::Null);
     };
+    let original = Path::new(path);
+    let mut resolved = original.to_path_buf();
+    for rule in source_paths {
+        let from = rule["from"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| error("expected a source path prefix"))?;
+        let to = rule["to"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| error("expected a source path replacement"))?;
+        if let Ok(suffix) = original.strip_prefix(from) {
+            resolved = Path::new(to).join(suffix);
+            break;
+        }
+    }
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+        .open(&resolved)
     {
         Ok(file) => file,
+        Err(err) if !source_paths.is_empty() => {
+            return Err(error(format!(
+                "cannot read source {path} at {}: {err}",
+                resolved.display()
+            )));
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Value::Null),
         Err(err) => return Err(err.into()),
     };
@@ -2487,7 +2584,7 @@ fn list_source(location: Value, radius: u64) -> Result<Value> {
         .take_while(|(number, _)| *number <= upper)
         .map(|(number, text)| json!({"line":number,"text":text}))
         .collect();
-    Ok(json!({"file":path,"line":line,"lines":lines}))
+    Ok(json!({"file":resolved,"originalFile":path,"line":line,"lines":lines}))
 }
 
 fn evaluation(report: Value) -> Result<Value> {

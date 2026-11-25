@@ -29,11 +29,13 @@ pub(super) struct Request {
     pub timeout_ms: Option<u64>,
     pub resume: Option<bool>,
     pub fresh: Option<bool>,
+    pub paused_only: Option<bool>,
     pub limit: Option<usize>,
 }
 
 struct Wait {
     kind: Kind,
+    paused_only: bool,
     tid: Option<i32>,
     after: u64,
     deadline: Instant,
@@ -41,6 +43,14 @@ struct Wait {
 }
 
 impl Wait {
+    fn deliverable(&self, event: &Entry, held: &impl Fn(i32, u64) -> bool) -> bool {
+        self.matches(event)
+            && (!self.paused_only
+                || !event.ready
+                || event.row["kind"] == "exit"
+                || is_held(&event.row, held))
+    }
+
     fn matches(&self, event: &Entry) -> bool {
         let row = &event.row;
         let terminal = row["kind"] == "exit";
@@ -147,7 +157,11 @@ impl Queue {
             .is_some_and(|entry| self.waiters.values().any(|wait| wait.matches(entry)))
     }
 
-    pub fn register(&mut self, request: &Request) -> Result<(u64, bool)> {
+    pub fn register(
+        &mut self,
+        request: &Request,
+        held: impl Fn(i32, u64) -> bool,
+    ) -> Result<(u64, bool)> {
         if self.waiters.len() == MAX_WAITERS {
             return Err(error("too many active event waits"));
         }
@@ -163,6 +177,7 @@ impl Queue {
         }
         let wait = Wait {
             kind: request.kind,
+            paused_only: request.paused_only == Some(true),
             tid: request.tid,
             after: if request.fresh == Some(true) {
                 self.sequence
@@ -174,7 +189,10 @@ impl Queue {
         };
         let resume = request.resume == Some(true)
             && !self.ended(&wait)
-            && !self.events.iter().any(|entry| wait.matches(entry));
+            && !self
+                .events
+                .iter()
+                .any(|entry| wait.deliverable(entry, &held));
         self.next_wait += 1;
         self.waiters.insert(self.next_wait, wait);
         Ok((self.next_wait, resume))
@@ -192,7 +210,10 @@ impl Queue {
         let mut results = Vec::new();
         let mut completed = Vec::new();
         for (&id, wait) in &self.waiters {
-            let first = self.events.iter().position(|entry| wait.matches(entry));
+            let first = self
+                .events
+                .iter()
+                .position(|entry| wait.deliverable(entry, &held));
             let mut result = None;
             if let Some(index) = first
                 && self.events[index].ready
@@ -252,12 +273,15 @@ impl Queue {
     }
 }
 
+fn is_held(row: &Value, held: &impl Fn(i32, u64) -> bool) -> bool {
+    row["paused"] == true
+        && row["tid"]
+            .as_i64()
+            .is_some_and(|tid| held(tid as i32, row["sequence"].as_u64().unwrap()))
+}
+
 fn refresh_paused(row: &mut Value, held: &impl Fn(i32, u64) -> bool) {
     if row["paused"] == true {
-        row["paused"] = json!(
-            row["tid"]
-                .as_i64()
-                .is_some_and(|tid| held(tid as i32, row["sequence"].as_u64().unwrap()))
-        );
+        row["paused"] = json!(is_held(row, held));
     }
 }

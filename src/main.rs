@@ -67,6 +67,16 @@ struct AttachArgs {
 #[derive(Deserialize, JsonSchema)]
 struct ScriptArgs {
     src: String,
+    /// Optional completion wait in milliseconds, up to 300000.
+    wait_ms: Option<u32>,
+    /// Optionally launch a new target before checking and executing the script.
+    run: Option<RunArgs>,
+}
+#[derive(Deserialize, JsonSchema)]
+struct ScriptWaitArgs {
+    script_id: u64,
+    /// Completion wait in milliseconds, up to 300000. Defaults to 5000.
+    wait_ms: Option<u32>,
 }
 #[derive(Deserialize, JsonSchema)]
 struct CoreArgs {
@@ -432,7 +442,33 @@ impl Connection {
         reply(
             self.client
                 .clone()
-                .script_run(self.request(RunScriptRequest { src: args.src }))
+                .script_run(
+                    self.request(RunScriptRequest {
+                        src: args.src,
+                        wait_ms: args
+                            .wait_ms
+                            .unwrap_or(if args.run.is_some() { 5000 } else { 0 }),
+                        run: args.run.map(|run| RunProcessRequest {
+                            path: run.path,
+                            arg: run.arg,
+                        }),
+                    }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Wait for a submitted script by ID and collect its current output. A wait timeout leaves the script running."
+    )]
+    async fn script_wait(&self, Parameters(args): Parameters<ScriptWaitArgs>) -> CallToolResult {
+        reply(
+            self.client
+                .clone()
+                .script_wait(self.request(WaitScriptRequest {
+                    script_id: args.script_id,
+                    wait_ms: args.wait_ms.unwrap_or(5000),
+                }))
                 .await,
         )
     }

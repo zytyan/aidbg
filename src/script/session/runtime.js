@@ -315,6 +315,7 @@
         );
         return Object.freeze({...row, pc:BigInt(raw.pc), sp:BigInt(raw.sp ?? 0), fp:BigInt(raw.fp ?? 0),
             lookupPc:BigInt(raw.lookupPc ?? raw.pc), locals:variables(raw.locals), parameters:variables(raw.parameters),
+            inlineFrames:raw.inlineFrames == null ? undefined : Object.freeze(raw.inlineFrames.map(Object.freeze)),
             unwindMethod:optional(raw.unwindMethod),
             missingDebugSections:raw.missingDebugSections == null ? undefined : Object.freeze(raw.missingDebugSections),
             symbol:optional(raw.symbol), file:optional(raw.file), line:optional(raw.line)});
@@ -401,11 +402,12 @@
         if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 86400000) throw new RangeError("invalid timeoutMs");
         const deadline = rpc("clock") + timeoutMs;
         while (true) {
-            const event = await waitEvent({kind:"stop", tid:scope(tid), resume:true,
+            const event = await waitEvent({kind:"stop", tid:scope(tid), resume:true, pausedOnly:options.pausedOnly,
                 timeoutMs:Math.max(0,deadline-rpc("clock"))}, callbackContext);
-            if (predicate === undefined || ["exit","ended","timeout"].includes(event.kind)) return event;
+            if (["exit","ended","timeout"].includes(event.kind)) return event;
+            if (predicate === undefined) return event;
             if (event.kind === "signal" && event.paused) return event;
-            if (event.paused && predicate(event) === true) return event;
+            if (event.paused && predicate?.(event) === true) return event;
             if (event.paused) rpc("continue", {tid:event.tid});
             if (rpc("clock") >= deadline) return Object.freeze({kind:"timeout"});
         }
@@ -489,12 +491,14 @@
 
     function install(type, at, callback, options = {}) {
         if (callback != null && typeof callback !== "function") throw new TypeError("expected breakpoint callback");
+        const {condition, ...targetOptions} = options ?? {};
+        if (condition !== undefined && typeof condition !== "function") throw new TypeError("expected breakpoint condition");
         const generation = targetGeneration();
         const id = ++nextPoint;
         const pending = type === "pending";
         const address = pending
-            ? rpc("addPendingPoint", {id, name:at, ...options})
-            : BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...options}));
+            ? rpc("addPendingPoint", {id, name:at, ...targetOptions})
+            : BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...targetOptions}));
         const change = remove => {
             if (generation !== targetGeneration()) throw new Error("breakpoint no longer exists");
             rpc("point", {id, remove});
@@ -510,7 +514,7 @@
             },
             get tid() {
                 if (generation !== targetGeneration()) return Object.freeze([]);
-                return Object.freeze(options.tid === undefined ? rpc("threads") : [options.tid]);
+                return Object.freeze(targetOptions.tid === undefined ? rpc("threads") : [targetOptions.tid]);
             },
             get callback() { return callback; },
             set callback(value) {
@@ -520,7 +524,7 @@
             disable() { change(false); },
             remove() { change(true); },
         });
-        points.set(id, {point, count:0});
+        points.set(id, {point, condition, count:0});
         return point;
     }
 
@@ -549,6 +553,32 @@
         async snapshot(options) {
             const request = typeof options === "object" ? options : {tid:options};
             return snapshot(rpc("snapshot", request));
+        },
+        async backtraceAll() {
+            const {threads, incomplete} = await dbg.snapshot();
+            return Object.freeze({threads, incomplete});
+        },
+        async traceHits(at, {tid, timeoutMs, limit = 1024} = {}) {
+            if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1024) {
+                throw new RangeError("trace hit limit must be in 1..=1024");
+            }
+            const generation = targetGeneration();
+            const hits = [];
+            const point = dbg.softwareBreakpoint(at, hit => {
+                hits.push(Object.freeze({tid:hit.thread.tid, hitCount:hit.hitCount}));
+                if (hits.length >= limit) hit.pause();
+                else hit.continue();
+            }, tid);
+            let stop;
+            try {
+                stop = await continueForStop("all", {timeoutMs, pausedOnly:true});
+                return Object.freeze({stop, hits:Object.freeze(hits), limitReached:hits.length >= limit});
+            } finally {
+                if (generation === targetGeneration()) {
+                    if (stop?.kind === "exit" || stop?.kind === "ended") points.delete(point.id);
+                    else point.remove();
+                }
+            }
         },
         async waitOutput(tid, timeoutMs = 180000) {
             tid = integer(tid, "invalid thread ID");
@@ -615,9 +645,10 @@
             return result == null ? null : BigInt(result);
         },
         addrToLine(address) { return rpc("addrToLine",{address:word(address)}); },
-        list(at, radius = 5) {
+        stringify(value) { return jsonText(value); },
+        list(at, radius = 5, sourcePaths = []) {
             return rpc("listSource", {address:word(typeof at === "bigint" ? at : at.lookupPc),
-                radius:integer(radius,"invalid source context")});
+                radius:integer(radius,"invalid source context"), sourcePaths});
         },
         async getSymbol(name) {
             const rows = rpc("symbols", {pattern:name});
@@ -646,9 +677,13 @@
             } while (cursor != null);
             yield* matches(rpc("linkedSymbols"));
         },
-        hardwareBreakpoint(at, callback, tid) { return install("hardware_breakpoint",at,callback,{tid}); },
+        hardwareBreakpoint(at, callback, options) {
+            return install("hardware_breakpoint", at, callback, typeof options === "number" ? {tid: options} : options);
+        },
         pendingBreakpoint(name, callback, options) { return install("pending",name,callback,options); },
-        softwareBreakpoint(at, callback, tid) { return install("software_breakpoint",at,callback,{tid}); },
+        softwareBreakpoint(at, callback, options) {
+            return install("software_breakpoint", at, callback, typeof options === "number" ? {tid: options} : options);
+        },
         hardwareWatchpoint(at, callback, options) { return install("hardware_watchpoint",at,callback,options); },
         softwareWatchpoint(at, callback, options) { return install("software_watchpoint",at,callback,options); },
         assemble(at, src) { return bytesFromHex(rpc("assemble", {at:checkedAddress(at), src}).bytes); },
@@ -672,6 +707,7 @@
     async function dispatch(tid, token, events) {
         const generation = targetGeneration();
         const context = {tid,token,active:true,pause:null,signal:false,pass:undefined,counts:{}};
+        let skippedPoint = false, matchedPoint = false;
         const thread = makeThread(tid, true, context);
         const check = () => {
             if (!context.active || targetGeneration() !== generation) throw new Error("the callback no longer controls this stop");
@@ -710,9 +746,15 @@
                             if (event.after != null) hit.after = immediateWatch(event.length, event.after);
                             if (event.access != null) hit.access = event.access;
                         }
-                        const callback = installed.point.callback;
-                        if (callback == null) context.pause = true;
-                        else result = callback(Object.freeze(hit));
+                        Object.freeze(hit);
+                        if (installed.condition && installed.condition(hit) !== true) {
+                            skippedPoint = true;
+                        } else {
+                            matchedPoint = true;
+                            const callback = installed.point.callback;
+                            if (callback == null) context.pause = true;
+                            else result = callback(hit);
+                        }
                     } else {
                         context.signal = true;
                         const callback = signals.get(event.signalNumber);
@@ -741,6 +783,7 @@
         } finally {
             if (context.active) {
                 context.active = false;
+                if (skippedPoint && !matchedPoint && !context.signal) context.pause ??= false;
                 rpc("callbackDone", {generation,tid,token,pause:context.pause,pass:context.pass,counts:context.counts});
             }
         }
@@ -748,6 +791,8 @@
 
     // Type descriptors carry layout. Every value has its own storage and thread binding.
     const types = new WeakMap(), values = new WeakMap();
+    let prettyPrinters = new WeakMap();
+    const activePrinters = new WeakSet();
     const valueKeys = {
         address: Symbol(),
         bytes: Symbol(),
@@ -1219,10 +1264,24 @@
         fromDwarf(name) {
             return dwarfType({graph:rpc("fromDwarf", {name})});
         },
-        findTypes(query) {
+        setPrettyPrinter(type, printer) {
+            typeInfo(type);
+            if (printer === null) prettyPrinters.delete(type);
+            else {
+                if (typeof printer !== "function") throw new TypeError("expected a pretty-printer");
+                prettyPrinters.set(type, printer);
+            }
+        },
+        findTypes(query, {exact = false, module:modulePath} = {}) {
             if (typeof query !== "string" || !query) throw new TypeError("expected a DWARF type query");
-            const pattern = /[*?\[]/.test(query) ? query : "*" + query + "*";
-            return Array.from(dwarfRows(pattern), ({name,module,size}) => ({name,module,size}));
+            const pattern = exact || /[*?\[]/.test(query) ? query : "*" + query + "*";
+            const rows = [];
+            for (const {name,module,size} of dwarfRows(pattern, exact, true)) {
+                if (modulePath === undefined || module === modulePath || module.endsWith("/" + modulePath)) {
+                    rows.push({name,module,size});
+                }
+            }
+            return rows;
         },
     };
     const voidType = descriptor({kind:"void"});
@@ -1509,7 +1568,21 @@
     }
 
     function summarize(value, depth = 0) {
-        const info = typeInfo(valueStore(value)[valueKeys.type]);
+        const type = valueStore(value)[valueKeys.type];
+        const info = typeInfo(type);
+        const printer = prettyPrinters.get(type);
+        if (printer && !activePrinters.has(type)) {
+            activePrinters.add(type);
+            try {
+                const formatted = printer(value);
+                if (formatted !== undefined) {
+                    if (typeof formatted !== "string") throw new TypeError("expected a pretty-printer string");
+                    return formatted;
+                }
+            } finally {
+                activePrinters.delete(type);
+            }
+        }
         if (value.$read) {
             const result = value.$read();
             return typeof result === "bigint" ? (info.kind === "ptr" ? word(result) : result.toString()) : result;
@@ -1547,10 +1620,10 @@
         });
     }
 
-    function *dwarfRows(pattern, exact = false) {
+    function *dwarfRows(pattern, exact = false, typesOnly = false) {
         let offset = 0;
         do {
-            const page = rpc("types", {pattern,exact,offset});
+            const page = rpc("types", {pattern,exact,typesOnly,offset});
             for (const row of page.items) yield row;
             offset = page.next_offset;
         } while (offset != null);
@@ -1665,6 +1738,7 @@
             points.clear();
             syscallCatches.clear();
             signals.clear();
+            prettyPrinters = new WeakMap();
             for (const key of Object.keys(exports)) delete exports[key];
         },
     };

@@ -752,6 +752,89 @@ fn name<'a>(
         .transpose()
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InlineFrame {
+    symbol: String,
+    call_file: Option<PathBuf>,
+    call_line: Option<u64>,
+}
+
+pub(crate) fn inline_frames(
+    dwarf: &Dwarf<Reader<'_>>,
+    pc: u64,
+    deadline: Instant,
+) -> Result<Vec<InlineFrame>> {
+    let mut units = dwarf.units();
+    let mut budget = ScanBudget::foreground(deadline);
+    while let Some(header) = units.next()? {
+        budget.entry()?;
+        let unit = dwarf.unit(header)?;
+        let mut ranges = dwarf.unit_ranges(&unit)?;
+        let mut covered = None;
+        while let Some(range) = ranges.next()? {
+            covered = Some((range.begin..range.end).contains(&pc));
+            if covered == Some(true) {
+                break;
+            }
+        }
+        if covered == Some(false) {
+            continue;
+        }
+        let mut best = Vec::new();
+        let mut active = Vec::new();
+        let mut entries = unit.entries();
+        while let Some(entry) = entries.next_dfs()? {
+            budget.entry()?;
+            active.retain(|(depth, _)| *depth < entry.depth());
+            if entry.tag() != gimli::DW_TAG_inlined_subroutine {
+                continue;
+            }
+            let mut ranges = dwarf.die_ranges(&unit, entry)?;
+            while let Some(range) = ranges.next()? {
+                if !(range.begin..range.end).contains(&pc) {
+                    continue;
+                }
+                let symbol = name(dwarf, &unit, entry)?.unwrap_or_else(|| "<inline>".to_owned());
+                let call_file = match (
+                    unit.line_program.as_ref(),
+                    entry.attr_value(gimli::DW_AT_call_file),
+                ) {
+                    (Some(program), Some(AttributeValue::FileIndex(index))) => program
+                        .header()
+                        .file(index)
+                        .map(|file| super::source_path(dwarf, &unit, program.header(), file))
+                        .transpose()?,
+                    _ => None,
+                };
+                let call_line = entry
+                    .attr_value(gimli::DW_AT_call_line)
+                    .and_then(|value| value.udata_value());
+                active.push((
+                    entry.depth(),
+                    InlineFrame {
+                        symbol,
+                        call_file,
+                        call_line,
+                    },
+                ));
+                if active.len() > best.len() {
+                    best = active
+                        .iter()
+                        .rev()
+                        .map(|(_, frame)| frame.clone())
+                        .collect();
+                }
+                break;
+            }
+        }
+        if !best.is_empty() {
+            return Ok(best);
+        }
+    }
+    Ok(Vec::new())
+}
+
 fn typedef_target<'a>(unit: &Unit<Reader<'a>>, entry: &Die<'a>) -> Result<Offset> {
     reference(unit, resolved_attr(unit, entry, gimli::DW_AT_type, 0)?).ok_or_else(|| {
         failure(

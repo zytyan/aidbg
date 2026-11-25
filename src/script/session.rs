@@ -52,7 +52,8 @@ pub enum Command {
     Run(RunProcessRequest),
     Attach(i32),
     Core(OpenCoreRequest),
-    Script(String),
+    Script(String, u32, Option<RunProcessRequest>),
+    ScriptWait(u64, u32),
     Input(String, std::result::Result<String, String>),
     Snapshot(Option<i32>, bool),
     Processes(crate::rpc::ProcessListRequest),
@@ -129,6 +130,8 @@ struct State {
     output: VecDeque<ScriptOutput>,
     output_size: usize,
     output_dropped: bool,
+    script_outcomes: BTreeMap<u64, &'static str>,
+    script_waiting: BTreeSet<u64>,
     target_error: Option<String>,
     signals: BTreeSet<i32>,
     events: events::Queue,
@@ -141,6 +144,19 @@ struct State {
 }
 
 impl State {
+    fn launch(&mut self, args: RunProcessRequest) -> Result<Value> {
+        let mut target = Live::launch(args)?;
+        let scratchpad = target
+            .prepare_scratch(None)
+            .or_else(|_| target.prepare_scratch(None));
+        let pid = target.pid;
+        let released = self.replace(Some(Target::Live(target)));
+        Ok(
+            json!({"pid":pid,"state":"paused","reason":"exec","released":released,"scratchpad":scratchpad.is_ok(),
+            "scratchpad_error":scratchpad.err().map(|err|err.to_string())}),
+        )
+    }
+
     fn replace(&mut self, target: Option<Target>) -> Vec<i32> {
         let mut released = Vec::new();
         if let Some(Target::Live(mut previous)) = std::mem::replace(&mut self.target, target) {
@@ -173,7 +189,22 @@ impl State {
         released
     }
 
+    fn record_script_outcome(&mut self, script_id: u64, outcome: &'static str) {
+        self.script_outcomes.insert(script_id, outcome);
+        if self.script_outcomes.len() > 512 {
+            self.script_outcomes.pop_first();
+        }
+    }
+
     fn log(&mut self, script_id: u64, value: Value) {
+        let outcome = match value["kind"].as_str() {
+            Some("script_complete") => Some("completed"),
+            Some("script_error") => Some("failed"),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            self.record_script_outcome(script_id, outcome);
+        }
         let json = value.to_string().into_bytes();
         if json.len() > MAX_OUTPUT {
             self.output_dropped = true;
@@ -234,7 +265,10 @@ impl State {
     fn register_event(&mut self, args: Value) -> Result<Value> {
         let request: events::Request = serde_json::from_value(args.clone())?;
         self.target.as_mut().ok_or_else(no_target)?.live()?;
-        let (id, resume) = self.events.register(&request)?;
+        let target = &self.target;
+        let (id, resume) = self.events.register(&request, |tid, sequence| {
+            matches!(target.as_ref(), Some(Target::Live(live)) if live.holds_stop(tid, sequence))
+        })?;
         if let Some((tid, token)) = args["handoffTid"].as_i64().zip(args["handoff"].as_u64()) {
             if self
                 .dispatches
@@ -494,12 +528,63 @@ impl State {
         }
     }
 
+    fn send_reply(
+        &mut self,
+        reply: oneshot::Sender<ToolReply>,
+        result: Result<Value>,
+        pending: &[Pending<'_>],
+    ) {
+        if !reply.is_closed() {
+            let mut message = self.tool_reply(result, pending);
+            let output_cursor = match self.target.as_ref() {
+                Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
+                    let (mut value, cursor) = stdio.mcp_output();
+                    value["pid"] = json!(live.pid);
+                    append_exit_status(&mut value, live.trace.exit);
+                    message.process_output_json = value.to_string().into_bytes();
+                    cursor
+                }),
+                _ => None,
+            };
+            match reply.send(message) {
+                Ok(()) => {
+                    if let Some(cursor) = output_cursor
+                        && let Some(Target::Live(live)) = self.target.as_mut()
+                        && let Some(stdio) = &mut live.stdio
+                    {
+                        stdio.acknowledge(cursor);
+                    }
+                }
+                Err(message) => {
+                    self.output_size += message
+                        .script_output
+                        .iter()
+                        .map(|row| row.json.len() + 16)
+                        .sum::<usize>();
+                    self.output.extend(message.script_output);
+                    self.output_dropped |= message.output_dropped;
+                    self.reported_signals =
+                        serde_json::from_slice(&message.signals_json).unwrap_or_default();
+                }
+            }
+        }
+    }
+
     fn tool_reply(&mut self, result: Result<Value>, pending: &[Pending<'_>]) -> ToolReply {
         let (result_json, error) = match result {
             Ok(value) => (value.to_string().into_bytes(), None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
-        self.output_size = 0;
+        let mut script_output = Vec::new();
+        for _ in 0..self.output.len() {
+            let row = self.output.pop_front().unwrap();
+            if self.script_waiting.contains(&row.script_id) {
+                self.output.push_back(row);
+            } else {
+                self.output_size -= row.json.len() + 16;
+                script_output.push(row);
+            }
+        }
         ToolReply {
             result_json,
             error,
@@ -520,7 +605,7 @@ impl State {
                     payload_json: state.payload.to_string().into_bytes(),
                 })
                 .collect(),
-            script_output: self.output.drain(..).collect(),
+            script_output,
             output_dropped: std::mem::take(&mut self.output_dropped),
             running_scripts: pending.iter().map(|script| script.id).collect(),
             target_error: self.target_error.clone(),
@@ -557,6 +642,12 @@ fn signal_number(signal: &Value) -> Result<i32> {
         }
     }
     Err(error("unknown signal"))
+}
+
+struct ScriptWait {
+    until: Instant,
+    response: Value,
+    reply: oneshot::Sender<ToolReply>,
 }
 
 struct Pending<'js> {
@@ -671,6 +762,8 @@ fn run(
         output: VecDeque::new(),
         output_size: 0,
         output_dropped: false,
+        script_outcomes: BTreeMap::new(),
+        script_waiting: BTreeSet::new(),
         target_error: None,
         signals: BTreeSet::new(),
         events: events::Queue::default(),
@@ -687,6 +780,7 @@ fn run(
         let mut pending = Vec::new();
         let mut exports = Exports::default();
         let mut next_script = 0;
+        let mut script_waits = BTreeMap::<u64, ScriptWait>::new();
         let host = state.clone();
         let operation = Function::new(ctx.clone(), move |ctx: Ctx<'_>, op:String, args:String| {
             let result = serde_json::from_str(&args).map_err(Into::into)
@@ -725,6 +819,20 @@ fn run(
             resolve_events(&state,&event_result)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
+            let mut state_ref = state.borrow_mut();
+            let ready_waits: Vec<_> = script_waits.extract_if(.., |id, wait| {
+                let status = state_ref.script_outcomes.get(id).copied()
+                    .or_else(|| (Instant::now() >= wait.until).then_some("wait_timeout"));
+                if let Some(status) = status {
+                    wait.response["status"] = json!(status);
+                }
+                wait.reply.is_closed() || status.is_some()
+            }).collect();
+            for (id, wait) in ready_waits {
+                state_ref.script_waiting.remove(&id);
+                state_ref.send_reply(wait.reply, Ok(wait.response), &pending);
+            }
+            drop(state_ref);
             let (command, reply) = match commands.recv_timeout(TICK) {
                 Ok(message) => message,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -732,18 +840,14 @@ fn run(
             };
             if cancelled.load(Ordering::Relaxed) || reply.is_closed() { continue; }
             deadline.set(Instant::now() + SCRIPT_SLICE);
-            let generation = current_generation;
+            let wait_ms = match &command {
+                Command::Script(_, ms, _) | Command::ScriptWait(_, ms) => *ms,
+                _ => 0,
+            };
             let result = (|| -> Result<Value> {
+                if wait_ms > 300_000 { return Err(error("wait_ms must be in 0..=300000")); }
                 match command {
-                    Command::Run(args) => {
-                        let mut target = Live::launch(args)?;
-                        let scratchpad = target.prepare_scratch(None)
-                            .or_else(|_| target.prepare_scratch(None));
-                        let pid = target.pid;
-                        let released = state.borrow_mut().replace(Some(Target::Live(target)));
-                        Ok(json!({"pid":pid,"state":"paused","reason":"exec","released":released,"scratchpad":scratchpad.is_ok(),
-                            "scratchpad_error":scratchpad.err().map(|err|err.to_string())}))
-                    }
+                    Command::Run(args) => state.borrow_mut().launch(args),
                     Command::Attach(pid) => {
                         let existing = matches!(&state.borrow().target, Some(Target::Live(live)) if live.pid == pid && live.verify().is_ok());
                         if !existing {
@@ -769,9 +873,16 @@ fn run(
                         deliver(&input, &handler, result)?;
                         Ok(json!({"handler":handler}))
                     }
-                    Command::Script(src) => {
+                    Command::Script(src, _, run) => {
                         if src.len() > MAX_SOURCE_BYTES { return Err(error("script source exceeds 64 KiB")); }
-                        if pending.len() >= MAX_PENDING { return Err(error("too many running scripts")); }
+                        if run.is_none() && pending.len() >= MAX_PENDING { return Err(error("too many running scripts")); }
+                        let mut response = json!({});
+                        if let Some(run) = run {
+                            response["run"] = state.borrow_mut().launch(run)?;
+                            sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
+                            pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
+                        }
+                        let generation = current_generation;
                         let id = next_script;
                         next_script += 1;
                         let (diagnostics, compiled) = compiler.session_compile(&src,&exports.declarations(),id,|name| {
@@ -780,7 +891,11 @@ fn run(
                             target.resolve_dwarf_type(name)
                         })?;
                         let Some((js,declarations,map)) = compiled else {
-                            return Ok(json!({"script_id":id,"status":"check_failed","diagnostics":diagnostics}));
+                            state.borrow_mut().record_script_outcome(id, "check_failed");
+                            response["script_id"] = json!(id);
+                            response["status"] = json!("check_failed");
+                            response["diagnostics"] = json!(diagnostics);
+                            return Ok(response);
                         };
                         let mut current = state.borrow_mut();
                         if current.source_maps.len()>=512 {current.source_maps.pop_first();}
@@ -791,7 +906,23 @@ fn run(
                         let (module, promise) = Module::declare(ctx.clone(), format!("script-{id}.js"), js)
                             .and_then(|module| module.eval()).catch(&ctx).map_err(|err| error(err.to_string()))?;
                         pending.push(Pending { id, generation, module, promise, declarations });
-                        Ok(json!({"script_id":id,"status":"accepted"}))
+                        response["script_id"] = json!(id);
+                        response["status"] = json!("accepted");
+                        Ok(response)
+                    }
+                    Command::ScriptWait(id, _) => {
+                        let state = state.borrow();
+                        if state.script_waiting.contains(&id) {
+                            return Err(error("script already has a completion waiter"));
+                        }
+                        let status = if let Some(status) = state.script_outcomes.get(&id) {
+                            *status
+                        } else if pending.iter().any(|script| script.id == id) {
+                            if wait_ms == 0 { "wait_timeout" } else { "accepted" }
+                        } else {
+                            return Err(error("unknown or expired script ID"));
+                        };
+                        Ok(json!({"script_id":id,"status":status}))
                     }
                     Command::Processes(args) => processes(args),
                     Command::SyscallTable(id, name) => Ok(syscalls::query(id, name.as_deref())),
@@ -807,35 +938,17 @@ fn run(
             resolve_events(&state,&event_result)?;
             pump(&ctx, &state, &publish, &mut exports, &mut pending)?;
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
-            if !reply.is_closed() {
-                let mut state = state.borrow_mut();
-                let mut message = state.tool_reply(result, &pending);
-                let output_cursor = match state.target.as_ref() {
-                    Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
-                        let (mut value,cursor) = stdio.mcp_output();
-                        value["pid"] = json!(live.pid);
-                        append_exit_status(&mut value, live.trace.exit);
-                        message.process_output_json = value.to_string().into_bytes();
-                        cursor
-                    }),
-                    _ => None,
-                };
-                match reply.send(message) {
-                    Ok(()) => {
-                        if let Some(cursor) = output_cursor
-                            && let Some(Target::Live(live)) = state.target.as_mut()
-                            && let Some(stdio) = &mut live.stdio
-                        {
-                            stdio.acknowledge(cursor);
-                        }
-                    }
-                    Err(message) => {
-                        state.output_size = message.script_output.iter().map(|row|row.json.len()+16).sum();
-                        state.output = message.script_output.into();
-                        state.output_dropped = message.output_dropped;
-                        state.reported_signals = serde_json::from_slice(&message.signals_json).unwrap_or_default();
-                    }
+            match result {
+                Ok(response) if wait_ms > 0 && response["status"] == "accepted" => {
+                    let id = response["script_id"].as_u64().unwrap();
+                    state.borrow_mut().script_waiting.insert(id);
+                    script_waits.insert(id, ScriptWait {
+                        until: Instant::now() + Duration::from_millis(u64::from(wait_ms)),
+                        response,
+                        reply,
+                    });
                 }
+                result => state.borrow_mut().send_reply(reply, result, &pending),
             }
         }
         state.borrow_mut().replace(None);
@@ -1112,12 +1225,15 @@ fn pump<'js>(
     }
     let generation = state.borrow().generation;
     pending.retain(|script| {
-        let Some(result) = script.promise.result::<JsValue>() else {
-            return script.generation == generation;
-        };
         if script.generation != generation {
+            state
+                .borrow_mut()
+                .record_script_outcome(script.id, "cancelled");
             return false;
         }
+        let Some(result) = script.promise.result::<JsValue>() else {
+            return true;
+        };
         let result = match result.catch(ctx) {
             Ok(_) => (|| -> Result<()> {
                 let namespace = script.module.namespace()?;

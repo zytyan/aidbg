@@ -835,6 +835,19 @@ pub(crate) fn dwarf_line(obj: &object::File<'_>, pc: u64) -> Result<Option<Line>
     line_for_pc(&dwarf, pc)
 }
 
+pub(crate) fn dwarf_inline_frames(
+    obj: &object::File<'_>,
+    pc: u64,
+    deadline: std::time::Instant,
+) -> Result<Vec<inspect::InlineFrame>> {
+    if obj.section_by_name(".debug_info").is_none() {
+        return Ok(Vec::new());
+    }
+    let sections = line_sections(obj)?;
+    let dwarf = sections.borrow(|s| EndianSlice::new(s, LittleEndian));
+    inspect::inline_frames(&dwarf, pc, deadline)
+}
+
 type LineReader<'a> = EndianSlice<'a, LittleEndian>;
 
 fn source_path(

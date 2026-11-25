@@ -31,7 +31,8 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标在 exec 后暂停。 |
 | `attach` | `pid` 是进程 ID。附加后线程暂停。 |
 | `core_open` | `path` 是服务端上的 ELF core 或 zstd 压缩的 core，可指定 `executable` 和 `debug_symbols`。 |
-| `script_run` | `src` 是 TypeScript 模块源码。脚本通过检查后由 QuickJS 执行，具名导出可在后续脚本中用 `$` 访问。 |
+| `script_run` | `src` 是 TypeScript 模块源码。可通过 `run: {path, arg}` 先启动目标，通过 `wait_ms` 等待完成并收集输出。仅提交源码时默认立即返回，组合启动时默认等 5 秒。 |
+| `script_wait` | 按 `script_id` 等待已提交的脚本，默认等 5 秒。返回 `wait_timeout` 时脚本继续运行。 |
 | `snapshot` | 可传入 `tid` 获取指定线程的快照。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
 | `send_input` | 向正在通过 `ask()` 等待回复的 `handler` 传入字符串 `data`。 |
 | `interrupt_input` | 向指定 `handler` 抛出异常，可传入消息 `msg`。 |
@@ -45,6 +46,14 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 `run` 和 `attach` 用于调试。一般 shell 命令请使用 shell 工具。普通 fork 默认跟踪父进程，未注册 `SIGCHLD` 处理器时自动将该信号交付目标。
 
 ## TypeScript
+
+等待响应中的 `completed` 表示模块已成功求值，具名导出已可通过同一会话的 `$` 使用。零等待时可从日志读取 `script_complete`。切换调试目标会重置导出。
+
+- `console.log({address: 0x1234n})` 可直接输出含 BigInt 的对象。需要 JSON 文本时用 `dbg.stringify(value)`，其中 BigInt 保留为十进制字符串。
+- `dbg.continueForStop("all", {pausedOnly: true})` 等待仍暂停的现场或退出。已经继续的命中可用 `dbg.waitStops()` 读取。`dbg.traceHits("push")` 可记录断点命中并自动继续。
+- `dbg.backtraceAll()` 从一次全线程快照读取调用栈。快照可在 live 目标运行时采集，`incomplete` 报告未完成的阶段。
+- `dbg.list(frame, 5, [{from: "/build/project", to: "/srv/src/project"}])` 按第一条匹配规则替换 DWARF 路径前缀。路径在调试服务端解析。`frame.inlineFrames` 显示 DWARF 为当前指令记录的逻辑内联调用。
+- `m.typeOfVar(name)` 支持运行时字符串。`m.findTypes("Node", {exact: true, module: "app"})` 可限定类型名及模块。断点选项的 `condition` 可筛选命中，`m.setPrettyPrinter(type, fn)` 可格式化同一类型描述符的调试值。
 
 MCP 资源 `aidbg://debugger.d.ts` 提供调试器接口，`aidbg://node.d.ts` 提供文件和路径模块接口。脚本以 TypeScript 模块的顶层作用域执行，宿主能力限于声明中的全局对象和模块。文件模块支持同步及 Promise 读操作，二进制读取返回 `Uint8Array`，单次读取上限为 16 MiB。相对路径基于 aidbg 服务端工作目录。源码见 [debugger.d.ts](docs/debugger.d.ts)，设计见 [需求文档](docs/下一代演进调试器需求文档.md)。
 

@@ -8,6 +8,7 @@ service Debugger {
   rpc Run (RunProcessRequest) returns (ToolReply);
   rpc Attach (AttachRequest) returns (ToolReply);
   rpc ScriptRun (RunScriptRequest) returns (ToolReply);
+  rpc ScriptWait (WaitScriptRequest) returns (ToolReply);
   rpc CoreOpen (OpenCoreRequest) returns (ToolReply);
   rpc SendInput (SendInputRequest) returns (ToolReply);
   rpc InterruptInput (InterruptInputRequest) returns (ToolReply);
@@ -24,7 +25,12 @@ message RunProcessRequest {
   repeated string arg = 2;
 }
 message AttachRequest { int32 pid = 1; }
-message RunScriptRequest { string src = 1; }
+message RunScriptRequest {
+  string src = 1;
+  uint32 wait_ms = 2;
+  RunProcessRequest run = 3;
+}
+message WaitScriptRequest { uint64 script_id = 1; uint32 wait_ms = 2; }
 message OpenCoreRequest {
   string path = 1;
   optional string executable = 2;

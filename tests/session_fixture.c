@@ -70,6 +70,12 @@ union Spec03ZeroWidthUnion {
     char a;
 };
 
+__attribute__((used, noinline))
+unsigned Spec03Packet_function(void)
+{
+    return sizeof(struct Spec03Packet);
+}
+
 struct Spec03Packet spec03_packet = {.ack = 1, .req = 13, .ipv4 = 0x12345678, .type = 1};
 const uint32_t spec03_layout[] = {
     sizeof(struct Spec03Packet), _Alignof(struct Spec03Packet),
@@ -120,6 +126,17 @@ static int event_fixture(void) {
     return signal_count == 1 ? 37 : 93;
 }
 
+static inline __attribute__((always_inline)) void inline_scope_probe(struct Packet *copy) {
+    fixture_stop(copy);
+    asm volatile("" : : "r"(copy) : "memory");
+}
+
+static __attribute__((noinline)) int inline_fixture(void) {
+    struct Packet copy = packet;
+    inline_scope_probe(&copy);
+    return 0;
+}
+
 static int child_fixture(void) {
     fixture_stop(&packet);
     return 23;
@@ -136,6 +153,7 @@ static __attribute__((noinline)) int memory_fixture(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'i') return inline_fixture();
     if (argc > 1 && argv[1][0] == 'c') return child_fixture();
     if (argc > 1 && argv[1][0] == 'm') return memory_fixture();
     if (argc > 1 && argv[1][0] == 'k') {

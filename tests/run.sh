@@ -21,7 +21,7 @@ strip --strip-all "$fixtures/stripped-fixture"
 "${CC:-gcc}" -O0 -fno-pic -c tests/session_link.c -o "$fixtures/link.o"
 "${CC:-gcc}" -O0 -g -shared -fPIC tests/session_link.c -o "$fixtures/session-test.so"
 targets=("$fixtures/gcc-fixture")
-make -C tests/debug-cases OUT="$fixtures/cases" "$fixtures/cases"/{D05,D06,D08,D09,D10}
+make -C tests/debug-cases OUT="$fixtures/cases" "$fixtures/cases"/{D02,D04,D05,D06,D08,D09,D10}
 if command -v clang >/dev/null; then
   clang "${flags[@]}" -gdwarf-5 tests/session_fixture.c -ldl -o "$fixtures/clang-fixture"
   targets+=("$fixtures/clang-fixture")

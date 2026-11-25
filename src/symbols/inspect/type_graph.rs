@@ -52,6 +52,7 @@ pub(crate) fn live_type_graphs(
     root: &Path,
     pattern: &str,
     exact: bool,
+    include_functions: bool,
     offset: usize,
     limit: usize,
     deadline: Instant,
@@ -81,6 +82,7 @@ pub(crate) fn live_type_graphs(
         let rows = dwarf.type_graphs(
             pattern,
             exact,
+            include_functions,
             skip,
             limit.saturating_sub(result.len()),
             deadline,
@@ -159,6 +161,7 @@ impl offline::DwarfImage {
         &self,
         pattern: &str,
         exact: bool,
+        include_functions: bool,
         offset: usize,
         limit: usize,
         deadline: Instant,
@@ -188,7 +191,8 @@ impl offline::DwarfImage {
                 if scanned > MAX_DIES || (scanned % 128 == 0 && Instant::now() >= deadline) {
                     return Ok((results, matched));
                 }
-                if kind.is_some_and(|kind| kind != entry.tag())
+                if (!include_functions && entry.tag() == gimli::DW_TAG_subprogram)
+                    || kind.is_some_and(|kind| kind != entry.tag())
                     || !matches!(
                         entry.tag(),
                         gimli::DW_TAG_base_type

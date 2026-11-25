@@ -755,6 +755,7 @@ impl Target {
         &self,
         pattern: &str,
         exact: bool,
+        include_functions: bool,
         offset: usize,
         limit: usize,
         deadline: Instant,
@@ -786,6 +787,7 @@ impl Target {
             let (rows, matched) = dwarf.type_graphs(
                 pattern,
                 exact,
+                include_functions,
                 skip,
                 limit.saturating_sub(result.len()),
                 deadline,
@@ -874,6 +876,14 @@ impl Target {
                 .map(|(frame, site)| {
                     let values = self.session_frame_values(frame, deadline).unwrap_or(Value::Null);
                     let source = self.attached_frame(frame.lookup_pc).and_then(|(dwarf,link)| dwarf.image.line(link).ok().flatten());
+                    let inline_frames = if Instant::now() < deadline {
+                        self.attached_frame(frame.lookup_pc)
+                            .and_then(|(dwarf, link)| dwarf.image.inline_frames(link, deadline).ok())
+                            .or_else(|| self.frame_dwarf(frame).ok()?.inline_frames(frame.link?, deadline).ok())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let (file,line) = source.map_or_else(
                         || (site["file"].clone(),site["line"].clone()),
                         |source| (json!(source.file),json!(source.line)),
@@ -881,7 +891,7 @@ impl Target {
                     json!({"pc":hex(frame.pc), "lookupPc":hex(frame.lookup_pc),
                         "sp":frame.regs.get(regs::SP).ok().map(hex), "fp":frame.regs.get(regs::FP).ok().map(hex),
                         "symbol":site["function"], "file":file, "line":line,
-                        "missingDebugSections":site["missingDebugSections"],
+                        "missingDebugSections":site["missingDebugSections"], "inlineFrames":inline_frames,
                         "locals":values["locals"], "parameters":values["parameters"]})
                 })
                 .collect::<Vec<_>>()

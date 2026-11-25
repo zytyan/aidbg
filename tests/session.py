@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import time
 
-TOOLS = {"connect", "run", "attach", "script_run", "core_open", "send_input", "interrupt_input",
+TOOLS = {"connect", "run", "attach", "script_run", "script_wait", "core_open", "send_input", "interrupt_input",
          "snapshot", "perf", "ps", "set_fork_policy", "docs", "syscall_table"}
 
 
@@ -95,6 +95,25 @@ def validate_types_and_input(client):
     assert "interface TypeSystem" in api["contents"][0]["text"]
     assert logs(client.script("export const triple = (n: number) => n * 3; console.log(triple(7));")) == [[21]]
     assert logs(client.script("console.log($.triple(14));")) == [[42]]
+    published = client.tool("script_run", wait_ms=2000, src="""
+        await sleep(20);
+        export const probe = () => 7n;
+        console.log(dbg.stringify({value: probe()}));
+    """)
+    assert published["result"]["status"] == "completed", published
+    assert logs(published) == [['{"value":"7"}']], published
+    assert logs(client.script("console.log($.probe());")) == [["7"]]
+    pending = client.tool("script_run", wait_ms=1, src="await sleep(100); console.log('finished');")
+    assert pending["result"]["status"] == "wait_timeout", pending
+    completed = client.tool("script_wait", script_id=pending["result"]["script_id"], wait_ms=2000)
+    assert completed["result"]["status"] == "completed" and logs(completed) == [["finished"]], completed
+    assert logs(client.script("""
+        const number = m.u64();
+        m.setPrettyPrinter(number, value => "u64:" + value.$read());
+        console.log(number.value(8n));
+        m.setPrettyPrinter(number, null);
+        console.log(number.value(8n));
+    """)) == [["u64:8"], ["8"]]
     client.script('$.triple("wrong")', invalid=True)
     client.script("function f() { let $ = 1; return $; }", invalid=True)
     client.script("const Packet = m.struct({len: m.u32(), data: m.array(m.u8(), ctx => ctx.lne)});", invalid=True)
@@ -205,6 +224,24 @@ def validate_session_extensions(client, fixture, owned):
     owned.remove(pid)
 
 
+def validate_inline_frames(client, fixture, owned):
+    pid = client.tool("run", path=fixture, arg=["inline"])["result"]["pid"]
+    owned.add(pid)
+    reply = client.tool("script_run", wait_ms=5000, src="""
+        dbg.softwareBreakpoint("fixture_stop");
+        const stop = await dbg.continueForStop("all", {timeoutMs:3000, pausedOnly:true});
+        if (stop.kind !== "breakpoint") throw new Error(stop.kind);
+        const frames = dbg.thread(stop.tid).backtrace();
+        const inline = frames.flatMap(frame => frame.inlineFrames ?? [])
+            .find(frame => frame.symbol === "inline_scope_probe");
+        if (!inline) throw new Error(dbg.stringify(frames));
+        console.log(inline.callFile?.endsWith("session_fixture.c"), (inline.callLine ?? 0) > 0);
+    """)
+    assert reply["result"]["status"] == "completed" and logs(reply) == [[True, True]], reply
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+
 def validate_spec03(client, fixture, owned):
     pid = client.tool("run", path=fixture, arg=["memory"])["result"]["pid"]
     owned.add(pid)
@@ -246,7 +283,11 @@ def validate_spec03(client, fixture, owned):
         let failed = false;
         try { edge.$writeContents("1234"); } catch { failed = true; }
         if (!failed) throw new Error("write into protected page");
-        if (!m.findTypes("Spec03Packet").some(row => row.size === Type.$size && row.module)) throw new Error("type discovery");
+        const discovered = m.findTypes("Spec03Packet");
+        if (!discovered.some(row => row.size === Type.$size && row.module)) throw new Error("type discovery");
+        if (discovered.some(row => row.name === "Spec03Packet_function")) throw new Error("function in type discovery");
+        const variableName: string = ["spec03", "packet"].join("_");
+        if (m.typeOfVar(variableName)?.$size !== Type.$size) throw new Error("dynamic variable type");
         console.log(actual);
     """)
     output = logs(reply)
@@ -791,6 +832,38 @@ def validate_debug_cases(client, fixtures, owned):
             result["output"] += tail["output"]
         assert logs(result) == expected, result
 
+    reply = client.tool("script_run", run={"path": str(fixtures / "D02")}, wait_ms=5000, src="""
+        const trace = await dbg.traceHits("push", {timeoutMs:3000});
+        const history = await dbg.waitStops(64, 0);
+        if (history.kind !== "stops") throw new Error(history.kind);
+        console.log(trace.stop.kind, trace.hits.map(hit => hit.hitCount),
+            history.events.filter(row => row.kind === "breakpoint").length);
+    """)
+    assert reply["result"]["status"] == "completed", reply
+    assert logs(reply) == [["exit", [1, 2, 3, 4], 4]], reply
+    assert reply["process_output"]["stdout"] == "10 20 30 10\n", reply
+
+    pid = launch("D04")
+    reply = client.tool("script_run", wait_ms=5000, src="""
+        dbg.resumeAll();
+        let output = "";
+        for (let attempt = 0; attempt < 4; attempt++) {
+            output += (await dbg.waitOutput(dbg.pid, 500)).stdout;
+            if (output.includes("refresh started") && output.includes("reconcile started")) break;
+        }
+        if (!output.includes("refresh started") || !output.includes("reconcile started")) throw new Error(output);
+        const {threads, incomplete} = await dbg.backtraceAll();
+        if (incomplete?.length) throw new Error(dbg.stringify(incomplete));
+        const frames = threads.flatMap(thread => thread.frames);
+        if (!frames.some(frame => frame.symbol === "refresh") || !frames.some(frame => frame.symbol === "reconcile"))
+            throw new Error(dbg.stringify(threads));
+        console.log(threads.length);
+    """)
+    assert reply["result"]["status"] == "completed", reply
+    assert logs(reply) == [[3]], reply
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
     for case, symbol, offset, before, after in (("D06", "flags", 0, 5, 2), ("D08", "rows", 16, 101, 0)):
         pid = launch(case)
         script(f"""
@@ -813,6 +886,24 @@ def validate_debug_cases(client, fixtures, owned):
         console.log(short?.demangledName, short?.address === mangled?.address,
                     full?.address === mangled?.address);
     """, [["schedule_retry()", True, True]])
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+    pid = launch("D02")
+    reply = client.tool("script_run", wait_ms=5000, src="""
+        const at = (await dbg.getSymbol("push"))!.address;
+        dbg.softwareBreakpoint(at, null, {condition: hit => hit.hitCount === 3});
+        const stop = await dbg.continueForStop("all", {timeoutMs:3000, pausedOnly:true});
+        if (stop.kind !== "breakpoint") throw new Error(stop.kind);
+        const source = dbg.addrToLine(at);
+        if (!source) throw new Error("missing DWARF source");
+        const directory = source.file.slice(0, source.file.lastIndexOf("/"));
+        const mapped = dbg.list(at, 1, [{from:directory, to:directory + "/../cases"}]);
+        console.log(stop.hitCount, mapped?.originalFile === source.file && mapped?.file !== source.file,
+            mapped?.lines.some(row => row.text.includes("static void push")));
+    """)
+    assert reply["result"]["status"] == "completed", reply
+    assert logs(reply) == [[3, True, True]], reply
     client.script("await dbg.kill();")
     owned.remove(pid)
 
@@ -887,6 +978,7 @@ def main():
                 client = Client(client_exe, socket, token)
                 validate_types_and_input(client)
                 validate_session_extensions(client, fixtures[0], owned)
+                validate_inline_frames(client, fixtures[0], owned)
                 validate_spec03(client, fixtures[0], owned)
                 if args.stripped and args.debug_image:
                     validate_stripped_cfi(client, os.path.abspath(args.stripped), os.path.abspath(args.debug_image), owned)

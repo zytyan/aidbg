@@ -425,6 +425,8 @@ pub struct Frame {
     #[serde(flatten)]
     names: Option<crate::cpp_names::Names>,
     missing_debug_sections: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inline_frames: Vec<crate::symbols::inspect::InlineFrame>,
     pub(crate) method: &'static str,
     #[serde(skip)]
     link_pc: Option<u64>,
@@ -517,7 +519,18 @@ impl Images {
     }
 
     pub fn symbolize(&self, stack: &mut Stack) {
+        self.symbolize_frames(stack, None);
+    }
+
+    pub(crate) fn symbolize_until(&self, stack: &mut Stack, deadline: Instant) {
+        self.symbolize_frames(stack, Some(deadline));
+    }
+
+    fn symbolize_frames(&self, stack: &mut Stack, deadline: Option<Instant>) {
         for frame in &mut stack.frames {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
             let Some((module, pc)) = frame.module_id.zip(frame.link_pc) else {
                 continue;
             };
@@ -549,6 +562,16 @@ impl Images {
                 {
                     frame.file = Some(source.file);
                     frame.line = source.line;
+                }
+                if let Some(deadline) = deadline
+                    && Instant::now() < deadline
+                {
+                    frame.inline_frames = crate::symbols::dwarf_inline_frames(
+                        debug.as_ref().unwrap_or(&obj),
+                        pc,
+                        deadline,
+                    )
+                    .unwrap_or_default();
                 }
             }
         }
@@ -632,6 +655,7 @@ impl Images {
                     args: None,
                     names: None,
                     missing_debug_sections: Vec::new(),
+                    inline_frames: Vec::new(),
                     method,
                     link_pc: None,
                     lookup_address: lookup,

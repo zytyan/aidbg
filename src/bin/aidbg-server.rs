@@ -110,8 +110,16 @@ impl Debugger for Service {
             .await
     }
     async fn script_run(&self, request: Request<RunScriptRequest>) -> Reply {
-        self.command(request, |args| Command::Script(args.src))
-            .await
+        self.command(request, |args| {
+            Command::Script(args.src, args.wait_ms, args.run)
+        })
+        .await
+    }
+    async fn script_wait(&self, request: Request<WaitScriptRequest>) -> Reply {
+        self.command(request, |args| {
+            Command::ScriptWait(args.script_id, args.wait_ms)
+        })
+        .await
     }
     async fn core_open(&self, request: Request<OpenCoreRequest>) -> Reply {
         self.command(request, Command::Core).await
