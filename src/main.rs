@@ -87,12 +87,30 @@ struct InterruptArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SnapshotArgs {
     tid: Option<i32>,
+    #[serde(default)]
+    context: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 struct PsArgs {
     #[serde(default)]
     #[schemars(description = "List individual threads and their TIDs")]
     threads: bool,
+    #[schemars(
+        description = "Case-insensitive substring in the PID, process name or command line"
+    )]
+    pattern: Option<String>,
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default)]
+    #[schemars(description = "Choose pid, ppid, name, threads, tid or args")]
+    fields: Vec<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SyscallArgs {
+    id: Option<u64>,
+    name: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -152,7 +170,7 @@ impl rmcp::ServerHandler for Mcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(rmcp::model::ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(rmcp::model::Implementation::new("aidbg", aidbg::BUILD_VERSION))
-            .with_instructions("Call connect with a Unix socket or TCP endpoint first. Select a target with run, attach or core_open. Use script_run for TypeScript debugging. Read aidbg://debugger.d.ts and aidbg://node.d.ts for the script APIs. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
+            .with_instructions("Call docs for the script API and connect to select a debugger server. Use run and attach to debug programs, and use a shell tool for shell commands. Use script_run for TypeScript debugging. Only top-level script code runs automatically. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
     }
 
     fn list_tools(
@@ -213,7 +231,7 @@ impl rmcp::ServerHandler for Mcp {
     ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         use rmcp::handler::server::tool::ToolCallContext;
 
-        if request.name == "connect" {
+        if matches!(request.name.as_ref(), "connect" | "docs") {
             return Self::tool_router()
                 .call(ToolCallContext::new(self, request, context))
                 .await;
@@ -235,6 +253,16 @@ impl rmcp::ServerHandler for Mcp {
 
 #[tool_router]
 impl Mcp {
+    #[tool(description = "Show script entry semantics and a TypeScript API summary.")]
+    async fn docs(&self) -> CallToolResult {
+        CallToolResult::structured(json!({
+            "instructions": "script_run executes the module's top-level code. Exports are available on $ to subsequent scripts. Use run and attach for debugging and a shell tool for shell commands. The default fork policy follows the parent.",
+            "declarations": include_str!("script/session/summary.d.ts"),
+            "modules": include_str!("script/session/node.d.ts"),
+            "full_api": API_URI,
+        }))
+    }
+
     #[tool(
         description = "Connect to an aidbg-server. Supply exactly one of socket or endpoint. Reuse the returned session token to reconnect to the same session."
     )]
@@ -333,6 +361,7 @@ fn reply(
         "result":serde_json::from_slice::<Value>(&result.result_json).unwrap_or(Value::Null),
         "error":result.error,
         "paused_threads":result.paused_threads,
+        "paused_stops":serde_json::from_slice::<Value>(&result.paused_stops_json).unwrap_or_else(|_| json!([])),
         "waiting_inputs":inputs,
         "running_scripts":result.running_scripts,
         "waiting_events":waiting_events,
@@ -354,7 +383,24 @@ fn reply(
 
 #[tool_router]
 impl Connection {
-    #[tool(description = "Run a program on the debugger server and stop at exec.")]
+    #[tool(
+        description = "List native Linux syscall IDs and six ordered parameter slots. Optionally filter by ID or name."
+    )]
+    async fn syscall_table(&self, Parameters(args): Parameters<SyscallArgs>) -> CallToolResult {
+        reply(
+            self.client
+                .clone()
+                .syscall_table(self.request(SyscallTableRequest {
+                    id: args.id,
+                    name: args.name,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Launch a program under the debugger and stop at exec. Use a shell tool for shell commands."
+    )]
     async fn run(&self, Parameters(args): Parameters<RunArgs>) -> CallToolResult {
         reply(
             self.client
@@ -367,7 +413,9 @@ impl Connection {
         )
     }
 
-    #[tool(description = "Attach to a Linux process on the debugger server.")]
+    #[tool(
+        description = "Attach the debugger to an existing Linux process. By default fork tracing follows the parent."
+    )]
     async fn attach(&self, Parameters(args): Parameters<AttachArgs>) -> CallToolResult {
         reply(
             self.client
@@ -378,7 +426,7 @@ impl Connection {
     }
 
     #[tool(
-        description = "Type-check and run a TypeScript module. Read aidbg://debugger.d.ts for the API. Exports are available on $ across script calls."
+        description = "Type-check a TypeScript module and execute its top-level code. Exports are available on $ across calls. See docs for the API."
     )]
     async fn script_run(&self, Parameters(args): Parameters<ScriptArgs>) -> CallToolResult {
         reply(
@@ -436,7 +484,10 @@ impl Connection {
         reply(
             self.client
                 .clone()
-                .snapshot(self.request(SessionSnapshotRequest { tid: args.tid }))
+                .snapshot(self.request(SessionSnapshotRequest {
+                    tid: args.tid,
+                    context: args.context,
+                }))
                 .await,
         )
     }
@@ -472,46 +523,22 @@ impl Connection {
         )
     }
 
-    #[tool(description = "List processes on the debugger server.")]
+    #[tool(
+        description = "List processes as structured JSON. Use threads for individual TIDs and fields to include command lines."
+    )]
     async fn ps(&self, Parameters(args): Parameters<PsArgs>) -> CallToolResult {
-        let mut result = reply(
+        reply(
             self.client
                 .clone()
                 .ps(self.request(ProcessListRequest {
                     threads: args.threads,
+                    pattern: args.pattern,
+                    limit: args.limit,
+                    offset: args.offset,
+                    fields: args.fields,
                 }))
                 .await,
-        );
-        if result.is_error != Some(true)
-            && let Some(document) = &result.structured_content
-            && let Some(table) = document["result"].as_str()
-        {
-            result.content = vec![rmcp::model::ContentBlock::text(table)];
-            if document["output"]
-                .as_array()
-                .is_some_and(|rows| !rows.is_empty())
-                || document["signals"]
-                    .as_array()
-                    .is_some_and(|rows| !rows.is_empty())
-                || document["waiting_inputs"]
-                    .as_array()
-                    .is_some_and(|rows| !rows.is_empty())
-                || document["paused_threads"]
-                    .as_array()
-                    .is_some_and(|rows| !rows.is_empty())
-                || document["running_scripts"]
-                    .as_array()
-                    .is_some_and(|rows| !rows.is_empty())
-                || !document["target_error"].is_null()
-            {
-                let mut status = document.clone();
-                status.as_object_mut().unwrap().remove("result");
-                result
-                    .content
-                    .push(rmcp::model::ContentBlock::text(status.to_string()));
-            }
-        }
-        result
+        )
     }
 }
 

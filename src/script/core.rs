@@ -1,7 +1,10 @@
 mod images;
 pub(super) mod memory;
 
-use super::CoreSymbols;
+use super::{
+    CoreSymbols,
+    session::dwarf::{AttachedDwarf, unique_bias},
+};
 use crate::{
     Diagnostic, Result,
     coredump::{Coverage, ExecutableMetadata, Missing},
@@ -78,6 +81,7 @@ pub(super) struct Target {
     threads: BTreeMap<i32, Thread>,
     image: Option<OfflineImage>,
     dwarf: Option<DwarfImage>,
+    pub(super) attached_dwarf: Vec<AttachedDwarf>,
     architecture: &'static str,
     executable: Option<ExecutableMetadata>,
     debug_image: Option<crate::symbols::DebugFile>,
@@ -223,6 +227,7 @@ impl Target {
             threads: BTreeMap::new(),
             image: None,
             dwarf: None,
+            attached_dwarf: Vec::new(),
             architecture,
             executable: None,
             debug_image: None,
@@ -759,7 +764,13 @@ impl Target {
         let main = self
             .entry
             .and_then(|entry| self.mapped_file(entry).map(|(module, _)| module));
-        let mut images = self.dwarf.iter().cloned().collect::<Vec<_>>();
+        let mut images = self
+            .attached_dwarf
+            .iter()
+            .rev()
+            .map(|dwarf| dwarf.image.clone())
+            .collect::<Vec<_>>();
+        images.extend(self.dwarf.iter().cloned());
         for module in &self.file_modules {
             if self.dwarf.is_some() && main.is_some_and(|main| std::ptr::eq(main, module)) {
                 continue;
@@ -785,7 +796,7 @@ impl Target {
                     result.push(row);
                 }
             }
-            if result.len() >= limit || (exact && !result.is_empty()) {
+            if result.len() >= limit {
                 break;
             }
         }
@@ -794,6 +805,42 @@ impl Target {
 
     pub(super) fn session_pid(&self) -> i32 {
         self.pid.or_else(|| self.default_tid()).unwrap_or_default()
+    }
+
+    pub(super) fn infer_dwarf_bias(&self, debug: &object::File<'_>, path: &Path) -> Result<u64> {
+        let build_id = debug.build_id()?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let basename = name.strip_suffix(".debug").unwrap_or(name);
+        let mut matches = std::collections::BTreeSet::new();
+        for module in &self.file_modules {
+            let module_path = module.path();
+            if build_id.is_none() && module_path.file_name().is_none_or(|name| name != basename) {
+                continue;
+            }
+            for mapping in module.maps.iter().filter(|mapping| mapping.executable()) {
+                let Some(image) = self.image_at(mapping.start) else {
+                    continue;
+                };
+                let Ok(object) = object::File::parse(image.bytes()) else {
+                    continue;
+                };
+                if build_id.is_some() && object.build_id()? != build_id {
+                    continue;
+                }
+                matches.insert((module_path.clone(), image.bias()));
+            }
+        }
+        unique_bias(&matches.into_iter().collect::<Vec<_>>())
+    }
+
+    fn attached_frame(&self, address: u64) -> Option<(&AttachedDwarf, u64)> {
+        self.attached_dwarf
+            .iter()
+            .rev()
+            .find_map(|dwarf| Some((dwarf, dwarf.link_address(address)?)))
     }
 
     pub(super) fn session_registers(&self, tid: i32, full: bool) -> Result<Value> {
@@ -826,9 +873,15 @@ impl Target {
                 .take(limit)
                 .map(|(frame, site)| {
                     let values = self.session_frame_values(frame, deadline).unwrap_or(Value::Null);
+                    let source = self.attached_frame(frame.lookup_pc).and_then(|(dwarf,link)| dwarf.image.line(link).ok().flatten());
+                    let (file,line) = source.map_or_else(
+                        || (site["file"].clone(),site["line"].clone()),
+                        |source| (json!(source.file),json!(source.line)),
+                    );
                     json!({"pc":hex(frame.pc), "lookupPc":hex(frame.lookup_pc),
                         "sp":frame.regs.get(regs::SP).ok().map(hex), "fp":frame.regs.get(regs::FP).ok().map(hex),
-                        "symbol":site["function"], "file":site["file"], "line":site["line"],
+                        "symbol":site["function"], "file":file, "line":line,
+                        "missingDebugSections":site["missingDebugSections"],
                         "locals":values["locals"], "parameters":values["parameters"]})
                 })
                 .collect::<Vec<_>>()
@@ -838,6 +891,15 @@ impl Target {
     fn session_frame_values(&self, frame: &OfflineFrame, deadline: Instant) -> Result<Value> {
         if Instant::now() >= deadline {
             return Err(error("frame inspection deadline"));
+        }
+        if let Some((dwarf, link)) = self.attached_frame(frame.lookup_pc)
+            && dwarf.uniform_bias().is_some()
+        {
+            let relocated = OfflineFrame {
+                link: Some(link),
+                ..*frame
+            };
+            return dwarf.image.frame_values(self, &relocated, 64, deadline);
         }
         self.frame_dwarf(frame)?
             .frame_values(self, frame, 64, deadline)
@@ -852,6 +914,13 @@ impl Target {
         let Some(frame) = self.frames_for(tid).and_then(|frames| frames.first()) else {
             return Ok(None);
         };
+        if let Some((dwarf, link)) = self.attached_frame(frame.lookup_pc)
+            && let Some(graph) = dwarf
+                .image
+                .variable_type_graph(name, Some(link), deadline)?
+        {
+            return Ok(Some(graph));
+        }
         let Ok(dwarf) = self.frame_dwarf(frame) else {
             return Ok(None);
         };
@@ -944,12 +1013,23 @@ impl Target {
                             })
                             .map(|(name, _)| name.to_owned())
                     })();
+                    let missing_debug_sections = image.as_ref().and_then(|image| {
+                        let primary = object::File::parse(image.bytes()).ok()?;
+                        let debug = image
+                            .debug(self)
+                            .and_then(|debug| object::File::parse(&*debug.bytes).ok());
+                        Some(crate::symbols::missing_debug_sections(
+                            &primary,
+                            debug.as_ref(),
+                        ))
+                    });
                     json!({
                         "handle": format!("{}:{tid}:{index}", self.id),
                         "pc": hex(frame.pc), "function": function,
                         "file": source.as_ref().map(|line| &line.file),
                         "line": source.as_ref().and_then(|line| line.line),
                         "column": source.as_ref().and_then(|line| line.column),
+                        "missingDebugSections": missing_debug_sections,
                     })
                 })
                 .collect()
@@ -1085,10 +1165,32 @@ impl Target {
             }));
         };
         let obj = object::File::parse(image.bytes())?;
+        let debug = image
+            .debug(self)
+            .and_then(|debug| object::File::parse(&*debug.bytes).ok());
+        let missing = crate::symbols::missing_debug_sections(&obj, debug.as_ref());
+        warnings.extend(missing.into_iter().map(|section| {
+            Diagnostic::new(
+                if section == ".symtab" {
+                    "STRIPPED_SYMTAB"
+                } else {
+                    "STRIPPED_DWARF"
+                },
+                crate::symbols::stripped_issue(section),
+                None,
+            )
+        }));
         let link = image
             .link(address)
             .ok_or_else(|| error("ELF address overflows"))?;
-        let source = image.line(self, link)?;
+        let attached_source = match self.attached_frame(address) {
+            Some((dwarf, link)) => dwarf.image.line(link)?,
+            None => None,
+        };
+        let source = match attached_source {
+            Some(source) => Some(source),
+            None => image.line(self, link)?,
+        };
         if source.is_none() {
             if image.debug(self).is_none() && !obj.has_debug_symbols() {
                 warnings.push(Diagnostic::new(

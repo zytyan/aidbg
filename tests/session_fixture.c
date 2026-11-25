@@ -3,9 +3,11 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -30,6 +32,57 @@ struct Packet packet = {3, {.word = 0x12345678}, nodes, {4, 9, 15}, 5};
 volatile uint32_t watched = 33;
 volatile uint32_t watched_copy;
 volatile sig_atomic_t signal_count;
+
+struct Spec03Packet {
+    uint32_t ack : 1;
+    uint32_t req : 4;
+    uint32_t : 3;
+    uint8_t unused[3];
+    union {
+        uint32_t ipv4;
+        uint8_t ipv6[16];
+    };
+    uint32_t type;
+    _Alignas(16) void *ptr;
+};
+
+#pragma pack(push, 1)
+struct Spec03Packed {
+    uint8_t kind;
+    _Alignas(16) uint32_t length;
+};
+struct Spec03ZeroWidth {
+    char a;
+    unsigned field : 30;
+    unsigned : 0;
+    char b;
+};
+#pragma pack(pop)
+
+struct Spec03Unnamed {
+    char a;
+    unsigned : 31;
+    char b;
+};
+
+union Spec03ZeroWidthUnion {
+    unsigned : 0;
+    char a;
+};
+
+struct Spec03Packet spec03_packet = {.ack = 1, .req = 13, .ipv4 = 0x12345678, .type = 1};
+const uint32_t spec03_layout[] = {
+    sizeof(struct Spec03Packet), _Alignof(struct Spec03Packet),
+    offsetof(struct Spec03Packet, unused), offsetof(struct Spec03Packet, ipv4),
+    offsetof(struct Spec03Packet, type), offsetof(struct Spec03Packet, ptr),
+    sizeof(struct Spec03Packed), _Alignof(struct Spec03Packed), offsetof(struct Spec03Packed, length),
+    sizeof(struct Spec03ZeroWidth), _Alignof(struct Spec03ZeroWidth), offsetof(struct Spec03ZeroWidth, b),
+    sizeof(struct Spec03Unnamed), _Alignof(struct Spec03Unnamed), offsetof(struct Spec03Unnamed, b),
+    sizeof(union Spec03ZeroWidthUnion), _Alignof(union Spec03ZeroWidthUnion),
+};
+static char spec03_text[32] = "old";
+char *spec03_string = spec03_text;
+char *spec03_edge;
 
 __attribute__((noinline)) int32_t fixture_sum(int32_t a, int32_t b) {
     return a + b;
@@ -72,8 +125,19 @@ static int child_fixture(void) {
     return 23;
 }
 
+static __attribute__((noinline)) int memory_fixture(void) {
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    char *storage = mmap(NULL, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (storage == MAP_FAILED || mprotect(storage + page, page, PROT_READ)) return 98;
+    spec03_edge = storage + page - 2;
+    spec03_edge[0] = 'x';
+    fixture_stop(&packet);
+    return 23;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == 'c') return child_fixture();
+    if (argc > 1 && argv[1][0] == 'm') return memory_fixture();
     if (argc > 1 && argv[1][0] == 'k') {
         pid_t child = fork();
         if (child == 0) {
@@ -94,6 +158,14 @@ int main(int argc, char **argv) {
         return 24;
     }
     if (argc > 1 && argv[1][0] == 'e') return event_fixture();
+    if (argc > 1 && argv[1][0] == 'o') {
+        pid_t child = fork();
+        if (child == 0) _exit(0);
+        if (child < 0 || waitpid(child, NULL, 0) != child) return 98;
+        puts("stdout tail");
+        fputs("stderr tail\n", stderr);
+        return 39;
+    }
     if (argc > 1 && argv[1][0] == 'f') {
         volatile uintptr_t inaccessible = 0;
         return *(volatile int *)inaccessible;

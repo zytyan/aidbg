@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 pub(crate) struct Graph {
     root: usize,
     nodes: Vec<Node>,
+    pub(crate) module: std::path::PathBuf,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -41,7 +42,7 @@ enum Node {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 struct Member {
-    name: String,
+    name: Option<String>,
     offset: u64,
     ty: usize,
     bit: Option<(u64, u64)>,
@@ -90,7 +91,7 @@ pub(crate) fn live_type_graphs(
                 result.push(row);
             }
         }
-        if result.len() >= limit || (exact && !result.is_empty()) {
+        if result.len() >= limit {
             break;
         }
     }
@@ -147,6 +148,7 @@ impl offline::DwarfImage {
                 Graph {
                     root,
                     nodes: builder.nodes,
+                    module: self.path.clone(),
                 },
             ));
         }
@@ -161,6 +163,17 @@ impl offline::DwarfImage {
         limit: usize,
         deadline: Instant,
     ) -> Result<(Vec<(String, Graph)>, usize)> {
+        let (kind, pattern) = if exact {
+            match pattern.split_once(' ') {
+                Some(("struct", name)) => (Some(gimli::DW_TAG_structure_type), name),
+                Some(("union", name)) => (Some(gimli::DW_TAG_union_type), name),
+                Some(("class", name)) => (Some(gimli::DW_TAG_class_type), name),
+                Some(("enum", name)) => (Some(gimli::DW_TAG_enumeration_type), name),
+                _ => (None, pattern),
+            }
+        } else {
+            (None, pattern)
+        };
         let matcher = (!exact).then(|| glob::Pattern::new(pattern)).transpose()?;
         let dwarf = self.data.borrow();
         let mut units = dwarf.units();
@@ -175,18 +188,20 @@ impl offline::DwarfImage {
                 if scanned > MAX_DIES || (scanned % 128 == 0 && Instant::now() >= deadline) {
                     return Ok((results, matched));
                 }
-                if !matches!(
-                    entry.tag(),
-                    gimli::DW_TAG_base_type
-                        | gimli::DW_TAG_typedef
-                        | gimli::DW_TAG_structure_type
-                        | gimli::DW_TAG_class_type
-                        | gimli::DW_TAG_union_type
-                        | gimli::DW_TAG_enumeration_type
-                        | gimli::DW_TAG_subprogram
-                ) || entry
-                    .attr_value(gimli::DW_AT_declaration)
-                    .is_some_and(|attr| matches!(attr, AttributeValue::Flag(true)))
+                if kind.is_some_and(|kind| kind != entry.tag())
+                    || !matches!(
+                        entry.tag(),
+                        gimli::DW_TAG_base_type
+                            | gimli::DW_TAG_typedef
+                            | gimli::DW_TAG_structure_type
+                            | gimli::DW_TAG_class_type
+                            | gimli::DW_TAG_union_type
+                            | gimli::DW_TAG_enumeration_type
+                            | gimli::DW_TAG_subprogram
+                    )
+                    || entry
+                        .attr_value(gimli::DW_AT_declaration)
+                        .is_some_and(|attr| matches!(attr, AttributeValue::Flag(true)))
                 {
                     continue;
                 }
@@ -213,6 +228,7 @@ impl offline::DwarfImage {
                 let graph = builder.entry(entry.offset(), 0).map(|root| Graph {
                     root,
                     nodes: builder.nodes,
+                    module: self.path.clone(),
                 });
                 if let Ok(graph) = graph
                     && !results.contains(&(name.clone(), graph.clone()))
@@ -285,13 +301,17 @@ impl Builder<'_, '_> {
                     if child.depth() != root_depth + 1 || child.tag() != gimli::DW_TAG_member {
                         continue;
                     }
-                    let Some(name) = name(self.dwarf, self.unit, child)? else {
-                        continue;
-                    };
+                    let name = name(self.dwarf, self.unit, child)?;
                     let ty = self.entry(typedef_target(self.unit, child)?, depth + 1)?;
                     let bit_size = child
                         .attr_value(gimli::DW_AT_bit_size)
                         .and_then(|value| value.udata_value());
+                    if name.is_none()
+                        && bit_size.is_none()
+                        && !matches!(self.nodes[ty], Node::Aggregate { .. })
+                    {
+                        continue;
+                    }
                     let location = child
                         .attr_value(gimli::DW_AT_data_member_location)
                         .and_then(|value| value.udata_value());
@@ -462,6 +482,26 @@ impl Builder<'_, '_> {
 }
 
 impl Graph {
+    pub(crate) fn size(&self) -> Option<usize> {
+        fn node_size(nodes: &[Node], id: usize) -> Option<usize> {
+            match &nodes[id] {
+                Node::Aggregate { size, .. } | Node::Opaque { size, .. } => Some(*size),
+                Node::Pointer { .. } => Some(8),
+                Node::Scalar { scalar } => Some(scalar[1..].parse::<usize>().ok()? / 8),
+                Node::Array {
+                    element,
+                    dimensions,
+                } if !dimensions.is_empty() => dimensions
+                    .iter()
+                    .try_fold(node_size(nodes, *element)?, |size, &count| {
+                        size.checked_mul(usize::try_from(count).ok()?)
+                    }),
+                _ => None,
+            }
+        }
+        node_size(&self.nodes, self.root)
+    }
+
     pub(crate) fn signature(&self) -> Option<(Vec<&str>, &str, bool)> {
         let Node::Function {
             args,
@@ -515,8 +555,15 @@ impl Graph {
                 }
                 Node::Aggregate { fields, .. } => {
                     let mut members = String::new();
-                    for field in fields {
-                        let field_name = serde_json::to_string(&field.name).unwrap();
+                    let mut pending: Vec<_> = fields.iter().rev().collect();
+                    while let Some(field) = pending.pop() {
+                        let Some(name) = &field.name else {
+                            if let Node::Aggregate { fields, .. } = &self.nodes[field.ty] {
+                                pending.extend(fields.iter().rev());
+                            }
+                            continue;
+                        };
+                        let field_name = serde_json::to_string(name).unwrap();
                         let ty = match (&field.bit, &self.nodes[field.ty]) {
                             (Some(_), Node::Scalar { scalar: kind }) => {
                                 format!("{api}.Type.Base<{api}.Value.Bitfield<{}>>", scalar(kind))

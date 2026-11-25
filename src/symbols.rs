@@ -788,6 +788,32 @@ pub(crate) struct Line {
     source: Option<String>,
 }
 
+pub(crate) fn missing_debug_sections(
+    image: &object::File<'_>,
+    debug: Option<&object::File<'_>>,
+) -> Vec<&'static str> {
+    [".symtab", ".debug_info", ".debug_line"]
+        .into_iter()
+        .filter(|name| {
+            let present = |object: &object::File<'_>| {
+                object
+                    .section_by_name(name)
+                    .is_some_and(|section| section.size() > 0)
+            };
+            !present(image) && debug.is_none_or(|object| !present(object))
+        })
+        .collect()
+}
+
+pub(crate) fn stripped_issue(section: &str) -> String {
+    let kind = if section == ".symtab" {
+        "symtab"
+    } else {
+        "dwarf"
+    };
+    format!("stripped {kind}: missing {section}")
+}
+
 fn line_sections<'a>(obj: &object::File<'a>) -> Result<DwarfSections<Cow<'a, [u8]>>> {
     let mut total = 0;
     DwarfSections::load(|id: gimli::SectionId| -> Result<_> {
@@ -840,6 +866,14 @@ pub(crate) fn source_addresses(
 ) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
     let sections = line_sections(obj)?;
     let dwarf = sections.borrow(|s| EndianSlice::new(s, LittleEndian));
+    dwarf_source_addresses(&dwarf, wanted, line)
+}
+
+pub(crate) fn dwarf_source_addresses(
+    dwarf: &gimli::Dwarf<LineReader<'_>>,
+    wanted: &Path,
+    line: u64,
+) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
     let mut units = dwarf.units();
     let mut statements = BTreeSet::new();
     let mut declarations = BTreeSet::new();
@@ -857,7 +891,7 @@ pub(crate) fn source_addresses(
                 let index = i as u64 + u64::from(header.version() < 5);
                 header.file(index).map(|file| (index, file))
             })
-            .map(|(index, file)| Ok((index, source_path(&dwarf, &unit, header, file)?)))
+            .map(|(index, file)| Ok((index, source_path(dwarf, &unit, header, file)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let matches = |index: u64| files.get(&index).is_some_and(|path| path.ends_with(wanted));
         if !files.values().any(|path| path.ends_with(wanted)) {
@@ -1263,6 +1297,11 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
     result.display = Some(format!("{name}+{}", hex(link - layout.elf_base)));
     let debug = DebugFile::discover(&process.root, module, &image);
     let debug_image = debug.as_ref().and_then(DebugFile::parse);
+    result.issues.extend(
+        missing_debug_sections(&image, debug_image.as_ref())
+            .into_iter()
+            .map(stripped_issue),
+    );
     let is_exec = map.executable();
     let mut best = None;
     for (sym, table, external) in symbol_entries(&image, debug_image.as_ref()) {

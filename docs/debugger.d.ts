@@ -233,6 +233,8 @@ export interface StackFrame {
     readonly module?: Module;
     /** 尝试解析出的函数名 */
     readonly symbol?: string;
+    readonly unwindMethod?: string;
+    readonly missingDebugSections?: readonly string[];
     /** 距离函数入口的偏移 */
     readonly offset?: number;
     /** 此帧可读的局部变量。缺少 DWARF 或无法恢复帧上下文时省略。 */
@@ -262,6 +264,26 @@ export interface DebugSnapshot {
     readonly threads: readonly ThreadSnapshot[];
     readonly mappings: readonly MemoryMapping[];
     readonly consistency: "thread" | "all-stopped" | "best-effort";
+    readonly context?: {
+        readonly State?: string;
+        readonly TracerPid?: number;
+        readonly Threads?: number;
+        readonly syscall?: string;
+        readonly wchan?: string;
+        readonly fd?: Readonly<Record<number, string>>;
+    };
+}
+
+export interface WaitOutputResult {
+    readonly stdout: string;
+    readonly stderr: string;
+    readonly truncated: boolean;
+    readonly eof: boolean;
+    readonly released: boolean;
+    readonly ended: boolean;
+    readonly timedOut: boolean;
+    readonly exitCode?: number;
+    readonly exitSignal?: number;
 }
 
 export type BreakpointCallback = (hit: BreakpointHit) => void | Promise<void>;
@@ -508,6 +530,8 @@ export interface Debugger {
     detach(): Promise<void>;
     /** 普通 fork 默认跟踪父进程。child 模式切换至子进程并暂停在 fork 边界。both 需要多实例支持。 */
     setForkPolicy(mode: "parent" | "child" | "both"): void;
+    /** Load additional DWARF for the active target. An explicit position may be needed for cores. */
+    attachDwarf(file: string, position?: bigint | Readonly<Record<string, bigint>>): void;
     /** 设置或移除指定范围的系统调用捕获。省略回调时命中会保持暂停。 */
     catchSyscall(tid: number | "all", phase: "entry" | "exit" | "both" | null,
         callback?: (hit: SyscallCaught) => void | Promise<void>): void;
@@ -531,7 +555,8 @@ export interface Debugger {
      * 已有 scratchpad 时可仅令当前线程执行 eval 与 injectSyscall；否则需暂停所有其他线程。
      */
     prepareScratchPad(): Promise<void>;
-    snapshot(tid?: number): Promise<DebugSnapshot>;
+    snapshot(options?: number | { tid?: number; context?: boolean }): Promise<DebugSnapshot>;
+    waitOutput(tid: number, timeoutMs?: number): Promise<WaitOutputResult>;
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
 
@@ -619,6 +644,7 @@ interface EventLocation {
     readonly tid: number;
     /** 此事件交付时线程是否仍由调试器暂停。 */
     readonly paused: boolean;
+    readonly reason: "fork" | "exec" | "signal" | "breakpoint" | "syscall";
 }
 
 export type BreakpointStop = EventLocation & {
@@ -641,6 +667,7 @@ export type SyscallStop = EventLocation & {
     readonly abi: number;
     readonly name?: string;
     readonly parameterNames?: readonly string[];
+    readonly parameters?: readonly ({ readonly name: string | null; readonly type: string | null } | null)[];
     readonly pathname?: string;
     readonly args: readonly bigint[];
     readonly result?: bigint;
@@ -741,11 +768,14 @@ export interface Console {
 // ============================================================================
 
 declare const valueBrand: unique symbol;
+declare const charBrand: unique symbol;
 
 export type LiteralString<T extends string> =
     string extends T ? never : T;
 
 export type Infer<T> = T extends Type.Base<infer V> ? V : never;
+type PointerItem<T> = Infer<T> extends Read<infer P> ? P : never;
+type TerminatedItem<T> = T extends Type.TerminatedPointer<any, infer R, any> ? R : PointerItem<T>;
 
 export type Fields = Record<string, Type.Base<unknown>>;
 
@@ -791,7 +821,7 @@ export interface Read<T extends number | bigint> {
     $read(): T;
 }
 
-export interface Write<T extends number | bigint> {
+export interface Write<T extends number | bigint | string> {
     $write(value: T): void;
 }
 
@@ -843,9 +873,17 @@ export declare namespace Value {
     export type Bitfield<T extends number | bigint> =
         Base & Read<T> & Write<T>;
 
+    export type Enum<T extends number | bigint, K extends string> =
+        Base & Sized & Read<T> & Write<T | K> & Address & Bytes;
+
     export type Pointer<V> =
         Base & Sized & Read<bigint> & Write<bigint> &
         Address & Bytes & Index<V> & Deref<V>;
+
+    export type TerminatedPointer<V, R, W> =
+        Omit<Pointer<V>, "$deref"> & Deref<R> & {
+            $writeContents(contents: W): { writtenBytes: number; previousBytes: number; warning?: string };
+        };
 
     export type Array<V> =
         Base & Address & Bytes & Index<V>;
@@ -902,27 +940,73 @@ export declare namespace Type {
          * 需要 call 能力时必须绑定线程 tid（也可后续修改返回 Value 的 $tid）。
          */
         at(address: bigint, tid?: number): V;
+        $readBytes(address: bigint): Uint8Array;
+        $writeBytes(address: bigint, data: Uint8Array): void;
+        offsetOf(path: string): number;
+        layout(): string;
     }
 
     export interface Scalar<T extends number | bigint>
         extends Base<Value.Scalar<T>> {
         value(value: T): Value.Scalar<T>;
+        align(bytes: number): this;
+    }
+
+    export interface EndianScalar<T extends number | bigint> extends Scalar<T> {
+        be(): this;
+        le(): this;
+    }
+
+    export interface Integer<T extends number | bigint> extends Scalar<T> {
+        bitfield(width: number): Base<Value.Bitfield<T>>;
+        enum<const E extends Readonly<Record<string, T>>>(values: E): Enum<T, Extract<keyof E, string>>;
+    }
+
+    export interface EndianInteger<T extends number | bigint> extends Integer<T>, EndianScalar<T> {
+        enum<const E extends Readonly<Record<string, T>>>(values: E): EndianEnum<T, Extract<keyof E, string>>;
+    }
+
+    export interface Enum<T extends number | bigint, K extends string> extends Base<Value.Enum<T, K>> {
+        align(bytes: number): this;
+        value(value: T | K): Value.Enum<T, K>;
+    }
+
+    export interface EndianEnum<T extends number | bigint, K extends string> extends Enum<T, K> {
+        be(): this;
+        le(): this;
+    }
+
+    export interface Char extends Integer<number> {
+        readonly [charBrand]: true;
+    }
+
+    export interface TerminatedPointer<T extends Base<unknown>, R, W> extends Base<Value.TerminatedPointer<Infer<T>, R, W>> {
+        align(bytes: number): this;
+        value(address: bigint): Value.TerminatedPointer<Infer<T>, R, W>;
+        pointee(): T;
     }
 
     export interface Pointer<T extends Base<unknown>>
         extends Base<Value.Pointer<Infer<T>>> {
         value(address: bigint): Value.Pointer<Infer<T>>;
         pointee(): T;
+        align(bytes: number): this;
+        nullTerminate(maxLength?: number): T extends Char
+            ? TerminatedPointer<T, string, string>
+            : TerminatedPointer<T, TerminatedItem<T>[], readonly PointerItem<T>[]>;
     }
 
     export interface Array<T extends Base<unknown>>
         extends Base<Value.Array<Infer<T>>> {
         element(): T;
+        align(bytes: number): this;
     }
 
     export interface Aggregate<F extends Fields>
         extends Base<Value.Aggregate<F>> {
         field<K extends keyof F>(name: K): F[K];
+        align(bytes: number): this;
+        pack(bytes: number): this;
 
         refine<const P extends Fields>(
             fields: P & Record<Exclude<keyof P, keyof F>, never>
@@ -935,17 +1019,17 @@ export declare namespace Type {
 export interface TypeSystem {
     void(): Type.Base<void>;
 
-    u8(): Type.Scalar<number>;
-    i8(): Type.Scalar<number>;
-    u16(): Type.Scalar<number>;
-    i16(): Type.Scalar<number>;
-    u32(): Type.Scalar<number>;
-    i32(): Type.Scalar<number>;
-    u64(): Type.Scalar<bigint>;
-    i64(): Type.Scalar<bigint>;
+    u8(): Type.Integer<number>;
+    i8(): Type.Integer<number>;
+    u16(): Type.EndianInteger<number>;
+    i16(): Type.EndianInteger<number>;
+    u32(): Type.EndianInteger<number>;
+    i32(): Type.EndianInteger<number>;
+    u64(): Type.EndianInteger<bigint>;
+    i64(): Type.EndianInteger<bigint>;
 
-    f32(): Type.Scalar<number>;
-    f64(): Type.Scalar<number>;
+    f32(): Type.EndianScalar<number>;
+    f64(): Type.EndianScalar<number>;
 
     struct<F extends Fields>(
         fields: F,
@@ -957,6 +1041,11 @@ export interface TypeSystem {
     ): Type.Aggregate<F>;
 
     array<T extends Type.Base<unknown>>(type: T, length?: Length): Type.Array<T>;
+    opaque(length: number): Type.Array<Type.Integer<number>>;
+    char(): Type.Char;
+    cStr(maxLength?: number): Type.TerminatedPointer<Type.Char, string, string>;
+    anonymous<F extends Fields>(type: Type.Aggregate<F>): F;
+    anonymous(type: Type.Base<Value.Bitfield<number | bigint>>): {};
     pointer<T extends Type.Base<unknown>>(type: T, length?: Length): Type.Pointer<T>;
 
     /** 变参由运行时按照 C 默认参数提升规则处理 */
@@ -973,6 +1062,7 @@ export interface TypeSystem {
 
     /** 第二遍编译根据 DWARF 信息替换为精确类型 */
     fromDwarf<const S extends string>(name: S & LiteralString<S>): any;
+    findTypes(query: string): readonly { readonly name: string; readonly module: string; readonly size: number | null }[];
     /** 查询当前回调线程（或进程主线程）顶层栈帧中变量的 DWARF 类型。找不到时返回 undefined。 */
     typeOfVar<const S extends string>(name: S & LiteralString<S>): Type.Base<unknown> | undefined;
 }
@@ -982,6 +1072,7 @@ export type ExitEvent = {
     readonly sequence: number;
     readonly scope: "thread" | "process";
     readonly tid: number;
+    readonly stopReason: "exit";
 } & (
     | { readonly reason: "code"; readonly code: number }
     | { readonly reason: "signal"; readonly signal: number }

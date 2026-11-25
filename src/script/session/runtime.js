@@ -315,6 +315,8 @@
         );
         return Object.freeze({...row, pc:BigInt(raw.pc), sp:BigInt(raw.sp ?? 0), fp:BigInt(raw.fp ?? 0),
             lookupPc:BigInt(raw.lookupPc ?? raw.pc), locals:variables(raw.locals), parameters:variables(raw.parameters),
+            unwindMethod:optional(raw.unwindMethod),
+            missingDebugSections:raw.missingDebugSections == null ? undefined : Object.freeze(raw.missingDebugSections),
             symbol:optional(raw.symbol), file:optional(raw.file), line:optional(raw.line)});
     }
     function snapshot(raw) {
@@ -338,6 +340,8 @@
             if (row.pathname == null) delete row.pathname;
             if (row.parameterNames == null) delete row.parameterNames;
             else Object.freeze(row.parameterNames);
+            if (row.parameters == null) delete row.parameters;
+            else row.parameters = Object.freeze(row.parameters.map(parameter => parameter && Object.freeze(parameter)));
         }
         if (row.kind === "signal") {
             const {tid, sequence} = row, generation = rpc("generation");
@@ -542,7 +546,26 @@
         thread:tid => makeThread(tid),
         threads:() => Object.freeze(rpc("threads").map(tid => makeThread(tid))),
         mappings:() => Object.freeze(rpc("mappings").map(mapping)),
-        async snapshot(tid) { return snapshot(rpc("snapshot", {tid})); },
+        async snapshot(options) {
+            const request = typeof options === "object" ? options : {tid:options};
+            return snapshot(rpc("snapshot", request));
+        },
+        async waitOutput(tid, timeoutMs = 180000) {
+            tid = integer(tid, "invalid thread ID");
+            timeoutMs = integer(timeoutMs, "invalid output timeout");
+            if (timeoutMs > 86400000) throw new RangeError("invalid output timeout");
+            const deadline = rpc("clock") + timeoutMs;
+            for (;;) {
+                const result = rpc("waitOutput", {tid});
+                if (result.stdout || result.stderr || result.truncated || result.released ||
+                    result.ended || result.exitCode !== undefined || result.exitSignal !== undefined) {
+                    return Object.freeze({...result, timedOut:false});
+                }
+                const remaining = deadline - rpc("clock");
+                if (remaining <= 0) return Object.freeze({...result, timedOut:true});
+                await sleep(Math.min(remaining, 20));
+            }
+        },
         async pauseThread(tid) {
             if (scope(tid) === undefined) throw new TypeError("pauseThread requires a numeric thread ID");
             return makeThread(rpc("pause", {tid})[0], true);
@@ -561,6 +584,15 @@
         async ask(payload, timeoutMs) { return ask(payload,timeoutMs,callbackTid); },
         async detach() { rpc("detach"); },
         setForkPolicy(mode) { rpc("setForkPolicy", {mode}); },
+        attachDwarf(file, position) {
+            if (position !== undefined && typeof position !== "bigint" &&
+                (!position || typeof position !== "object" || Array.isArray(position))) {
+                throw new TypeError("expected an ELF load bias or a section address map");
+            }
+            const encoded = position === undefined ? undefined : typeof position === "bigint" ? word(position) :
+                Object.fromEntries(Object.entries(position).map(([section,address]) => [section,word(address)]));
+            rpc("attachDwarf", {file,position:encoded});
+        },
         catchSyscall(tid, phase, callback) {
             const key = scope(tid) ?? "all";
             if (callback != null && typeof callback !== "function") throw new TypeError("expected a syscall callback");
@@ -733,7 +765,9 @@
         f32:["Float32",4], f64:["Float64",8], ptr:["BigUint64",8],
     };
     const scalarDescriptors = {};
-    function scalarBytes(kind, value) {
+    const anonymousFields = new WeakSet();
+    let nextAnonymousField = 0;
+    function scalarBytes(kind, value, littleEndian = true) {
         const [native, width] = scalarSpec[kind];
         const bytes = new Uint8Array(width);
         if (kind === "ptr") word(value);
@@ -748,7 +782,7 @@
                 if (!Number.isInteger(value) || value >= limit || value < (signed ? -limit : 0)) throw new RangeError("integer does not fit the C type");
             }
         }
-        view(bytes)["set" + native](0,value,true);
+        view(bytes)["set" + native](0,value,littleEndian);
         return bytes;
     }
 
@@ -757,11 +791,63 @@
             get $size() { return info.kind === "lazy" ? typeInfo(resolve(type)).size : info.size; },
             get $align() { return info.kind === "lazy" ? typeInfo(resolve(type)).align : info.align; },
             at(address, tid) { word(address); return makeValue(type, {address, tid, root:rpc("generation")}); },
+            $readBytes(address) {
+                word(address);
+                return readBytes(address, staticStorageSize(type));
+            },
+            $writeBytes(address, bytes) {
+                word(address);
+                if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
+                if (bytes.length !== staticStorageSize(type)) throw new RangeError("byte length differs from C storage size");
+                if (bytes.length) writeBytes(address, bytes);
+            },
+            offsetOf(path) { return fieldOffset(type, path); },
+            layout() { return describeType(type); },
         };
-        if (info.kind === "scalar" || info.kind === "ptr") {
-            type.value = value => makeValue(type, {bytes:scalarBytes(info.scalar, value)});
+        if (info.align && info.kind !== "bitfield") {
+            type.align = value => {
+                const explicitAlign = alignment(value);
+                const align = Math.max(info.align, explicitAlign);
+                const size = info.fields ? rounded(info.size, align) : info.size;
+                return descriptor({...info, align, size, explicitAlign:align});
+            };
         }
-        if (info.kind === "ptr") type.pointee = () => typeInfo(info.element).kind === "self" ? info.element : resolve(info.element);
+        if (info.kind === "scalar" && info.size > 1) {
+            type.be = () => descriptor({...info, littleEndian:false});
+            type.le = () => descriptor({...info, littleEndian:true});
+        }
+        if (info.kind === "scalar" && /^[ui]/.test(info.scalar)) {
+            type.bitfield = width => {
+                width = integer(width, "invalid bitfield width");
+                if (width > info.size * 8 || info.littleEndian === false || info.explicitAlign || info.enumerators) {
+                    throw new TypeError("unsupported bitfield type or width");
+                }
+                return descriptor({...info, kind:"bitfield", bit:[0,width]});
+            };
+            type.enum = values => {
+                const enumerators = Object.assign(Object.create(null), values);
+                for (const [name, value] of Object.entries(enumerators)) {
+                    if (!/^[a-zA-Z_]\w*$/.test(name)) throw new TypeError("invalid enum name " + name);
+                    scalarBytes(info.scalar, value);
+                }
+                return descriptor({...info, enumerators:Object.freeze(enumerators)});
+            };
+        }
+        if (info.kind === "scalar" || info.kind === "ptr") {
+            type.value = value => makeValue(type, {bytes:encodeValue(info, value)});
+        }
+        if (info.kind === "ptr") {
+            type.pointee = () => typeInfo(info.element).kind === "self" ? info.element : resolve(info.element);
+            type.nullTerminate = (limit = 4096) => {
+                limit = integer(limit, "invalid termination limit");
+                const element = typeInfo(resolve(info.element));
+                if (!limit || info.length !== undefined || !["scalar", "ptr"].includes(element.kind)
+                    || element.scalar.startsWith("f") || element.size % element.align) {
+                    throw new TypeError("unsupported terminated pointer type or length");
+                }
+                return descriptor({...info, terminated:limit});
+            };
+        }
         if (info.kind === "array") type.element = () => info.element;
         if (info.fields) {
             type.field = name => {
@@ -769,9 +855,134 @@
                 return info.fields[name].type;
             };
             type.refine = fields => refine(type, fields);
+            type.pack = value => {
+                if (!info.entries) throw new TypeError("cannot repack a resolved or refined layout");
+                return aggregate(info.kind, info.entries, {pack:value,align:info.explicitAlign});
+            };
         }
         types.set(type,info);
         return Object.freeze(type);
+    }
+
+    function describeType(type) {
+        const seen = new Set();
+        function describe(type, name, depth) {
+            const info = typeInfo(resolve(type));
+            const align = info.explicitAlign ? "_Alignas(" + info.explicitAlign + ") " : "";
+            const order = info.littleEndian === false ? " big-endian" : "";
+            const label = name ? " " + name : "";
+            if (seen.has(type) || depth > 24) return "<recursive type>" + label;
+            if (info.kind === "ptr") {
+                const element = typeInfo(info.element);
+                const pointee = info.terminated === undefined ? element : typeInfo(resolve(info.element));
+                const extent = info.terminated !== undefined
+                    ? " " + (pointee.char ? "NUL-terminated UTF-8" : pointee.kind === "ptr" ? "NULL-terminated" : "zero-terminated") + ", max " + info.terminated
+                    :
+                    typeof info.length === "function" ? " context length" :
+                    info.length === undefined ? "" : " length " + info.length;
+                seen.add(type);
+                const text = align + (element.kind === "self" ? "self" : describe(info.element,"",depth+1)) + " *" + label + extent;
+                seen.delete(type);
+                return text;
+            }
+            if (info.kind === "array") {
+                const count = typeof info.length === "function" ? "context length" : info.length ?? "";
+                return align + describe(info.element,"",depth+1) + label + "[" + count + "]";
+            }
+            if (info.fields) {
+                seen.add(type);
+                const indent = "    ".repeat(depth + 1);
+                const fields = info.declarations ?? Object.entries(info.fields).map(([name,field]) => ({...field,name}));
+                const lines = [align + info.kind + " {"];
+                let occupied = 0;
+                for (const {name,type,offset} of fields) {
+                    const member = typeInfo(resolve(type));
+                    if (info.kind === "struct" && offset > occupied) lines.push(indent + "// padding: " + (offset - occupied));
+                    const bit = member.bit ? ", bitoffset: " + member.bit[0] : "";
+                    lines.push(indent + describe(type,name,depth+1) + "; // byteoffset: " + offset + bit);
+                    occupied = Math.max(occupied, offset + (member.bit ? Math.ceil((member.bit[0]+member.bit[1])/8) : member.size ?? 0));
+                }
+                if (info.size > occupied) lines.push(indent + "// tail padding: " + (info.size - occupied));
+                lines.push("    ".repeat(depth) + "}" + label);
+                seen.delete(type);
+                if (info.pack !== undefined) lines.unshift("#pragma pack(" + info.pack + ")");
+                return lines.join("\n");
+            }
+            const base = info.char ? "char" : info.scalar ? (info.scalar[0] === "f" ?
+                (info.size === 4 ? "float" : "double") :
+                (info.scalar[0] === "u" ? "uint" : "int") + info.scalar.slice(1) + "_t") : info.kind;
+            const enumValues = info.enumerators ? " enum {" + Object.entries(info.enumerators).map(([key,value]) => key + " = " + value).join(", ") + "}" : "";
+            return align + base + enumValues + label + (info.bit ? " : " + info.bit[1] : "") + order;
+        }
+        const info = typeInfo(resolve(type));
+        return describe(type,"",0) + ";\n// sizeof: " + (info.size ?? "dynamic") +
+            "\n// alignof: " + (info.align ?? "unknown");
+    }
+    function encodeValue(info, value) {
+        if (info.enumerators && typeof value === "string") {
+            if (!Object.hasOwn(info.enumerators, value)) throw new TypeError("unknown enumerator " + value);
+            value = info.enumerators[value];
+        }
+        return scalarBytes(info.scalar, value, info.littleEndian);
+    }
+
+    function terminatedBytes(base, element, limit) {
+        if (base === 0n) throw new RangeError("null pointer");
+        const total = integer(element.size * limit, "terminated sequence is too large");
+        const collected = [];
+        let offset = 0;
+        while (offset < total) {
+            const length = Math.min(total - offset,4096);
+            const chunk = rpc("readPrefix", {address:word(addr(base,offset)), length});
+            for (let i = 0; i + element.size <= chunk.length; i += element.size) {
+                const bytes = chunk.slice(i,i + element.size);
+                if (bytes.every(byte => byte === 0)) return Uint8Array.from(collected);
+                collected.push(...bytes);
+            }
+            if (chunk.length < length) throw new Error("terminated sequence crosses unavailable memory");
+            offset += length;
+        }
+        throw new RangeError("terminator not found within the element limit");
+    }
+    function staticStorageSize(type) {
+        const info = typeInfo(resolve(type));
+        if (info.size === undefined || info.kind === "bitfield") {
+            throw new TypeError("type has no independently addressable static storage");
+        }
+        return info.size;
+    }
+
+    function fieldOffset(type, path) {
+        if (typeof path !== "string" || !path.length) throw new TypeError("expected a member path");
+        let offset = 0;
+        let remaining = path;
+        while (remaining.length) {
+            const info = typeInfo(resolve(type));
+            if (remaining.startsWith("[")) {
+                const index = /^\[(\d+)\]/.exec(remaining);
+                if (!index || info.kind !== "array" || typeof info.length !== "number") {
+                    throw new TypeError("expected an index into a fixed array");
+                }
+                const element = integer(Number(index[1]), "invalid array index");
+                if (element >= info.length) throw new RangeError("array index out of bounds");
+                type = info.element;
+                offset += element * staticStorageSize(type);
+                remaining = remaining.slice(index[0].length);
+            } else {
+                const member = /^[^.\[\]]+/.exec(remaining)?.[0];
+                const field = member && info.fields && Object.hasOwn(info.fields, member) && info.fields[member];
+                if (!field || !Number.isSafeInteger(field.offset)) throw new TypeError("unknown or dynamic C member");
+                type = field.type;
+                offset += field.offset;
+                remaining = remaining.slice(member.length);
+            }
+            if (remaining.startsWith(".")) {
+                remaining = remaining.slice(1);
+                if (!remaining || /^[.\[\]]/.test(remaining)) throw new TypeError("invalid member path");
+            } else if (remaining && !remaining.startsWith("[")) throw new TypeError("invalid member path");
+        }
+        if (typeInfo(resolve(type)).kind === "bitfield") throw new TypeError("bitfields have no byte offset");
+        return integer(offset, "invalid byte offset");
     }
     function resolve(type, self) {
         for (let i = 0; i < 32; i++) {
@@ -793,35 +1004,77 @@
         typeInfo(type);
         if (typeof length !== "function" && length !== undefined) length = integer(length, "invalid element count");
         const item = kind === "array" ? typeInfo(resolve(type)) : null;
-        if (item && (!item.size || !item.align)) throw new TypeError("array element size must be known and nonzero");
+        if (item && (!item.size || !item.align || item.kind === "bitfield" || item.size % item.align)) {
+            throw new TypeError("array element must have a nonzero size divisible by its alignment");
+        }
         return descriptor({kind, element:type, length, scalar:kind === "ptr" ? "ptr" : undefined,
             size:kind === "ptr" ? 8 : typeof length === "number" ? integer(length * item.size, "array size too large") : undefined,
             align:kind === "ptr" ? 8 : item.align});
     }
 
     function aggregate(kind, fields, option = {}) {
-        const pack = option.pack === undefined ? Infinity : alignment(option.pack);
-        const entries = Object.entries(fields);
+        const pack = option.pack === undefined || option.pack === 0 ? Infinity : alignment(option.pack);
+        if (pack !== Infinity && pack > 16) throw new RangeError("GCC packing must be 0, 1, 2, 4, 8 or 16");
+        const entries = Reflect.ownKeys(fields).filter(key => Object.prototype.propertyIsEnumerable.call(fields,key));
         const layout = Object.create(null);
-        let size = 0, natural = 1, tail;
-        for (const [index,[name,type]] of entries.entries()) {
-            if (name.startsWith("$")) throw new TypeError("C field names cannot begin with $");
-            const info = typeInfo(resolve(type));
+        const declarations = [];
+        const addField = (name, type, offset) => {
+            if (Object.hasOwn(layout,name)) throw new TypeError("duplicate C field name " + name);
+            layout[name] = {type,offset};
+        };
+        let occupiedBits = 0, natural = 1, tail;
+        for (const [index,name] of entries.entries()) {
+            const type = fields[name];
+            const anonymous = typeof name === "string" && name.startsWith("$") && anonymousFields.has(type);
+            if (!anonymous && (typeof name !== "string" || name.startsWith("$") ||
+                (/^(0|[1-9]\d*)$/.test(name) && Number(name) < 4294967295))) {
+                throw new TypeError("invalid C field name " + String(name));
+            }
+            const member = anonymous ? type.type : type;
+            const info = typeInfo(resolve(member));
+            if (info.kind === "bitfield" && info.size !== undefined) {
+                const width = info.bit[1], unit = info.size * 8;
+                if (width === 0) {
+                    if (!anonymous) throw new TypeError("zero-width bitfields must be unnamed");
+                    if (arch === "aarch64") natural = Math.max(natural,info.align);
+                    if (kind === "struct") occupiedBits = rounded(occupiedBits,info.align * 8);
+                    declarations.push({type:member,offset:kind === "struct" ? occupiedBits / 8 : 0});
+                    continue;
+                }
+                const align = Math.min(info.align,pack);
+                const contributesAlignment = !anonymous || arch === "aarch64";
+                if (contributesAlignment) natural = Math.max(natural,align);
+                let start = kind === "union" ? 0 : occupiedBits;
+                if (pack >= info.align && start % unit + width > unit) start = rounded(start,unit);
+                const offset = Math.floor(start / 8);
+                const placed = descriptor({...info,bit:[start % 8,width]});
+                if (!anonymous) addField(name,placed,offset);
+                declarations.push({name:anonymous ? undefined : name,type:placed,offset});
+                const end = kind === "union" && contributesAlignment ? Math.max(width,align * 8) : start + width;
+                occupiedBits = Math.max(occupiedBits,end);
+                continue;
+            }
             if (!info.align || info.kind === "void" || info.kind === "fn") throw new TypeError("field " + name + " does not have a C object type");
             const align = Math.min(info.align,pack);
             natural = Math.max(natural,align);
-            const offset = kind === "struct" ? rounded(size,align) : 0;
-            layout[name] = {type,offset};
+            const offset = kind === "struct" ? rounded(Math.ceil(occupiedBits / 8),align) : 0;
+            if (anonymous) {
+                if (!info.fields || info.tail !== undefined) throw new TypeError("expected an anonymous fixed aggregate");
+                for (const [child, field] of Object.entries(info.fields)) addField(child,field.type,offset + field.offset);
+            } else addField(name,member,offset);
+            declarations.push({name:anonymous ? undefined : name,type:member,offset});
             if (info.size === undefined) {
                 if (kind !== "struct" || index !== entries.length - 1 || info.kind !== "array") {
                     throw new TypeError("an unsized array must be the final struct field");
                 }
                 tail = name;
             }
-            size = Math.max(size, offset + (info.size ?? 0));
+            occupiedBits = Math.max(occupiedBits, (offset + (info.size ?? 0)) * 8);
         }
-        const align = Math.max(natural, option.align === undefined ? 1 : alignment(option.align));
-        return descriptor({kind, fields:layout, tail, size:rounded(size,align), align});
+        const explicitAlign = option.align === undefined ? undefined : alignment(option.align);
+        const align = Math.max(natural, explicitAlign ?? 1);
+        return descriptor({kind, fields:layout, tail, size:rounded(Math.ceil(occupiedBits / 8),align),
+            align, explicitAlign, pack:option.pack, declarations, entries:Object.fromEntries(entries.map(key => [key,fields[key]]))});
     }
 
     function refine(type, fields) {
@@ -836,7 +1089,7 @@
             }
             layout[name] = {...original,type};
         }
-        return descriptor({...info,fields:layout});
+        return descriptor({...info,fields:layout,entries:undefined});
     }
 
     const m = {
@@ -844,7 +1097,16 @@
         struct: (fields, options) => aggregate("struct",fields,options),
         union: (fields, options) => aggregate("union",fields,options),
         array: (type,length) => sequence("array",type,length),
+        opaque: length => sequence("array",scalar("u8"),integer(length,"invalid opaque byte count")),
+        anonymous(type) {
+            typeInfo(type);
+            const member = Object.freeze({type});
+            anonymousFields.add(member);
+            return {["$anonymous" + nextAnonymousField++]:member};
+        },
         pointer: (type,length) => sequence("ptr",type,length),
+        char: () => descriptor({...typeInfo(scalar(arch === "aarch64" ? "u8" : "i8")), char:true}),
+        cStr: limit => m.pointer(m.char()).nullTerminate(limit),
         function(signature) {
             for (const type of signature.args) typeInfo(type);
             typeInfo(signature.returns);
@@ -857,9 +1119,12 @@
             return graph == null ? undefined : dwarfType({graph});
         },
         fromDwarf(name) {
-            const rows = Array.from(dwarfRows(name,true));
-            if (rows.length !== 1) throw new Error("expected one DWARF type named " + name + ", found " + rows.length);
-            return dwarfType(rows[0]);
+            return dwarfType({graph:rpc("fromDwarf", {name})});
+        },
+        findTypes(query) {
+            if (typeof query !== "string" || !query) throw new TypeError("expected a DWARF type query");
+            const pattern = /[*?\[]/.test(query) ? query : "*" + query + "*";
+            return Array.from(dwarfRows(pattern), ({name,module,size}) => ({name,module,size}));
         },
     };
     const voidType = descriptor({kind:"void"});
@@ -909,7 +1174,7 @@
             if (store.bytes) store.bytes.set(bytes);
             else writeBytes(store.address,bytes);
         };
-        const read = () => view(getBytes())["get" + scalarSpec[info.scalar][0]](0,true);
+        const read = () => view(getBytes())["get" + scalarSpec[info.scalar][0]](0,info.littleEndian ?? true);
         const own = {
             $type:() => type, $size:() => valueSize(info,store), $parent:() => store.parent,
             $tid:() => store.tid ?? (store.inheritTid ? store.parent?.$tid : undefined),
@@ -922,7 +1187,7 @@
         }
         if (info.kind === "scalar" || info.kind === "ptr") {
             own.$read = () => read;
-            own.$write = () => value => setBytes(scalarBytes(info.scalar,value));
+            own.$write = () => value => setBytes(encodeValue(info,value));
         }
         if (info.kind === "bitfield") {
             const [shift,width] = info.bit;
@@ -980,7 +1245,39 @@
             own.$length = () => dynamicLength(info,store);
             own.$atUnchecked = () => index => atIndex(index,false);
         }
-        if (info.kind === "ptr") own.$deref = () => () => atIndex(0,false);
+        if (info.kind === "ptr") {
+            own.$deref = () => () => atIndex(0,false);
+            if (info.terminated !== undefined) {
+                const element = typeInfo(resolve(info.element));
+                own.$deref = () => () => {
+                    const bytes = terminatedBytes(read(),element,info.terminated);
+                    if (element.char) return fromUtf8(bytes);
+                    const data = view(bytes);
+                    return Array.from({length:bytes.length / element.size}, (_, index) => {
+                        const item = data["get" + scalarSpec[element.scalar][0]](index * element.size,element.littleEndian ?? true);
+                        return element.terminated === undefined ? item : atIndex(index,false).$deref();
+                    });
+                };
+                own.$writeContents = () => contents => {
+                    const base = read();
+                    const previous = terminatedBytes(base,element,info.terminated);
+                    const length = element.char ? (typeof contents === "string" ? utf8(contents) : undefined) : contents;
+                    if (element.char ? !length : !Array.isArray(length)) throw new TypeError("invalid terminated sequence contents");
+                    const count = length.length;
+                    const bytes = new Uint8Array(integer((count + 1) * element.size,"terminated sequence is too large"));
+                    for (let index = 0; index < count; index++) {
+                        const encoded = element.char ? [length[index]] : encodeValue(element,length[index]);
+                        if (encoded.every(byte => byte === 0)) throw new TypeError("sequence content contains a terminator");
+                        bytes.set(encoded,index * element.size);
+                    }
+                    writeBytes(base,bytes);
+                    const previousBytes = previous.length + element.size;
+                    return bytes.length > previousBytes ?
+                        {writtenBytes:bytes.length, previousBytes, warning:"write exceeded the previous sequence extent"} :
+                        {writtenBytes:bytes.length, previousBytes};
+                };
+            }
+        }
         const arrayIndex = key => typeof key === "string" && /^(?:0|[1-9][0-9]*)$/.test(key);
         const proxy = new Proxy(object,{
             get(object,key) {
@@ -1019,7 +1316,8 @@
         if (dest.type !== src.type && (expected.kind !== actual.kind || expected.kind !== "scalar" || expected.scalar !== actual.scalar)) {
             throw new TypeError("incompatible C types");
         }
-        if (target.$writeBytes && source.$readBytes) target.$writeBytes(source.$readBytes());
+        if (expected.kind === "scalar" && expected.littleEndian !== actual.littleEndian) target.$write(source.$read());
+        else if (target.$writeBytes && source.$readBytes) target.$writeBytes(source.$readBytes());
         else if (target.$write && source.$read) target.$write(source.$read());
         else throw new TypeError("value storage is not assignable");
     }
@@ -1091,14 +1389,24 @@
                 break;
             case "aggregate": {
                 const fields = Object.create(null);
+                const declarations = [];
+                const insert = (name, type, offset) => {
+                    if (Object.hasOwn(fields,name)) throw new TypeError("duplicate DWARF member " + name);
+                    fields[name] = {type,offset};
+                };
                 for (const {name,offset,ty,bit} of info.fields) {
                     const member = node(ty);
-                    if (bit) {
-                        const underlying = typeInfo(member);
-                        fields[name] = {offset,type:descriptor({kind:"bitfield",scalar:underlying.scalar,bit})};
-                    } else fields[name] = {offset,type:member};
+                    const underlying = typeInfo(member);
+                    const type = bit ? descriptor({kind:"bitfield",scalar:underlying.scalar,bit}) : member;
+                    declarations.push({name,offset,type});
+                    if (name != null) insert(name,type,offset);
+                    else if (underlying.fields) {
+                        for (const [child,field] of Object.entries(underlying.fields)) {
+                            insert(child,field.type,offset + field.offset);
+                        }
+                    }
                 }
-                type = descriptor({kind:info.union ? "union" : "struct",size:info.size,align:info.align,fields});
+                type = descriptor({kind:info.union ? "union" : "struct",size:info.size,align:info.align,fields,declarations});
                 break;
             }
             case "function":

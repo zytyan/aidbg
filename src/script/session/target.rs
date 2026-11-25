@@ -71,6 +71,7 @@ pub(super) struct Live {
     exit_reported: bool,
     pub(super) stdio: Option<super::process_io::ProcessIo>,
     pub paused: BTreeSet<i32>,
+    initial_attach: BTreeSet<i32>,
     pub callbacks: BTreeSet<i32>,
     stop_sequences: BTreeMap<i32, BTreeSet<u64>>,
     points: BTreeMap<u32, Point>,
@@ -86,6 +87,7 @@ pub(super) struct Live {
     suppress: BTreeSet<i32>,
     last_software_tid: i32,
     linked: Vec<(std::ops::Range<u64>, Vec<Value>)>,
+    dwarf: Vec<super::dwarf::AttachedDwarf>,
     pub(super) scratch: Option<super::inferior::Scratch>,
 }
 
@@ -165,6 +167,7 @@ impl Live {
             exit_reported: false,
             stdio: None,
             paused: BTreeSet::new(),
+            initial_attach: BTreeSet::new(),
             callbacks: BTreeSet::new(),
             stop_sequences: BTreeMap::new(),
             points: BTreeMap::new(),
@@ -180,6 +183,7 @@ impl Live {
             suppress: BTreeSet::new(),
             last_software_tid: 0,
             linked: Vec::new(),
+            dwarf: Vec::new(),
             scratch: None,
         }
     }
@@ -203,6 +207,7 @@ impl Live {
         trace.freeze(Instant::now() + DEADLINE)?;
         let mut live = Self::new(pid, root, start, trace, false);
         live.paused.extend(live.trace.threads.keys().copied());
+        live.initial_attach.clone_from(&live.paused);
         Ok(live)
     }
 
@@ -300,6 +305,36 @@ impl Live {
         Ok(())
     }
 
+    pub(super) fn paused_stops(&self) -> Vec<Value> {
+        self.paused
+            .union(&self.callbacks)
+            .map(|tid| {
+                let mut signal_name = None;
+                let reason = match self.trace.threads.get(tid).and_then(|thread| thread.stop) {
+                    Some(Stop::ExecBoundary) => "exec",
+                    Some(Stop::Syscall) => "syscall",
+                    Some(Stop::Breakpoint { .. } | Stop::Software { .. }) => "breakpoint",
+                    Some(Stop::Step) => "step",
+                    Some(Stop::Delivery(signal) | Stop::Group(signal)) => {
+                        signal_name = Some(signal.to_string());
+                        "signal"
+                    }
+                    Some(Stop::UnnamedDelivery(number)) => {
+                        signal_name = Some(format!("SIG{number}"));
+                        "signal"
+                    }
+                    _ if self.initial_attach.contains(tid) => "attach",
+                    _ => "pause",
+                };
+                let mut row = json!({"tid":tid,"reason":reason});
+                if let Some(name) = signal_name {
+                    row["signalName"] = json!(name);
+                }
+                row
+            })
+            .collect()
+    }
+
     pub(super) fn with_stopped<T>(
         &mut self,
         tid: i32,
@@ -370,7 +405,7 @@ impl Live {
         tid.map_or_else(|| self.tids(), |tid| vec![tid])
     }
 
-    fn snapshot(&mut self, tid: Option<i32>) -> Result<Value> {
+    fn snapshot(&mut self, tid: Option<i32>, context: bool) -> Result<Value> {
         let collect = |live: &mut Self| -> Result<_> {
             live.trace.rewind_software_stops()?;
             let mut threads = Vec::new();
@@ -381,15 +416,53 @@ impl Live {
                 threads
                     .push(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}));
             }
-            Ok(
-                json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":live.mappings()?,
-                "consistency":if tid.is_some() { "thread" } else { "all-stopped" }}),
-            )
+            let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":live.mappings()?,
+                "consistency":if tid.is_some() { "thread" } else { "all-stopped" }});
+            if context {
+                snapshot["context"] = live.process_context();
+            }
+            Ok(snapshot)
         };
         match tid {
             Some(tid) => self.with_stopped(tid, collect),
             None => self.with_frozen(collect),
         }
+    }
+
+    fn process_context(&self) -> Value {
+        let mut context = serde_json::Map::new();
+        if let Ok(status) = fs::read_to_string(self.root.join("status")) {
+            for (key, value) in status.lines().filter_map(|line| line.split_once(':')) {
+                match key {
+                    "State" => {
+                        context.insert(key.into(), json!(value.trim()));
+                    }
+                    "TracerPid" | "Threads" => {
+                        if let Ok(number) = value.trim().parse::<u32>() {
+                            context.insert(key.into(), json!(number));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for key in ["syscall", "wchan"] {
+            if let Ok(value) = fs::read_to_string(self.root.join(key)) {
+                context.insert(key.into(), json!(value.trim()));
+            }
+        }
+        if let Ok(entries) = fs::read_dir(self.root.join("fd")) {
+            let fd: BTreeMap<_, _> = entries
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let number = entry.file_name().to_str()?.parse::<u32>().ok()?;
+                    let target = fs::read_link(entry.path()).ok()?;
+                    Some((number, target.to_string_lossy().into_owned()))
+                })
+                .collect();
+            context.insert("fd".into(), json!(fd));
+        }
+        Value::Object(context)
     }
 
     fn mappings(&self) -> Result<Value> {
@@ -427,9 +500,18 @@ impl Live {
                 let values = self
                     .frame_values(registers, deadline)
                     .unwrap_or(Value::Null);
+                let source = self
+                    .attached_source(registers.get(regs::PC)?)
+                    .ok()
+                    .flatten();
+                let (file, line) = source.map_or_else(
+                    || (frame["file"].clone(), frame["line"].clone()),
+                    |source| (json!(source.file), json!(source.line)),
+                );
                 Ok(json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
                     "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
-                    "file":frame["file"],"line":frame["line"],
+                    "file":file,"line":line,"unwindMethod":frame["method"],
+                    "missingDebugSections":frame["missing_debug_sections"],
                     "locals":values["locals"],"parameters":values["parameters"]}))
             })
             .collect()
@@ -439,8 +521,40 @@ impl Live {
         if Instant::now() >= deadline {
             return Err(error("frame inspection deadline"));
         }
-        let (dwarf, frame) = symbols::inspect::stopped_dwarf(&self.root, &self.trace, registers)?;
+        let original = symbols::inspect::stopped_dwarf(&self.root, &self.trace, registers);
+        let pc = registers.get(regs::PC)?;
+        for attached in self.dwarf.iter().rev() {
+            if let Some(link) = attached.link_address(pc)
+                && attached.uniform_bias().is_some()
+            {
+                let frame = crate::unwind::OfflineFrame {
+                    regs: registers,
+                    pc,
+                    link: Some(link),
+                    lookup_pc: pc,
+                    cfa: original.as_ref().ok().and_then(|(_, frame)| frame.cfa),
+                };
+                let values = attached
+                    .image
+                    .frame_values(&self.trace, &frame, 64, deadline);
+                if values.is_ok() {
+                    return values;
+                }
+            }
+        }
+        let (dwarf, frame) = original?;
         dwarf.frame_values(&self.trace, &frame, 64, deadline)
+    }
+
+    fn attached_source(&self, address: u64) -> Result<Option<symbols::Line>> {
+        for attached in self.dwarf.iter().rev() {
+            if let Some(link) = attached.link_address(address)
+                && let Some(source) = attached.image.line(link)?
+            {
+                return Ok(Some(source));
+            }
+        }
+        Ok(None)
     }
 
     fn evaluate(&self, tid: i32, expression: String) -> Result<Value> {
@@ -538,6 +652,7 @@ impl Live {
     }
 
     fn resume(&mut self, tid: i32) -> Result<()> {
+        self.initial_attach.remove(&tid);
         let Some(thread) = self.trace.threads.get(&tid) else {
             return Err(error("thread no longer exists"));
         };
@@ -617,6 +732,7 @@ impl Live {
                 self.resume(tid)?;
             }
             self.paused.remove(&tid);
+            self.initial_attach.remove(&tid);
         }
         Ok(())
     }
@@ -800,6 +916,7 @@ impl Live {
                 let mut child = Self::new(pid, root, start, trace, false);
                 child.paused.insert(pid);
                 child.stdio = self.stdio.take();
+                child.dwarf = std::mem::take(&mut self.dwarf);
                 if let Some(catch) = self.syscall_catches.get(&None).copied() {
                     child.syscall_catches.insert(None, catch);
                     child.trace.syscall_all = true;
@@ -833,6 +950,7 @@ impl Live {
             self.watch_values.clear();
             self.branch_record.clear();
             self.linked.clear();
+            self.dwarf.clear();
             self.scratch = None;
             self.paused
                 .retain(|tid| self.trace.threads.contains_key(tid));
@@ -903,6 +1021,13 @@ impl Live {
             let Some(stop) = self.trace.threads.get(&tid).and_then(|thread| thread.stop) else {
                 continue;
             };
+            if matches!(stop, Stop::Delivery(Signal::SIGCHLD))
+                && !signals.contains(&(Signal::SIGCHLD as i32))
+                && !self.paused.contains(&tid)
+            {
+                self.resume(tid)?;
+                continue;
+            }
             if matches!(stop, Stop::Software { address, .. } if Some(address) == self.loader_hook) {
                 if self.loader_rendezvous().is_none_or(|(_, state)| state == 0) {
                     self.with_frozen(|live| live.refresh_pending_points())?;
@@ -1359,9 +1484,9 @@ impl Target {
         }
     }
 
-    pub fn snapshot(&mut self, tid: Option<i32>) -> Result<Value> {
+    pub fn snapshot(&mut self, tid: Option<i32>, context: bool) -> Result<Value> {
         match self {
-            Self::Live(live) => live.snapshot(tid),
+            Self::Live(live) => live.snapshot(tid, context),
             Self::Core(core) => {
                 let tids: Vec<_> = match tid {
                     Some(tid) => vec![tid],
@@ -1476,6 +1601,9 @@ impl Target {
         let resolved = match self {
             Self::Live(live) => {
                 live.verify()?;
+                if let Some(source) = live.attached_source(address)? {
+                    return Ok(json!({"file":source.file,"line":source.line}));
+                }
                 serde_json::to_value(symbols::resolve(live.pid, address, &[])?)?
             }
             Self::Core(core) => core.resolve(address)?,
@@ -1609,7 +1737,10 @@ impl Target {
                 Self::Live(live) => live.mappings(),
                 Self::Core(core) => Ok(core.session_mappings()),
             },
-            "snapshot" => self.snapshot(args["tid"].as_i64().map(i32::try_from).transpose()?),
+            "snapshot" => self.snapshot(
+                args["tid"].as_i64().map(i32::try_from).transpose()?,
+                args["context"] == true,
+            ),
             "read" => Ok(json!(self.read(
                 parse_address(&args["address"])?,
                 number(&args, "length")? as usize
@@ -1722,6 +1853,18 @@ impl Target {
                 let graph = match self {
                     Self::Live(live) => live.with_stopped(tid, |live| {
                         let registers = regs::read(tid)?.stack;
+                        let pc = registers.get(regs::PC)?;
+                        for attached in live.dwarf.iter().rev() {
+                            if let Some(link) = attached.link_address(pc)
+                                && let Some(graph) = attached.image.variable_type_graph(
+                                    name,
+                                    Some(link),
+                                    deadline,
+                                )?
+                            {
+                                return Ok(Some(graph));
+                            }
+                        }
                         let Ok((dwarf, frame)) =
                             symbols::inspect::stopped_dwarf(&live.root, &live.trace, registers)
                         else {
@@ -1838,6 +1981,18 @@ impl Target {
                 let address = match self {
                     Self::Live(live) => {
                         live.verify()?;
+                        let mut attached_addresses = BTreeSet::new();
+                        for attached in &live.dwarf {
+                            for link in attached.image.line_addresses(file, line)? {
+                                attached_addresses.extend(attached.runtime_address(link));
+                            }
+                        }
+                        if !attached_addresses.is_empty() {
+                            return Ok(json!(
+                                (attached_addresses.len() == 1)
+                                    .then(|| hex(*attached_addresses.first().unwrap()))
+                            ));
+                        }
                         match symbols::breakpoint_line(&live.root, file, line, None, None) {
                             Ok(site) => Some(site.address),
                             Err(err)
@@ -2068,6 +2223,56 @@ impl Target {
                 )?;
                 Ok(Value::Null)
             }
+            "attachDwarf" => {
+                let file = args["file"]
+                    .as_str()
+                    .filter(|file| !file.is_empty())
+                    .ok_or_else(|| error("expected DWARF file path"))?;
+                let path = fs::canonicalize(file)?;
+                let files = match self {
+                    Self::Live(live) => &live.dwarf,
+                    Self::Core(core) => &core.attached_dwarf,
+                };
+                if files.len() >= 8 && !files.iter().any(|dwarf| dwarf.image.path == path) {
+                    return Err(error("too many attached DWARF files"));
+                }
+                let (files, dwarf) = match self {
+                    Self::Live(live) => {
+                        live.verify()?;
+                        let dwarf = super::dwarf::AttachedDwarf::load(
+                            path.clone(),
+                            &args["position"],
+                            |object, path| {
+                                super::dwarf::infer_bias(
+                                    &live.root,
+                                    object,
+                                    path,
+                                    Instant::now() + DEADLINE,
+                                )
+                            },
+                        )?;
+                        (&mut live.dwarf, dwarf)
+                    }
+                    Self::Core(core) => {
+                        let dwarf = super::dwarf::AttachedDwarf::load(
+                            path.clone(),
+                            &args["position"],
+                            |object, path| core.infer_dwarf_bias(object, path),
+                        )?;
+                        (&mut core.attached_dwarf, dwarf)
+                    }
+                };
+                files.retain(|dwarf| dwarf.image.path != path);
+                files.push(dwarf);
+                Ok(Value::Null)
+            }
+            "fromDwarf" => Ok(json!(
+                self.resolve_dwarf_type(
+                    args["name"]
+                        .as_str()
+                        .ok_or_else(|| error("expected DWARF type name"))?,
+                )?
+            )),
             "types" => {
                 let offset = args["offset"].as_u64().unwrap_or(0) as usize;
                 let rows = self.type_graphs(
@@ -2077,7 +2282,7 @@ impl Target {
                     33,
                 )?;
                 Ok(
-                    json!({"items":rows.iter().take(32).map(|(name,graph)|json!({"name":name,"graph":graph})).collect::<Vec<_>>(),
+                    json!({"items":rows.iter().take(32).map(|(name,graph)|json!({"name":name,"module":graph.module,"size":graph.size(),"graph":graph})).collect::<Vec<_>>(),
                           "next_offset":(rows.len()>32).then_some(offset+32)}),
                 )
             }
@@ -2158,11 +2363,76 @@ impl Target {
             Self::Core(core) => core.session_types(pattern, exact, offset, limit, deadline),
             Self::Live(live) => {
                 live.verify()?;
-                symbols::inspect::type_graph::live_type_graphs(
-                    &live.root, pattern, exact, offset, limit, deadline,
-                )
+                let mut rows = Vec::new();
+                let mut skip = offset;
+                for attached in live.dwarf.iter().rev() {
+                    let (items, scanned) = attached.image.type_graphs(
+                        pattern,
+                        exact,
+                        skip,
+                        limit - rows.len(),
+                        deadline,
+                    )?;
+                    rows.extend(items);
+                    if rows.len() >= limit {
+                        return Ok(rows);
+                    }
+                    skip = skip.saturating_sub(scanned);
+                }
+                rows.extend(symbols::inspect::type_graph::live_type_graphs(
+                    &live.root,
+                    pattern,
+                    exact,
+                    skip,
+                    limit - rows.len(),
+                    deadline,
+                )?);
+                Ok(rows)
             }
         }
+    }
+
+    pub(super) fn resolve_dwarf_type(
+        &self,
+        name: &str,
+    ) -> Result<symbols::inspect::type_graph::Graph> {
+        let mut matches = self.type_graphs(name, true, 0, 5)?;
+        if matches.len() == 1 {
+            return Ok(matches.pop().unwrap().1);
+        }
+        let missing = matches.is_empty();
+        if missing {
+            let stem: String = name
+                .split_whitespace()
+                .last()
+                .unwrap_or_default()
+                .chars()
+                .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                .take(12)
+                .collect();
+            if !stem.is_empty() {
+                matches = self.type_graphs(&format!("*{stem}*"), false, 0, 5)?;
+            }
+        }
+        let candidates = matches
+            .iter()
+            .map(|(name, graph)| {
+                format!(
+                    "{name} ({}, size {:?})",
+                    graph.module.display(),
+                    graph.size()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let reason = if missing {
+            "DWARF type not found"
+        } else {
+            "ambiguous DWARF type"
+        };
+        Err(error(format!(
+            "{reason}: {name:?}. Candidates: [{candidates}]"
+        )))
     }
 }
 

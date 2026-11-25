@@ -130,15 +130,18 @@ impl Debugger for Service {
         .await
     }
     async fn snapshot(&self, request: Request<SessionSnapshotRequest>) -> Reply {
-        self.command(request, |args| Command::Snapshot(args.tid))
+        self.command(request, |args| Command::Snapshot(args.tid, args.context))
             .await
     }
     async fn ps(&self, request: Request<ProcessListRequest>) -> Reply {
-        self.command(request, |args| Command::Processes(args.threads))
-            .await
+        self.command(request, Command::Processes).await
     }
     async fn set_fork_policy(&self, request: Request<ForkPolicyRequest>) -> Reply {
         self.command(request, |args| Command::SetForkPolicy(args.mode))
+            .await
+    }
+    async fn syscall_table(&self, request: Request<SyscallTableRequest>) -> Reply {
+        self.command(request, |args| Command::SyscallTable(args.id, args.name))
             .await
     }
     async fn perf(&self, request: Request<SessionProfileRequest>) -> Reply {

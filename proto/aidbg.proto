@@ -15,6 +15,7 @@ service Debugger {
   rpc Perf (SessionProfileRequest) returns (ToolReply);
   rpc Ps (ProcessListRequest) returns (ToolReply);
   rpc SetForkPolicy (ForkPolicyRequest) returns (ToolReply);
+  rpc SyscallTable (SyscallTableRequest) returns (ToolReply);
 }
 
 message HeartbeatRequest {}
@@ -37,9 +38,22 @@ message InterruptInputRequest {
   string handler = 1;
   optional string msg = 2;
 }
-message SessionSnapshotRequest { optional int32 tid = 1; }
-message ProcessListRequest { bool threads = 1; }
+message SessionSnapshotRequest {
+  optional int32 tid = 1;
+  bool context = 2;
+}
+message ProcessListRequest {
+  bool threads = 1;
+  optional string pattern = 2;
+  optional uint32 limit = 3;
+  uint32 offset = 4;
+  repeated string fields = 5;
+}
 message ForkPolicyRequest { string mode = 1; }
+message SyscallTableRequest {
+  optional uint64 id = 1;
+  optional string name = 2;
+}
 message SessionProfileRequest {
   int32 pid = 1;
   bool hotspot = 2;
@@ -72,4 +86,5 @@ message ToolReply {
   uint32 pending_events = 11;
   bool event_queue_full = 12;
   bytes process_output_json = 13;
+  bytes paused_stops_json = 14;
 }

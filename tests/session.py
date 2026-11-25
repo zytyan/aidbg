@@ -11,7 +11,7 @@ import tempfile
 import time
 
 TOOLS = {"connect", "run", "attach", "script_run", "core_open", "send_input", "interrupt_input",
-         "snapshot", "perf", "ps", "set_fork_policy"}
+         "snapshot", "perf", "ps", "set_fork_policy", "docs", "syscall_table"}
 
 
 class Client:
@@ -23,6 +23,8 @@ class Client:
         self.rpc("initialize", protocolVersion="2024-11-05", capabilities={},
                  clientInfo={"name": "aidbg integration test", "version": "1"})
         self.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        summary = self.rpc("tools/call", name="docs", arguments={})["structuredContent"]
+        assert "interface TypeSystem" in summary["declarations"], summary
         disconnected = self.rpc("tools/call", name="ps", arguments={})
         assert disconnected["isError"] and "connect" in disconnected["structuredContent"]["error"], disconnected
         connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token})
@@ -46,7 +48,7 @@ class Client:
         assert reply.get("id") == self.counter and "error" not in reply, reply
         return reply["result"]
 
-    def tool(self, name, *, error=False, **arguments):
+    def tool(self, name, /, *, error=False, **arguments):
         result = self.rpc("tools/call", name=name, arguments=arguments)["structuredContent"]
         assert {"paused_threads", "waiting_inputs", "running_scripts", "output"} <= result.keys(), result
         if not error:
@@ -168,12 +170,17 @@ def validate_session_extensions(client, fixture, owned):
     client.tool("set_fork_policy", mode="parent")
     pid = client.tool("run", path=fixture, arg=["child"])["result"]["pid"]
     owned.add(pid)
-    table = client.tool("ps")["result"]
-    assert table.startswith("PID PPID THREADS ARGS\n")
-    assert any(row.startswith(f"{pid} ") and row.split(maxsplit=3)[2] == "1" for row in table.splitlines())
-    thread_table = client.tool("ps", threads=True)["result"]
-    assert thread_table.startswith("PID PPID TID ARGS\n")
-    assert any(row.startswith(f"{pid} ") and row.split(maxsplit=3)[2] == str(pid) for row in thread_table.splitlines())
+    table = client.tool("ps")["result"]["items"]
+    assert any(row["pid"] == pid and row["threads"] == 1 and "args" not in row for row in table)
+    thread_table = client.tool("ps", threads=True, fields=["pid", "tid", "args"])["result"]["items"]
+    assert any(row["pid"] == row["tid"] == pid and row["args"][-1] == "child" for row in thread_table)
+    filtered = client.tool("ps", pattern=str(pid), limit=1)["result"]
+    assert len(filtered["items"]) == 1
+    context = client.tool("snapshot", tid=pid, context=True)["result"]["context"]
+    assert context["TracerPid"] > 0 and context["Threads"] == 1 and "0" in context["fd"]
+    table = client.tool("syscall_table", name="mmap")["result"]
+    assert table["syscalls"][0]["id"] == {"x86_64": 9, "aarch64": 222}[table["architecture"]]
+    assert [p["name"] for p in table["syscalls"][0]["parameters"]] == ["addr", "length", "prot", "flags", "fd", "offset"]
     reply = client.script("""
         dbg.catchSyscall(dbg.pid, "both", hit => hit.pause());
         const entry = await dbg.continueForStop(dbg.pid, {timeoutMs: 2500});
@@ -194,6 +201,157 @@ def validate_session_extensions(client, fixture, owned):
         assert not any(row["value"]["kind"] == "script_error" for row in final["output"]), final
         output += logs(final)
     assert output == [["entry", "exit", True, True], [True, True]], (reply, output)
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+
+def validate_spec03(client, fixture, owned):
+    pid = client.tool("run", path=fixture, arg=["memory"])["result"]["pid"]
+    owned.add(pid)
+    reply = client.script("""
+        const Type = m.struct({
+            ack: m.u32().bitfield(1), req: m.u32().bitfield(4),
+            ...m.anonymous(m.u32().bitfield(3)),
+            unused: m.opaque(3),
+            ...m.anonymous(m.union({ipv4:m.u32(),ipv6:m.array(m.u8(),16)})),
+            type: m.u32().enum({OK:1,ERR:2}),
+            ptr: m.pointer(m.void()).align(16),
+        });
+        const packed = m.struct({kind:m.u8(),length:m.u32().be().align(16)}).pack(1);
+        const zero = m.struct({a:m.char(),field:m.u32().bitfield(30),...m.anonymous(m.u32().bitfield(0)),b:m.char()}).pack(1);
+        const unnamed = m.struct({a:m.char(),...m.anonymous(m.u32().bitfield(31)),b:m.char()});
+        const union = m.union({...m.anonymous(m.u32().bitfield(0)),a:m.char()});
+        const actual = [Type.$size, Type.$align, Type.offsetOf("unused"), Type.offsetOf("ipv4"),
+            Type.offsetOf("type"), Type.offsetOf("ptr"), packed.$size, packed.$align, packed.offsetOf("length"),
+            zero.$size, zero.$align, zero.offsetOf("b"), unnamed.$size, unnamed.$align, unnamed.offsetOf("b"),
+            union.$size, union.$align];
+        const abi = m.array(m.u32(), actual.length).at((await dbg.getSymbol("spec03_layout"))!.address);
+        for (let i = 0; i < actual.length; i++) if (abi[i].$read() !== actual[i]) throw new Error(Type.layout());
+        if (Type.offsetOf("ipv6[3]") !== 7 || Type.layout().includes("$anonymous")) throw new Error("layout");
+        dbg.softwareBreakpoint("fixture_stop");
+        const stop = await dbg.continueForStop();
+        if (stop.kind !== "breakpoint" || stop.reason !== "breakpoint") throw new Error("stop reason");
+        const address = (await dbg.getSymbol("spec03_packet"))!.address;
+        const value = Type.at(address);
+        if (value.ack.$read() !== 1 || value.req.$read() !== 13 || value.ipv4.$read() !== 0x12345678) throw new Error("read bits");
+        const original = Type.$readBytes(address);
+        value.req.$write(2);
+        value.type.$write("ERR");
+        if (Type.$readBytes(address)[0] !== 5 || value.type.$read() !== 2) throw new Error("write bits");
+        Type.$writeBytes(address,original);
+        const string = m.cStr().at((await dbg.getSymbol("spec03_string"))!.address);
+        if (string.$deref() !== "old") throw new Error("read C string");
+        if (!string.$writeContents("中文").warning || string.$deref() !== "中文") throw new Error("long C string write");
+        const edge = m.cStr().at((await dbg.getSymbol("spec03_edge"))!.address);
+        let failed = false;
+        try { edge.$writeContents("1234"); } catch { failed = true; }
+        if (!failed) throw new Error("write into protected page");
+        if (!m.findTypes("Spec03Packet").some(row => row.size === Type.$size && row.module)) throw new Error("type discovery");
+        console.log(actual);
+    """)
+    output = logs(reply)
+    if reply["running_scripts"]:
+        final = await_state(client, lambda row: not row["running_scripts"])
+        assert not any(row["value"]["kind"] == "script_error" for row in final["output"]), final
+        output += logs(final)
+    assert len(output) == 1 and output[0][0][:9] == [48, 16, 1, 4, 20, 32, 5, 1, 1], (reply, output)
+    client.script("await dbg.kill();")
+    owned.remove(pid)
+
+    pid = client.tool("run", path=fixture, arg=["output"])["result"]["pid"]
+    owned.add(pid)
+    reply = client.script("""
+        const pid = dbg.pid;
+        if (!(await dbg.waitOutput(pid, 0)).timedOut) throw new Error("output timeout");
+        dbg.resumeThread(pid);
+        let stdout = "", stderr = "";
+        for (;;) {
+            const chunk = await dbg.waitOutput(pid, 2000);
+            if (chunk.timedOut) throw new Error("output timeout");
+            stdout += chunk.stdout;
+            stderr += chunk.stderr;
+            if (chunk.exitCode !== undefined) {
+                console.log(stdout, stderr, chunk.exitCode);
+                break;
+            }
+        }
+    """)
+    output = logs(reply)
+    if reply["running_scripts"]:
+        final = await_state(client, lambda row: not row["running_scripts"])
+        assert not any(row["value"]["kind"] == "script_error" for row in final["output"]), final
+        output += logs(final)
+    assert output == [["stdout tail\n", "stderr tail\n", 39]], (reply, output)
+    owned.remove(pid)
+
+    previous = client.tool("run", path=fixture, arg=["output"])["result"]["pid"]
+    owned.add(previous)
+    waiter = client.script("""
+        dbg.resumeAll();
+        const exit = await dbg.waitExit(2000);
+        if (exit.kind !== "exit" || exit.reason !== "code" || exit.code !== 39) throw new Error("exit");
+    """)
+    if waiter["running_scripts"]:
+        waiter = await_state(client, lambda row: not row["running_scripts"])
+    assert not any(row["value"]["kind"] == "script_error" for row in waiter["output"]), waiter
+    owned.remove(previous)
+    switched = client.tool("run", path=fixture, arg=["child"])["result"]
+    owned.add(switched["pid"])
+    assert switched["released"] == [previous], switched
+    archived = client.script(f"""
+        const result = await dbg.waitOutput({previous}, 0);
+        console.log(result.released, result.stdout, result.stderr, result.exitCode);
+    """)
+    assert logs(archived) == [[True, "stdout tail\n", "stderr tail\n", 39]], archived
+    client.script("await dbg.kill();")
+    owned.remove(switched["pid"])
+
+
+def validate_stripped_cfi(client, binary, debug_image, owned):
+    pid = client.tool("run", path=binary, arg=["child"])["result"]["pid"]
+    owned.add(pid)
+    result = client.script("""
+        dbg.softwareBreakpoint("fixture_stop");
+        const stop = await dbg.continueForStop();
+        if (stop.kind !== "breakpoint") throw new Error(stop.kind);
+        const frames = dbg.thread(stop.tid).backtrace(4);
+        console.log(frames.length >= 2, frames[1].unwindMethod,
+                    frames[0].missingDebugSections?.includes(".symtab"),
+                    frames[0].missingDebugSections?.includes(".debug_info"));
+    """)
+    output = logs(result)
+    if result["running_scripts"]:
+        final = await_state(client, lambda row: not row["running_scripts"])
+        assert not any(row["value"]["kind"] == "script_error" for row in final["output"]), final
+        output += logs(final)
+    assert output == [[True, "cfi", True, True]], (result, output)
+    attached = client.script(f"""
+        const address = (await dbg.getSymbol("fixture_stop"))!.address;
+        dbg.attachDwarf({json.dumps(debug_image)});
+        console.log(dbg.addrToLine(address)?.file.endsWith("session_fixture.c"),
+            m.findTypes("Spec03Packet").some(row => row.module.endsWith("manual.debug")));
+    """)
+    assert logs(attached) == [[True, True]], attached
+    dwarf = client.script("""
+        const Packet = m.fromDwarf("struct Spec03Packet");
+        const packet = Packet.at((await dbg.getSymbol("spec03_packet"))!.address);
+        console.log(Packet.$size, Packet.offsetOf("ipv4"), packet.ipv4.$read());
+    """)
+    assert logs(dwarf) == [[48, 4, 0x12345678]], dwarf
+    symbols = subprocess.check_output(["nm", "-D", binary], text=True).splitlines()
+    link_symbol = next(int(line.split()[0], 16) for line in symbols if line.endswith(" fixture_stop"))
+    sections = subprocess.check_output(["readelf", "-WS", binary], text=True).splitlines()
+    text_section = next(line.split() for line in sections if ".text" in line.split())
+    link_text = int(text_section[text_section.index(".text") + 2], 16)
+    relocated = client.script(f"""
+        const address = (await dbg.getSymbol("fixture_stop"))!.address;
+        const bias = address - {link_symbol}n;
+        dbg.attachDwarf({json.dumps(debug_image)}, bias);
+        const byBias = dbg.addrToLine(address)?.line;
+        dbg.attachDwarf({json.dumps(debug_image)}, {{".text": bias + {link_text}n}});
+        console.log(byBias !== undefined && dbg.addrToLine(address)?.line === byBias);
+    """)
+    assert logs(relocated) == [[True]], relocated
     client.script("await dbg.kill();")
     owned.remove(pid)
 
@@ -383,11 +541,11 @@ def validate_event_queue(client, fixture, owned):
     assert logs(second)[0][0][0][1] > event["sequence"], second
     answer = client.tool("send_input", handler=handler["handler"], data="release")
     assert logs(answer) == [[event["tid"],"release"]] and len(answer["paused_threads"]) == 2, answer
-    table = client.tool("ps")["result"]
-    rows = [row for row in table.splitlines() if row.startswith(f"{pid} ")]
-    assert len(rows) == 1 and rows[0].split(maxsplit=3)[2] == "3", rows
-    thread_table = client.tool("ps", threads=True)["result"]
-    tids = {int(row.split(maxsplit=3)[2]) for row in thread_table.splitlines() if row.startswith(f"{pid} ")}
+    table = client.tool("ps")["result"]["items"]
+    rows = [row for row in table if row["pid"] == pid]
+    assert len(rows) == 1 and rows[0]["threads"] == 3, rows
+    thread_table = client.tool("ps", threads=True)["result"]["items"]
+    tids = {row["tid"] for row in thread_table if row["pid"] == pid}
     assert tids == {pid, event["tid"], logs(second)[0][0][0][0]}, tids
     resumed = client.script('dbg.resumeAll();')
     chunks = [resumed]
@@ -707,6 +865,8 @@ def main():
     parser.add_argument("--lease", action="store_true")
     parser.add_argument("--cases", type=Path)
     parser.add_argument("--library")
+    parser.add_argument("--stripped")
+    parser.add_argument("--debug-image")
     args = parser.parse_args()
     client_exe, server_exe = map(os.path.abspath, (args.client, args.server))
     fixtures = list(map(os.path.abspath, args.fixtures))
@@ -727,6 +887,9 @@ def main():
                 client = Client(client_exe, socket, token)
                 validate_types_and_input(client)
                 validate_session_extensions(client, fixtures[0], owned)
+                validate_spec03(client, fixtures[0], owned)
+                if args.stripped and args.debug_image:
+                    validate_stripped_cfi(client, os.path.abspath(args.stripped), os.path.abspath(args.debug_image), owned)
                 validate_event_queue(client, fixtures[0], owned)
                 validate_next_hit(client, fixtures[0], owned)
                 validate_fault_and_kill(client, fixtures[0], owned)

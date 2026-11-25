@@ -1,3 +1,4 @@
+pub(super) mod dwarf;
 mod events;
 mod files;
 mod inferior;
@@ -38,14 +39,23 @@ const MAX_PENDING: usize = 64;
 const SCRIPT_SLICE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(5);
 
+fn append_exit_status(output: &mut Value, exit: Option<crate::trace::LaunchExit>) {
+    match exit {
+        Some(crate::trace::LaunchExit::Code(code)) => output["exitCode"] = json!(code),
+        Some(crate::trace::LaunchExit::Signal(signal)) => output["exitSignal"] = json!(signal),
+        None => {}
+    }
+}
+
 pub enum Command {
     Run(RunProcessRequest),
     Attach(i32),
     Core(OpenCoreRequest),
     Script(String),
     Input(String, std::result::Result<String, String>),
-    Snapshot(Option<i32>),
-    Processes(bool),
+    Snapshot(Option<i32>, bool),
+    Processes(crate::rpc::ProcessListRequest),
+    SyscallTable(Option<u64>, Option<String>),
     SetForkPolicy(String),
     Result(Result<Value>),
 }
@@ -108,6 +118,7 @@ struct Waiting {
 
 struct State {
     target: Option<Target>,
+    released_output: VecDeque<(i32, process_io::ProcessIo, Option<crate::trace::LaunchExit>)>,
     follow_fork: bool,
     generation: u64,
     state_dir: PathBuf,
@@ -129,8 +140,24 @@ struct State {
 }
 
 impl State {
-    fn replace(&mut self, target: Option<Target>) {
-        self.target = target;
+    fn replace(&mut self, target: Option<Target>) -> Vec<i32> {
+        let mut released = Vec::new();
+        if let Some(Target::Live(mut previous)) = std::mem::replace(&mut self.target, target) {
+            released.push(previous.pid);
+            if let Some(stdio) = &mut previous.stdio {
+                let _ = stdio.drain();
+                self.released_output
+                    .retain(|(pid, _, _)| *pid != previous.pid);
+                self.released_output.push_back((
+                    previous.pid,
+                    stdio.archive_output(),
+                    previous.trace.exit,
+                ));
+                if self.released_output.len() > 8 {
+                    self.released_output.pop_front();
+                }
+            }
+        }
         if let Some(Target::Live(live)) = &mut self.target {
             live.trace.follow_fork = self.follow_fork;
         }
@@ -142,6 +169,7 @@ impl State {
         self.timers.clear();
         self.source_maps.clear();
         self.target_error = None;
+        released
     }
 
     fn log(&mut self, script_id: u64, value: Value) {
@@ -298,6 +326,41 @@ impl State {
                 Ok(Value::Null)
             }
             "eventWait" => self.register_event(args),
+            "waitOutput" => {
+                let tid = args["tid"]
+                    .as_i64()
+                    .and_then(|tid| i32::try_from(tid).ok())
+                    .filter(|&tid| tid > 0)
+                    .ok_or_else(|| error("invalid thread ID"))?;
+                let (stdio, exit, released, ended) = match self.target.as_mut() {
+                    Some(Target::Live(live))
+                        if live.pid == tid || live.trace.threads.contains_key(&tid) =>
+                    {
+                        (
+                            live.stdio
+                                .as_mut()
+                                .ok_or_else(|| error("target has no captured output"))?,
+                            live.trace.exit,
+                            false,
+                            live.trace.threads.is_empty(),
+                        )
+                    }
+                    _ => self
+                        .released_output
+                        .iter_mut()
+                        .find(|(pid, _, _)| *pid == tid)
+                        .map(|(_, stdio, exit)| (stdio, *exit, true, exit.is_some()))
+                        .ok_or_else(|| error("target has no captured output"))?,
+                };
+                stdio.drain()?;
+                let (mut result, drained) = stdio.wait_output();
+                result["released"] = json!(released);
+                result["ended"] = json!(ended && drained);
+                if drained {
+                    append_exit_status(&mut result, exit);
+                }
+                Ok(result)
+            }
             "ask" => {
                 if self.waiting.len() >= MAX_PENDING {
                     return Err(error("too many waiting input handlers"));
@@ -442,6 +505,10 @@ impl State {
             error,
             paused_threads: match &self.target {
                 Some(Target::Live(live)) => live.paused.union(&live.callbacks).copied().collect(),
+                _ => Vec::new(),
+            },
+            paused_stops_json: match &self.target {
+                Some(Target::Live(live)) => json!(live.paused_stops()).to_string().into_bytes(),
                 _ => Vec::new(),
             },
             waiting_inputs: self
@@ -594,6 +661,7 @@ fn run(
     let context = Context::full(&runtime)?;
     let state = Rc::new(RefCell::new(State {
         target: None,
+        released_output: VecDeque::new(),
         follow_fork: false,
         generation: 0,
         state_dir,
@@ -669,8 +737,8 @@ fn run(
                         let scratchpad = target.prepare_scratch(None)
                             .or_else(|_| target.prepare_scratch(None));
                         let pid = target.pid;
-                        state.borrow_mut().replace(Some(Target::Live(target)));
-                        Ok(json!({"pid":pid,"state":"paused","scratchpad":scratchpad.is_ok(),
+                        let released = state.borrow_mut().replace(Some(Target::Live(target)));
+                        Ok(json!({"pid":pid,"state":"paused","reason":"exec","released":released,"scratchpad":scratchpad.is_ok(),
                             "scratchpad_error":scratchpad.err().map(|err|err.to_string())}))
                     }
                     Command::Attach(pid) => {
@@ -678,20 +746,20 @@ fn run(
                         if !existing {
                             let mut target = Live::attach(pid)?;
                             let scratchpad = target.prepare_scratch(None);
-                            state.borrow_mut().replace(Some(Target::Live(target)));
-                            return Ok(json!({"pid":pid,"state":"attached","scratchpad":scratchpad.is_ok(),
+                            let released = state.borrow_mut().replace(Some(Target::Live(target)));
+                            return Ok(json!({"pid":pid,"state":"attached","reason":"attach","released":released,"scratchpad":scratchpad.is_ok(),
                                 "scratchpad_error":scratchpad.err().map(|err|err.to_string())}));
                         }
-                        Ok(json!({"pid":pid,"state":"attached"}))
+                        Ok(json!({"pid":pid,"state":"attached","released":[]}))
                     }
                     Command::Core(args) => {
-                        let (target, info) = Target::open(args)?;
-                        state.borrow_mut().replace(Some(target));
+                        let (target, mut info) = Target::open(args)?;
+                        info["released"] = json!(state.borrow_mut().replace(Some(target)));
                         Ok(info)
                     }
-                    Command::Snapshot(tid) => {
+                    Command::Snapshot(tid, context) => {
                         let mut state = state.borrow_mut();
-                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid)
+                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid, context)
                     }
                     Command::Input(handler, result) => {
                         if state.borrow_mut().waiting.remove(&handler).is_none() { return Err(error("input handler is not waiting")); }
@@ -706,11 +774,7 @@ fn run(
                         let (diagnostics, compiled) = compiler.session_compile(&src,&exports.declarations(),id,|name| {
                             let state = state.borrow();
                             let target = state.target.as_ref().ok_or_else(no_target)?;
-                            let mut rows = target.type_graphs(name,true,0,2)?;
-                            if rows.len() != 1 {
-                                return Err(error(format!("expected one DWARF type named {name:?}, found {}",rows.len())));
-                            }
-                            Ok(rows.pop().unwrap().1)
+                            target.resolve_dwarf_type(name)
                         })?;
                         let Some((js,declarations,map)) = compiled else {
                             return Ok(json!({"script_id":id,"status":"check_failed","diagnostics":diagnostics}));
@@ -726,7 +790,8 @@ fn run(
                         pending.push(Pending { id, generation, module, promise, declarations });
                         Ok(json!({"script_id":id,"status":"accepted"}))
                     }
-                    Command::Processes(threads) => processes(threads),
+                    Command::Processes(args) => processes(args),
+                    Command::SyscallTable(id, name) => Ok(syscalls::query(id, name.as_deref())),
                     Command::SetForkPolicy(mode) => state.borrow_mut().operation("setForkPolicy", json!({"mode":mode})),
                     Command::Result(result) => result,
                 }
@@ -744,7 +809,9 @@ fn run(
                 let mut message = state.tool_reply(result, &pending);
                 let output_cursor = match state.target.as_ref() {
                     Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
-                        let (value,cursor) = stdio.mcp_output();
+                        let (mut value,cursor) = stdio.mcp_output();
+                        value["pid"] = json!(live.pid);
+                        append_exit_status(&mut value, live.trace.exit);
                         message.process_output_json = value.to_string().into_bytes();
                         cursor
                     }),
@@ -886,7 +953,7 @@ fn tick(
                     state.dispatches.clear();
                     state.reported_signals.clear();
                     let sequence = state.events.push(
-                        json!({"kind":"fork","parentPid":parent,"tid":tid,"paused":true}),
+                        json!({"kind":"fork","reason":"fork","parentPid":parent,"tid":tid,"paused":true}),
                         true,
                     );
                     if let Some(Target::Live(live)) = &mut state.target {
@@ -895,7 +962,7 @@ fn tick(
                 }
                 Event::Exec { tid, executable } => {
                     let sequence = state.events.push(
-                        json!({"kind":"exec","tid":tid,"executable":executable,"paused":true}),
+                        json!({"kind":"exec","reason":"exec","tid":tid,"executable":executable,"paused":true}),
                         true,
                     );
                     if let Some(Target::Live(live)) = &mut state.target {
@@ -909,7 +976,7 @@ fn tick(
                     watch,
                 } => {
                     let mut row = json!({"kind":if watch.is_some() {"watchpoint"} else {"breakpoint"},
-                        "tid":tid,"breakpointId":id,"address":crate::hex(address),"paused":true});
+                        "reason":"breakpoint","tid":tid,"breakpointId":id,"address":crate::hex(address),"paused":true});
                     if let Some(watch) = watch {
                         row["length"] = json!(watch.length);
                         row["before"] = json!(watch.before.map(crate::hex));
@@ -931,7 +998,7 @@ fn tick(
                 } => {
                     let name = nix::sys::signal::Signal::try_from(number)
                         .map_or_else(|_| format!("SIG{number}"), |s| s.to_string());
-                    let mut row = json!({"kind":"signal","tid":tid,"signalNumber":number,"signalName":name,
+                    let mut row = json!({"kind":"signal","reason":"signal","tid":tid,"signalNumber":number,"signalName":name,
                         "faultAddress":fault.map(crate::hex),"paused":true});
                     let sequence = state.events.push(row.clone(), !callback);
                     if !callback && let Some(Target::Live(live)) = &mut state.target {
@@ -948,7 +1015,7 @@ fn tick(
                     process,
                     result,
                 } => {
-                    let mut row = json!({"kind":"exit","tid":tid,"scope":if process {"process"} else {"thread"}});
+                    let mut row = json!({"kind":"exit","stopReason":"exit","tid":tid,"scope":if process {"process"} else {"thread"}});
                     match result {
                         Some(crate::trace::LaunchExit::Code(code)) => {
                             row["reason"] = json!("code");
@@ -1110,12 +1177,29 @@ fn exception_text<'js>(ctx: &Ctx<'js>, error: rquickjs::CaughtError<'js>) -> Str
     }
 }
 
-fn processes(threads: bool) -> Result<Value> {
-    use std::fmt::Write;
-
+fn processes(args: crate::rpc::ProcessListRequest) -> Result<Value> {
+    let fields = if args.fields.is_empty() {
+        vec![
+            "pid",
+            "ppid",
+            "name",
+            if args.threads { "tid" } else { "threads" },
+        ]
+    } else {
+        args.fields.iter().map(String::as_str).collect()
+    };
+    if let Some(field) = fields.iter().find(|&&field| {
+        !matches!(field, "pid" | "ppid" | "name" | "threads" | "tid" | "args")
+            || (field == "tid" && !args.threads)
+    }) {
+        return Err(error(format!("invalid process list field {field:?}")));
+    }
+    if args.limit == Some(0) {
+        return Err(error("process list limit must be positive"));
+    }
+    let pattern = args.pattern.as_deref().map(str::to_lowercase);
     let mut rows = Vec::new();
-    for entry in fs::read_dir("/proc")? {
-        let entry = entry?;
+    for entry in fs::read_dir("/proc")?.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
@@ -1126,50 +1210,76 @@ fn processes(threads: bool) -> Result<Value> {
         if procfs::is_kernel_thread(&path, &status) {
             continue;
         }
-        let ppid = status.field("PPid").unwrap_or("?").to_owned();
-        let count = status.field("Threads").unwrap_or("?").to_owned();
-        let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
-        let args = cmdline
-            .strip_suffix(&[0])
-            .unwrap_or(&cmdline)
-            .split(|&byte| byte == 0)
-            .map(|arg| String::from_utf8_lossy(arg).escape_debug().to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let args = if args.is_empty() {
-            format!("[{}]", status.name().unwrap_or_default().escape_debug())
+        let name = status.name().unwrap_or_default();
+        let command_line: Vec<_> = if fields.contains(&"args") || pattern.is_some() {
+            let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
+            cmdline
+                .strip_suffix(&[0])
+                .unwrap_or(&cmdline)
+                .split(|&byte| byte == 0)
+                .filter(|arg| !arg.is_empty() || !cmdline.is_empty())
+                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                .collect()
         } else {
-            args
+            Vec::new()
         };
-        let mut tids = Vec::new();
-        if threads {
+        if let Some(pattern) = &pattern
+            && !pid.to_string().contains(pattern)
+            && !name.to_lowercase().contains(pattern)
+            && !command_line.join(" ").to_lowercase().contains(pattern)
+        {
+            continue;
+        }
+        let ppid = status
+            .field("PPid")
+            .and_then(|value| value.parse::<i32>().ok());
+        let count = status
+            .field("Threads")
+            .and_then(|value| value.parse::<u32>().ok());
+        let mut row = serde_json::Map::new();
+        for field in &fields {
+            let value = match *field {
+                "pid" => json!(pid),
+                "ppid" => json!(ppid),
+                "name" => json!(name),
+                "threads" => json!(count),
+                "args" => json!(command_line),
+                _ => continue,
+            };
+            row.insert((*field).into(), value);
+        }
+        if args.threads {
             let Ok(tasks) = fs::read_dir(path.join("task")) else {
                 continue;
             };
-            tids.extend(
-                tasks
-                    .flatten()
-                    .filter_map(|task| task.file_name().to_str()?.parse::<i32>().ok()),
-            );
-            tids.sort_unstable();
-        }
-        rows.push((pid, ppid, count, args, tids));
-    }
-    rows.sort_by_key(|row| row.0);
-    let mut output = if threads {
-        "PID PPID TID ARGS\n"
-    } else {
-        "PID PPID THREADS ARGS\n"
-    }
-    .to_owned();
-    for (pid, ppid, count, args, tids) in rows {
-        if threads {
-            for tid in tids {
-                writeln!(output, "{pid} {ppid} {tid} {args}")?;
+            for task in tasks.flatten() {
+                let Some(tid) = task
+                    .file_name()
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                let mut thread = row.clone();
+                if fields.contains(&"tid") {
+                    thread.insert("tid".into(), json!(tid));
+                }
+                rows.push((pid, tid, thread));
             }
         } else {
-            writeln!(output, "{pid} {ppid} {count} {args}")?;
+            rows.push((pid, pid, row));
         }
     }
-    Ok(json!(output))
+    rows.sort_by_key(|(pid, tid, _)| (*pid, *tid));
+    let offset = args.offset as usize;
+    let limit = args.limit.map_or(usize::MAX, |limit| limit as usize);
+    let next = offset.saturating_add(limit);
+    let next_offset = (next < rows.len()).then_some(next);
+    let items: Vec<_> = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|(_, _, row)| row)
+        .collect();
+    Ok(json!({"items":items,"next_offset":next_offset}))
 }

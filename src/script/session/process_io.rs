@@ -41,7 +41,7 @@ pub(super) struct ProcessIo {
     stdin: Option<File>,
     readers: [Reader; 2],
     chunks: VecDeque<Chunk>,
-    cursors: [Cursor; 4],
+    cursors: [Cursor; 5],
     next: u64,
     size: usize,
 }
@@ -169,6 +169,20 @@ impl ProcessIo {
         self.stdin = None;
     }
 
+    pub(super) fn archive_output(&mut self) -> Self {
+        Self {
+            stdin: None,
+            readers: std::array::from_fn(|_| Reader {
+                file: None,
+                incomplete: Vec::new(),
+            }),
+            chunks: std::mem::take(&mut self.chunks),
+            cursors: std::mem::take(&mut self.cursors),
+            next: self.next,
+            size: std::mem::take(&mut self.size),
+        }
+    }
+
     pub fn read(&mut self, index: usize) -> Value {
         let cursor = &mut self.cursors[index];
         let mut text = String::new();
@@ -191,7 +205,20 @@ impl ProcessIo {
     }
 
     pub fn mcp_output(&self) -> (Value, u64) {
-        let cursor = &self.cursors[3];
+        self.output_at(3)
+    }
+
+    pub(super) fn wait_output(&mut self) -> (Value, bool) {
+        let (mut result, next) = self.output_at(4);
+        self.cursors[4].next = next;
+        self.cursors[4].truncated = false;
+        result["eof"] =
+            json!(next == self.next && self.readers.iter().all(|reader| reader.file.is_none()));
+        (result, next == self.next)
+    }
+
+    fn output_at(&self, index: usize) -> (Value, u64) {
+        let cursor = &self.cursors[index];
         let mut parts = [String::new(), String::new()];
         let mut next = cursor.next;
         let mut size = 0;

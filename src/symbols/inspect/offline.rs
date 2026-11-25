@@ -66,6 +66,18 @@ impl DwarfImage {
         super::super::line_for_pc(&dwarf, pc)
     }
 
+    pub(crate) fn line_addresses(&self, file: &std::path::Path, line: u64) -> Result<Vec<u64>> {
+        let dwarf = self.data.borrow();
+        let (statements, declarations) = super::super::dwarf_source_addresses(&dwarf, file, line)?;
+        Ok(if statements.is_empty() {
+            declarations
+        } else {
+            statements
+        }
+        .into_iter()
+        .collect())
+    }
+
     fn lookup<'a, T>(
         &'a self,
         target: &str,

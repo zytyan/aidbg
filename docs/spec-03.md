@@ -146,7 +146,7 @@ const ProcessArgs = m.struct({
 
 ### 6. ReadBytes / WriteBytes
 
-所有具有确定静态大小且可独立寻址的类型均增加 `$readBytes()` / `$writeBytes()` 接口，使用 `Uint8Array` 表示原始数据。
+所有具有确定静态大小且可独立寻址的类型均增加同步 `$readBytes(addr)` / `$writeBytes(addr, bytes)` 接口，使用 `Uint8Array` 表示原始数据。
 
 约束：
 
@@ -157,14 +157,14 @@ const ProcessArgs = m.struct({
 - 不支持静态大小不确定的类型及不可独立寻址的位域。
 
 ```ts
-const bytes = await Packet.readBytes(addr)
-await Packet.writeBytes(otherAddr, bytes)
+const bytes = Packet.$readBytes(addr)
+Packet.$writeBytes(otherAddr, bytes)
 
 // 仅复制结构体本身，不复制字符串及 argv 内容
-const args = await ProcessArgs.readBytes(addr)
+const args = ProcessArgs.$readBytes(addr)
 
 // 仅读取指针本身，不读取字符串
-const ptr = await m.cStr().readBytes(addr)
+const ptr = m.cStr().$readBytes(addr)
 ```
 
 ### 7. Layout

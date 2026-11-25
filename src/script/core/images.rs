@@ -209,6 +209,17 @@ impl Target {
 
     pub(crate) fn script_line_address(&self, file: &Path, line: u64) -> Result<Option<u64>> {
         use std::collections::BTreeSet;
+        let mut attached_addresses = BTreeSet::new();
+        for attached in &self.attached_dwarf {
+            for link in attached.image.line_addresses(file, line)? {
+                attached_addresses.extend(attached.runtime_address(link));
+            }
+        }
+        if !attached_addresses.is_empty() {
+            return Ok(
+                (attached_addresses.len() == 1).then(|| *attached_addresses.first().unwrap())
+            );
+        }
         let mut statements = BTreeSet::new();
         let mut declarations = BTreeSet::new();
         let mut collect = |image: Image<'_>| -> Result<()> {

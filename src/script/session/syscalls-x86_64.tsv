@@ -1,0 +1,384 @@
+# Generated from Linux v6.18 syscall tables and prototypes.
+0	read	fd:unsigned int	buf:char *	count:size_t
+1	write	fd:unsigned int	buf:const char *	count:size_t
+2	open	filename:const char *	flags:int	mode:umode_t
+3	close	fd:unsigned int
+4	stat	filename:const char *	statbuf:struct stat *
+5	fstat	fd:unsigned int	statbuf:struct stat *
+6	lstat	filename:const char *	statbuf:struct stat *
+7	poll	ufds:struct pollfd *	nfds:unsigned int	timeout:int
+8	lseek	fd:unsigned int	offset:off_t	whence:unsigned int
+9	mmap	addr:unsigned long	length:unsigned long	prot:unsigned long	flags:unsigned long	fd:unsigned long	offset:unsigned long
+10	mprotect	start:unsigned long	len:size_t	prot:unsigned long
+11	munmap	addr:unsigned long	len:size_t
+12	brk	brk:unsigned long
+13	rt_sigaction	arg1:int	arg2:const struct sigaction *	arg3:struct sigaction *	arg4:size_t
+14	rt_sigprocmask	how:int	set:sigset_t *	oset:sigset_t *	sigsetsize:size_t
+15	rt_sigreturn
+16	ioctl	fd:unsigned int	cmd:unsigned int	arg:unsigned long
+17	pread64	fd:unsigned int	buf:char *	count:size_t	pos:loff_t
+18	pwrite64	fd:unsigned int	buf:const char *	count:size_t	pos:loff_t
+19	readv	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long
+20	writev	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long
+21	access	filename:const char *	mode:int
+22	pipe	fildes:int *
+23	select	n:int	inp:fd_set *	outp:fd_set *	exp:fd_set *	tvp:struct __kernel_old_timeval *
+24	sched_yield
+25	mremap	addr:unsigned long	old_len:unsigned long	new_len:unsigned long	flags:unsigned long	new_addr:unsigned long
+26	msync	start:unsigned long	len:size_t	flags:int
+27	mincore	start:unsigned long	len:size_t	vec:unsigned char *
+28	madvise	start:unsigned long	len:size_t	behavior:int
+29	shmget	key:key_t	size:size_t	flag:int
+30	shmat	shmid:int	shmaddr:char *	shmflg:int
+31	shmctl	shmid:int	cmd:int	buf:struct shmid_ds *
+32	dup	fildes:unsigned int
+33	dup2	oldfd:unsigned int	newfd:unsigned int
+34	pause
+35	nanosleep	rqtp:struct __kernel_timespec *	rmtp:struct __kernel_timespec *
+36	getitimer	which:int	value:struct __kernel_old_itimerval *
+37	alarm	seconds:unsigned int
+38	setitimer	which:int	value:struct __kernel_old_itimerval *	ovalue:struct __kernel_old_itimerval *
+39	getpid
+40	sendfile	out_fd:int	in_fd:int	offset:loff_t *	count:size_t
+41	socket	arg1:int	arg2:int	arg3:int
+42	connect	arg1:int	arg2:struct sockaddr *	arg3:int
+43	accept	arg1:int	arg2:struct sockaddr *	arg3:int *
+44	sendto	arg1:int	arg2:void *	arg3:size_t	arg4:unsigned	arg5:struct sockaddr *	arg6:int
+45	recvfrom	arg1:int	arg2:void *	arg3:size_t	arg4:unsigned	arg5:struct sockaddr *	arg6:int *
+46	sendmsg	fd:int	msg:struct user_msghdr *	flags:unsigned
+47	recvmsg	fd:int	msg:struct user_msghdr *	flags:unsigned
+48	shutdown	arg1:int	arg2:int
+49	bind	arg1:int	arg2:struct sockaddr *	arg3:int
+50	listen	arg1:int	arg2:int
+51	getsockname	arg1:int	arg2:struct sockaddr *	arg3:int *
+52	getpeername	arg1:int	arg2:struct sockaddr *	arg3:int *
+53	socketpair	arg1:int	arg2:int	arg3:int	arg4:int *
+54	setsockopt	fd:int	level:int	optname:int	optval:char *	optlen:int
+55	getsockopt	fd:int	level:int	optname:int	optval:char *	optlen:int *
+56	clone	flags:unsigned long	stack:unsigned long	parent_tid:int *	child_tid:int *	tls:unsigned long
+57	fork
+58	vfork
+59	execve	filename:const char *	argv:const char *const *	envp:const char *const *
+60	exit	error_code:int
+61	wait4	pid:pid_t	stat_addr:int *	options:int	ru:struct rusage *
+62	kill	pid:pid_t	sig:int
+63	uname	name:struct new_utsname *
+64	semget	key:key_t	nsems:int	semflg:int
+65	semop	semid:int	sops:struct sembuf *	nsops:unsigned
+66	semctl	semid:int	semnum:int	cmd:int	arg:unsigned long
+67	shmdt	shmaddr:char *
+68	msgget	key:key_t	msgflg:int
+69	msgsnd	msqid:int	msgp:struct msgbuf *	msgsz:size_t	msgflg:int
+70	msgrcv	msqid:int	msgp:struct msgbuf *	msgsz:size_t	msgtyp:long	msgflg:int
+71	msgctl	msqid:int	cmd:int	buf:struct msqid_ds *
+72	fcntl	fd:unsigned int	cmd:unsigned int	arg:unsigned long
+73	flock	fd:unsigned int	cmd:unsigned int
+74	fsync	fd:unsigned int
+75	fdatasync	fd:unsigned int
+76	truncate	path:const char *	length:long
+77	ftruncate	fd:unsigned int	length:off_t
+78	getdents	fd:unsigned int	dirent:struct linux_dirent *	count:unsigned int
+79	getcwd	buf:char *	size:unsigned long
+80	chdir	filename:const char *
+81	fchdir	fd:unsigned int
+82	rename	oldname:const char *	newname:const char *
+83	mkdir	pathname:const char *	mode:umode_t
+84	rmdir	pathname:const char *
+85	creat	pathname:const char *	mode:umode_t
+86	link	oldname:const char *	newname:const char *
+87	unlink	pathname:const char *
+88	symlink	old:const char *	new:const char *
+89	readlink	path:const char *	buf:char *	bufsiz:int
+90	chmod	filename:const char *	mode:umode_t
+91	fchmod	fd:unsigned int	mode:umode_t
+92	chown	filename:const char *	user:uid_t	group:gid_t
+93	fchown	fd:unsigned int	user:uid_t	group:gid_t
+94	lchown	filename:const char *	user:uid_t	group:gid_t
+95	umask	mask:int
+96	gettimeofday	tv:struct __kernel_old_timeval *	tz:struct timezone *
+97	getrlimit	resource:unsigned int	rlim:struct rlimit *
+98	getrusage	who:int	ru:struct rusage *
+99	sysinfo	info:struct sysinfo *
+100	times	tbuf:struct tms *
+101	ptrace	request:long	pid:long	addr:unsigned long	data:unsigned long
+102	getuid
+103	syslog	type:int	buf:char *	len:int
+104	getgid
+105	setuid	uid:uid_t
+106	setgid	gid:gid_t
+107	geteuid
+108	getegid
+109	setpgid	pid:pid_t	pgid:pid_t
+110	getppid
+111	getpgrp
+112	setsid
+113	setreuid	ruid:uid_t	euid:uid_t
+114	setregid	rgid:gid_t	egid:gid_t
+115	getgroups	gidsetsize:int	grouplist:gid_t *
+116	setgroups	gidsetsize:int	grouplist:gid_t *
+117	setresuid	ruid:uid_t	euid:uid_t	suid:uid_t
+118	getresuid	ruid:uid_t *	euid:uid_t *	suid:uid_t *
+119	setresgid	rgid:gid_t	egid:gid_t	sgid:gid_t
+120	getresgid	rgid:gid_t *	egid:gid_t *	sgid:gid_t *
+121	getpgid	pid:pid_t
+122	setfsuid	uid:uid_t
+123	setfsgid	gid:gid_t
+124	getsid	pid:pid_t
+125	capget	header:cap_user_header_t	dataptr:cap_user_data_t
+126	capset	header:cap_user_header_t	data:const cap_user_data_t
+127	rt_sigpending	set:sigset_t *	sigsetsize:size_t
+128	rt_sigtimedwait	uthese:const sigset_t *	uinfo:siginfo_t *	uts:const struct __kernel_timespec *	sigsetsize:size_t
+129	rt_sigqueueinfo	pid:pid_t	sig:int	uinfo:siginfo_t *
+130	rt_sigsuspend	unewset:sigset_t *	sigsetsize:size_t
+131	sigaltstack	uss:const struct sigaltstack *	uoss:struct sigaltstack *
+132	utime	filename:char *	times:struct utimbuf *
+133	mknod	filename:const char *	mode:umode_t	dev:unsigned
+134	uselib	library:const char *
+135	personality	personality:unsigned int
+136	ustat	dev:unsigned	ubuf:struct ustat *
+137	statfs	path:const char *	buf:struct statfs *
+138	fstatfs	fd:unsigned int	buf:struct statfs *
+139	sysfs	option:int	arg1:unsigned long	arg2:unsigned long
+140	getpriority	which:int	who:int
+141	setpriority	which:int	who:int	niceval:int
+142	sched_setparam	pid:pid_t	param:struct sched_param *
+143	sched_getparam	pid:pid_t	param:struct sched_param *
+144	sched_setscheduler	pid:pid_t	policy:int	param:struct sched_param *
+145	sched_getscheduler	pid:pid_t
+146	sched_get_priority_max	policy:int
+147	sched_get_priority_min	policy:int
+148	sched_rr_get_interval	pid:pid_t	interval:struct __kernel_timespec *
+149	mlock	start:unsigned long	len:size_t
+150	munlock	start:unsigned long	len:size_t
+151	mlockall	flags:int
+152	munlockall
+153	vhangup
+154	modify_ldt	?	?	?	?	?	?
+155	pivot_root	new_root:const char *	put_old:const char *
+156	_sysctl	?	?	?	?	?	?
+157	prctl	option:int	arg2:unsigned long	arg3:unsigned long	arg4:unsigned long	arg5:unsigned long
+158	arch_prctl	code:int	addr:unsigned long
+159	adjtimex	txc_p:struct __kernel_timex *
+160	setrlimit	resource:unsigned int	rlim:struct rlimit *
+161	chroot	filename:const char *
+162	sync
+163	acct	name:const char *
+164	settimeofday	tv:struct __kernel_old_timeval *	tz:struct timezone *
+165	mount	dev_name:char *	dir_name:char *	type:char *	flags:unsigned long	data:void *
+166	umount2	name:char *	flags:int
+167	swapon	specialfile:const char *	swap_flags:int
+168	swapoff	specialfile:const char *
+169	reboot	magic1:int	magic2:int	cmd:unsigned int	arg:void *
+170	sethostname	name:char *	len:int
+171	setdomainname	name:char *	len:int
+172	iopl	?	?	?	?	?	?
+173	ioperm	from:unsigned long	num:unsigned long	on:int
+174	create_module	?	?	?	?	?	?
+175	init_module	umod:void *	len:unsigned long	uargs:const char *
+176	delete_module	name_user:const char *	flags:unsigned int
+177	get_kernel_syms	?	?	?	?	?	?
+178	query_module	?	?	?	?	?	?
+179	quotactl	cmd:unsigned int	special:const char *	id:qid_t	addr:void *
+180	nfsservctl	?	?	?	?	?	?
+181	getpmsg	?	?	?	?	?	?
+182	putpmsg	?	?	?	?	?	?
+183	afs_syscall	?	?	?	?	?	?
+184	tuxcall	?	?	?	?	?	?
+185	security	?	?	?	?	?	?
+186	gettid
+187	readahead	fd:int	offset:loff_t	count:size_t
+188	setxattr	path:const char *	name:const char *	value:const void *	size:size_t	flags:int
+189	lsetxattr	path:const char *	name:const char *	value:const void *	size:size_t	flags:int
+190	fsetxattr	fd:int	name:const char *	value:const void *	size:size_t	flags:int
+191	getxattr	path:const char *	name:const char *	value:void *	size:size_t
+192	lgetxattr	path:const char *	name:const char *	value:void *	size:size_t
+193	fgetxattr	fd:int	name:const char *	value:void *	size:size_t
+194	listxattr	path:const char *	list:char *	size:size_t
+195	llistxattr	path:const char *	list:char *	size:size_t
+196	flistxattr	fd:int	list:char *	size:size_t
+197	removexattr	path:const char *	name:const char *
+198	lremovexattr	path:const char *	name:const char *
+199	fremovexattr	fd:int	name:const char *
+200	tkill	pid:pid_t	sig:int
+201	time	tloc:__kernel_old_time_t *
+202	futex	uaddr:u32 *	op:int	val:u32	utime:const struct __kernel_timespec *	uaddr2:u32 *	val3:u32
+203	sched_setaffinity	pid:pid_t	len:unsigned int	user_mask_ptr:unsigned long *
+204	sched_getaffinity	pid:pid_t	len:unsigned int	user_mask_ptr:unsigned long *
+205	set_thread_area	?	?	?	?	?	?
+206	io_setup	nr_reqs:unsigned	ctx:aio_context_t *
+207	io_destroy	ctx:aio_context_t
+208	io_getevents	ctx_id:aio_context_t	min_nr:long	nr:long	events:struct io_event *	timeout:struct __kernel_timespec *
+209	io_submit	arg1:aio_context_t	arg2:long	arg3:struct iocb * *
+210	io_cancel	ctx_id:aio_context_t	iocb:struct iocb *	result:struct io_event *
+211	get_thread_area	?	?	?	?	?	?
+212	lookup_dcookie	?	?	?	?	?	?
+213	epoll_create	size:int
+214	epoll_ctl_old	?	?	?	?	?	?
+215	epoll_wait_old	?	?	?	?	?	?
+216	remap_file_pages	start:unsigned long	size:unsigned long	prot:unsigned long	pgoff:unsigned long	flags:unsigned long
+217	getdents64	fd:unsigned int	dirent:struct linux_dirent64 *	count:unsigned int
+218	set_tid_address	tidptr:int *
+219	restart_syscall
+220	semtimedop	semid:int	sops:struct sembuf *	nsops:unsigned	timeout:const struct __kernel_timespec *
+221	fadvise64	fd:int	offset:loff_t	len:size_t	advice:int
+222	timer_create	which_clock:clockid_t	timer_event_spec:struct sigevent *	created_timer_id:timer_t *
+223	timer_settime	timer_id:timer_t	flags:int	new_setting:const struct __kernel_itimerspec *	old_setting:struct __kernel_itimerspec *
+224	timer_gettime	timer_id:timer_t	setting:struct __kernel_itimerspec *
+225	timer_getoverrun	timer_id:timer_t
+226	timer_delete	timer_id:timer_t
+227	clock_settime	which_clock:clockid_t	tp:const struct __kernel_timespec *
+228	clock_gettime	which_clock:clockid_t	tp:struct __kernel_timespec *
+229	clock_getres	which_clock:clockid_t	tp:struct __kernel_timespec *
+230	clock_nanosleep	which_clock:clockid_t	flags:int	rqtp:const struct __kernel_timespec *	rmtp:struct __kernel_timespec *
+231	exit_group	error_code:int
+232	epoll_wait	epfd:int	events:struct epoll_event *	maxevents:int	timeout:int
+233	epoll_ctl	epfd:int	op:int	fd:int	event:struct epoll_event *
+234	tgkill	tgid:pid_t	pid:pid_t	sig:int
+235	utimes	filename:char *	utimes:struct __kernel_old_timeval *
+236	vserver	?	?	?	?	?	?
+237	mbind	start:unsigned long	len:unsigned long	mode:unsigned long	nmask:const unsigned long *	maxnode:unsigned long	flags:unsigned
+238	set_mempolicy	mode:int	nmask:const unsigned long *	maxnode:unsigned long
+239	get_mempolicy	policy:int *	nmask:unsigned long *	maxnode:unsigned long	addr:unsigned long	flags:unsigned long
+240	mq_open	name:const char *	oflag:int	mode:umode_t	attr:struct mq_attr *
+241	mq_unlink	name:const char *
+242	mq_timedsend	mqdes:mqd_t	msg_ptr:const char *	msg_len:size_t	msg_prio:unsigned int	abs_timeout:const struct __kernel_timespec *
+243	mq_timedreceive	mqdes:mqd_t	msg_ptr:char *	msg_len:size_t	msg_prio:unsigned int *	abs_timeout:const struct __kernel_timespec *
+244	mq_notify	mqdes:mqd_t	notification:const struct sigevent *
+245	mq_getsetattr	mqdes:mqd_t	mqstat:const struct mq_attr *	omqstat:struct mq_attr *
+246	kexec_load	entry:unsigned long	nr_segments:unsigned long	segments:struct kexec_segment *	flags:unsigned long
+247	waitid	which:int	pid:pid_t	infop:struct siginfo *	options:int	ru:struct rusage *
+248	add_key	_type:const char *	_description:const char *	_payload:const void *	plen:size_t	destringid:key_serial_t
+249	request_key	_type:const char *	_description:const char *	_callout_info:const char *	destringid:key_serial_t
+250	keyctl	cmd:int	arg2:unsigned long	arg3:unsigned long	arg4:unsigned long	arg5:unsigned long
+251	ioprio_set	which:int	who:int	ioprio:int
+252	ioprio_get	which:int	who:int
+253	inotify_init
+254	inotify_add_watch	fd:int	path:const char *	mask:u32
+255	inotify_rm_watch	fd:int	wd:__s32
+256	migrate_pages	pid:pid_t	maxnode:unsigned long	from:const unsigned long *	to:const unsigned long *
+257	openat	dfd:int	filename:const char *	flags:int	mode:umode_t
+258	mkdirat	dfd:int	pathname:const char *	mode:umode_t
+259	mknodat	dfd:int	filename:const char *	mode:umode_t	dev:unsigned
+260	fchownat	dfd:int	filename:const char *	user:uid_t	group:gid_t	flag:int
+261	futimesat	dfd:int	filename:const char *	utimes:struct __kernel_old_timeval *
+262	newfstatat	dfd:int	filename:const char *	statbuf:struct stat *	flag:int
+263	unlinkat	dfd:int	pathname:const char *	flag:int
+264	renameat	olddfd:int	oldname:const char *	newdfd:int	newname:const char *
+265	linkat	olddfd:int	oldname:const char *	newdfd:int	newname:const char *	flags:int
+266	symlinkat	oldname:const char *	newdfd:int	newname:const char *
+267	readlinkat	dfd:int	path:const char *	buf:char *	bufsiz:int
+268	fchmodat	dfd:int	filename:const char *	mode:umode_t
+269	faccessat	dfd:int	filename:const char *	mode:int
+270	pselect6	arg1:int	arg2:fd_set *	arg3:fd_set *	arg4:fd_set *	arg5:struct __kernel_timespec *	arg6:void *
+271	ppoll	arg1:struct pollfd *	arg2:unsigned int	arg3:struct __kernel_timespec *	arg4:const sigset_t *	arg5:size_t
+272	unshare	unshare_flags:unsigned long
+273	set_robust_list	head:struct robust_list_head *	len:size_t
+274	get_robust_list	pid:int	head_ptr:struct robust_list_head * *	len_ptr:size_t *
+275	splice	fd_in:int	off_in:loff_t *	fd_out:int	off_out:loff_t *	len:size_t	flags:unsigned int
+276	tee	fdin:int	fdout:int	len:size_t	flags:unsigned int
+277	sync_file_range	fd:int	offset:loff_t	nbytes:loff_t	flags:unsigned int
+278	vmsplice	fd:int	iov:const struct iovec *	nr_segs:unsigned long	flags:unsigned int
+279	move_pages	pid:pid_t	nr_pages:unsigned long	pages:const void * *	nodes:const int *	status:int *	flags:int
+280	utimensat	dfd:int	filename:const char *	utimes:struct __kernel_timespec *	flags:int
+281	epoll_pwait	epfd:int	events:struct epoll_event *	maxevents:int	timeout:int	sigmask:const sigset_t *	sigsetsize:size_t
+282	signalfd	ufd:int	user_mask:sigset_t *	sizemask:size_t
+283	timerfd_create	clockid:int	flags:int
+284	eventfd	count:unsigned int
+285	fallocate	fd:int	mode:int	offset:loff_t	len:loff_t
+286	timerfd_settime	ufd:int	flags:int	utmr:const struct __kernel_itimerspec *	otmr:struct __kernel_itimerspec *
+287	timerfd_gettime	ufd:int	otmr:struct __kernel_itimerspec *
+288	accept4	arg1:int	arg2:struct sockaddr *	arg3:int *	arg4:int
+289	signalfd4	ufd:int	user_mask:sigset_t *	sizemask:size_t	flags:int
+290	eventfd2	count:unsigned int	flags:int
+291	epoll_create1	flags:int
+292	dup3	oldfd:unsigned int	newfd:unsigned int	flags:int
+293	pipe2	fildes:int *	flags:int
+294	inotify_init1	flags:int
+295	preadv	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long	pos_l:unsigned long	pos_h:unsigned long
+296	pwritev	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long	pos_l:unsigned long	pos_h:unsigned long
+297	rt_tgsigqueueinfo	tgid:pid_t	pid:pid_t	sig:int	uinfo:siginfo_t *
+298	perf_event_open	attr_uptr:struct perf_event_attr *	pid:pid_t	cpu:int	group_fd:int	flags:unsigned long
+299	recvmmsg	fd:int	msg:struct mmsghdr *	vlen:unsigned int	flags:unsigned	timeout:struct __kernel_timespec *
+300	fanotify_init	flags:unsigned int	event_f_flags:unsigned int
+301	fanotify_mark	fanotify_fd:int	flags:unsigned int	mask:u64	fd:int	pathname:const char *
+302	prlimit64	pid:pid_t	resource:unsigned int	new_rlim:const struct rlimit64 *	old_rlim:struct rlimit64 *
+303	name_to_handle_at	dfd:int	name:const char *	handle:struct file_handle *	mnt_id:void *	flag:int
+304	open_by_handle_at	mountdirfd:int	handle:struct file_handle *	flags:int
+305	clock_adjtime	which_clock:clockid_t	tx:struct __kernel_timex *
+306	syncfs	fd:int
+307	sendmmsg	fd:int	msg:struct mmsghdr *	vlen:unsigned int	flags:unsigned
+308	setns	fd:int	nstype:int
+309	getcpu	cpu:unsigned *	node:unsigned *	cache:struct getcpu_cache *
+310	process_vm_readv	pid:pid_t	lvec:const struct iovec *	liovcnt:unsigned long	rvec:const struct iovec *	riovcnt:unsigned long	flags:unsigned long
+311	process_vm_writev	pid:pid_t	lvec:const struct iovec *	liovcnt:unsigned long	rvec:const struct iovec *	riovcnt:unsigned long	flags:unsigned long
+312	kcmp	pid1:pid_t	pid2:pid_t	type:int	idx1:unsigned long	idx2:unsigned long
+313	finit_module	fd:int	uargs:const char *	flags:int
+314	sched_setattr	pid:pid_t	attr:struct sched_attr *	flags:unsigned int
+315	sched_getattr	pid:pid_t	attr:struct sched_attr *	size:unsigned int	flags:unsigned int
+316	renameat2	olddfd:int	oldname:const char *	newdfd:int	newname:const char *	flags:unsigned int
+317	seccomp	op:unsigned int	flags:unsigned int	uargs:void *
+318	getrandom	buf:char *	count:size_t	flags:unsigned int
+319	memfd_create	uname_ptr:const char *	flags:unsigned int
+320	kexec_file_load	kernel_fd:int	initrd_fd:int	cmdline_len:unsigned long	cmdline_ptr:const char *	flags:unsigned long
+321	bpf	cmd:int	attr:union bpf_attr *	size:unsigned int
+322	execveat	dfd:int	filename:const char *	argv:const char *const *	envp:const char *const *	flags:int
+323	userfaultfd	flags:int
+324	membarrier	cmd:int	flags:unsigned int	cpu_id:int
+325	mlock2	start:unsigned long	len:size_t	flags:int
+326	copy_file_range	fd_in:int	off_in:loff_t *	fd_out:int	off_out:loff_t *	len:size_t	flags:unsigned int
+327	preadv2	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long	pos_l:unsigned long	pos_h:unsigned long	flags:rwf_t
+328	pwritev2	fd:unsigned long	vec:const struct iovec *	vlen:unsigned long	pos_l:unsigned long	pos_h:unsigned long	flags:rwf_t
+329	pkey_mprotect	start:unsigned long	len:size_t	prot:unsigned long	pkey:int
+330	pkey_alloc	flags:unsigned long	init_val:unsigned long
+331	pkey_free	pkey:int
+332	statx	dfd:int	path:const char *	flags:unsigned	mask:unsigned	buffer:struct statx *
+333	io_pgetevents	ctx_id:aio_context_t	min_nr:long	nr:long	events:struct io_event *	timeout:struct __kernel_timespec *	sig:const struct __aio_sigset *
+334	rseq	rseq:struct rseq *	rseq_len:uint32_t	flags:int	sig:uint32_t
+335	uretprobe
+336	uprobe
+424	pidfd_send_signal	pidfd:int	sig:int	info:siginfo_t *	flags:unsigned int
+425	io_uring_setup	entries:u32	p:struct io_uring_params *
+426	io_uring_enter	fd:unsigned int	to_submit:u32	min_complete:u32	flags:u32	argp:const void *	argsz:size_t
+427	io_uring_register	fd:unsigned int	op:unsigned int	arg:void *	nr_args:unsigned int
+428	open_tree	dfd:int	path:const char *	flags:unsigned
+429	move_mount	from_dfd:int	from_path:const char *	to_dfd:int	to_path:const char *	ms_flags:unsigned int
+430	fsopen	fs_name:const char *	flags:unsigned int
+431	fsconfig	fs_fd:int	cmd:unsigned int	key:const char *	value:const void *	aux:int
+432	fsmount	fs_fd:int	flags:unsigned int	ms_flags:unsigned int
+433	fspick	dfd:int	path:const char *	flags:unsigned int
+434	pidfd_open	pid:pid_t	flags:unsigned int
+435	clone3	uargs:struct clone_args *	size:size_t
+436	close_range	fd:unsigned int	max_fd:unsigned int	flags:unsigned int
+437	openat2	dfd:int	filename:const char *	how:struct open_how *	size:size_t
+438	pidfd_getfd	pidfd:int	fd:int	flags:unsigned int
+439	faccessat2	dfd:int	filename:const char *	mode:int	flags:int
+440	process_madvise	pidfd:int	vec:const struct iovec *	vlen:size_t	behavior:int	flags:unsigned int
+441	epoll_pwait2	epfd:int	events:struct epoll_event *	maxevents:int	timeout:const struct __kernel_timespec *	sigmask:const sigset_t *	sigsetsize:size_t
+442	mount_setattr	dfd:int	path:const char *	flags:unsigned int	uattr:struct mount_attr *	usize:size_t
+443	quotactl_fd	fd:unsigned int	cmd:unsigned int	id:qid_t	addr:void *
+444	landlock_create_ruleset	attr:const struct landlock_ruleset_attr *	size:size_t	flags:__u32
+445	landlock_add_rule	ruleset_fd:int	rule_type:enum landlock_rule_type	rule_attr:const void *	flags:__u32
+446	landlock_restrict_self	ruleset_fd:int	flags:__u32
+447	memfd_secret	flags:unsigned int
+448	process_mrelease	pidfd:int	flags:unsigned int
+449	futex_waitv	waiters:struct futex_waitv *	nr_futexes:unsigned int	flags:unsigned int	timeout:struct __kernel_timespec *	clockid:clockid_t
+450	set_mempolicy_home_node	start:unsigned long	len:unsigned long	home_node:unsigned long	flags:unsigned long
+451	cachestat	fd:unsigned int	cstat_range:struct cachestat_range *	cstat:struct cachestat *	flags:unsigned int
+452	fchmodat2	dfd:int	filename:const char *	mode:umode_t	flags:unsigned int
+453	map_shadow_stack	addr:unsigned long	size:unsigned long	flags:unsigned int
+454	futex_wake	uaddr:void *	mask:unsigned long	nr:int	flags:unsigned int
+455	futex_wait	uaddr:void *	val:unsigned long	mask:unsigned long	flags:unsigned int	timespec:struct __kernel_timespec *	clockid:clockid_t
+456	futex_requeue	waiters:struct futex_waitv *	flags:unsigned int	nr_wake:int	nr_requeue:int
+457	statmount	req:const struct mnt_id_req *	buf:struct statmount *	bufsize:size_t	flags:unsigned int
+458	listmount	req:const struct mnt_id_req *	mnt_ids:u64 *	nr_mnt_ids:size_t	flags:unsigned int
+459	lsm_get_self_attr	attr:unsigned int	ctx:struct lsm_ctx *	size:u32 *	flags:u32
+460	lsm_set_self_attr	attr:unsigned int	ctx:struct lsm_ctx *	size:u32	flags:u32
+461	lsm_list_modules	ids:u64 *	size:u32 *	flags:u32
+462	mseal	start:unsigned long	len:size_t	flags:unsigned long
+463	setxattrat	dfd:int	path:const char *	at_flags:unsigned int	name:const char *	args:const struct xattr_args *	size:size_t
+464	getxattrat	dfd:int	path:const char *	at_flags:unsigned int	name:const char *	args:struct xattr_args *	size:size_t
+465	listxattrat	dfd:int	path:const char *	at_flags:unsigned int	list:char *	size:size_t
+466	removexattrat	dfd:int	path:const char *	at_flags:unsigned int	name:const char *
+467	open_tree_attr	dfd:int	path:const char *	flags:unsigned	uattr:struct mount_attr *	usize:size_t
+468	file_getattr	dfd:int	filename:const char *	attr:struct file_attr *	usize:size_t	at_flags:unsigned int
+469	file_setattr	dfd:int	filename:const char *	attr:struct file_attr *	usize:size_t	at_flags:unsigned int

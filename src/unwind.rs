@@ -3,8 +3,9 @@ use crate::regs::{FP, PC, Registers, SP};
 use crate::trace::Trace;
 use crate::{Result, error, hex};
 use gimli::{
-    BaseAddresses, CfaRule, DebugFrame, EhFrame, Encoding, EndianArcSlice, EvaluationResult,
-    Expression, LittleEndian, Location, RegisterRule, UnwindContext, UnwindSection, Value, Vendor,
+    BaseAddresses, CfaRule, DebugFrame, EhFrame, EhFrameHdr, Encoding, EndianArcSlice,
+    EvaluationResult, Expression, FrameDescriptionEntry, LittleEndian, Location, ParsedEhFrameHdr,
+    RegisterRule, UnwindContext, UnwindSection, Value, Vendor,
 };
 use object::{Object, ObjectSection};
 use serde::Serialize;
@@ -23,6 +24,7 @@ struct Image {
     bytes: Arc<Vec<u8>>,
     symbols: Option<Vec<u8>>,
     eh: EhFrame<Data>,
+    eh_index: Option<ParsedEhFrameHdr<Data>>,
     debug: DebugFrame<Data>,
     bases: BaseAddresses,
     layout: Layout,
@@ -60,12 +62,17 @@ impl Image {
         let addr = |name| obj.section_by_name(name).map(|s| s.address()).unwrap_or(0);
         let bases = BaseAddresses::default()
             .set_eh_frame(addr(".eh_frame"))
+            .set_eh_frame_hdr(addr(".eh_frame_hdr"))
             .set_text(addr(".text"))
             .set_got(addr(".got"));
+        let eh_index = section(".eh_frame_hdr")
+            .ok()
+            .and_then(|header| EhFrameHdr::from(header).parse(&bases, 8).ok());
         Ok(Self {
             bytes,
             symbols: None,
             eh,
+            eh_index,
             debug,
             bases,
             layout,
@@ -73,24 +80,49 @@ impl Image {
     }
 
     fn step(&self, pc: u64, ctx: Context<'_>) -> Result<Step> {
-        match self.step_section(&self.eh, pc, ctx) {
-            Err(e)
-                if e.downcast_ref::<gimli::Error>()
-                    == Some(&gimli::Error::NoUnwindInfoForAddress) =>
-            {
-                self.step_section(&self.debug, pc, ctx)
+        self.with_fde(pc, |section, fde| match section {
+            CallFrameSection::Eh(section) => self.step_section(section, fde, pc, ctx),
+            CallFrameSection::Debug(section) => self.step_section(section, fde, pc, ctx),
+        })
+    }
+
+    fn with_fde<T>(
+        &self,
+        pc: u64,
+        use_fde: impl FnOnce(CallFrameSection<'_>, FrameDescriptionEntry<Data>) -> Result<T>,
+    ) -> Result<T> {
+        let entry = self
+            .eh_index
+            .as_ref()
+            .and_then(ParsedEhFrameHdr::table)
+            .and_then(|index| {
+                index
+                    .fde_for_address(&self.eh, &self.bases, pc, EhFrame::cie_from_offset)
+                    .ok()
+            })
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.eh
+                    .fde_for_address(&self.bases, pc, EhFrame::cie_from_offset)
+            });
+        match entry {
+            Err(e) if e == gimli::Error::NoUnwindInfoForAddress => {
+                let fde =
+                    self.debug
+                        .fde_for_address(&self.bases, pc, DebugFrame::cie_from_offset)?;
+                use_fde(CallFrameSection::Debug(&self.debug), fde)
             }
-            result => result,
+            result => use_fde(CallFrameSection::Eh(&self.eh), result?),
         }
     }
 
     fn step_section<S: UnwindSection<Data>>(
         &self,
         section: &S,
+        fde: FrameDescriptionEntry<Data>,
         pc: u64,
         mut c: Context<'_>,
     ) -> Result<Step> {
-        let fde = section.fde_for_address(&self.bases, pc, S::cie_from_offset)?;
         if fde.is_signal_trampoline() {
             return Ok(Step::Unsupported("signal_trampoline"));
         }
@@ -140,17 +172,29 @@ impl Image {
         Ok(Step::Next(next, "cfi"))
     }
 
+    fn cfa(&self, pc: u64, context: Context<'_>) -> Result<u64> {
+        self.with_fde(pc, |section, fde| match section {
+            CallFrameSection::Eh(section) => self.cfa_section(section, fde, pc, context),
+            CallFrameSection::Debug(section) => self.cfa_section(section, fde, pc, context),
+        })
+    }
+
     fn cfa_section<S: UnwindSection<Data>>(
         &self,
         section: &S,
+        fde: FrameDescriptionEntry<Data>,
         pc: u64,
         context: Context<'_>,
     ) -> Result<u64> {
-        let fde = section.fde_for_address(&self.bases, pc, S::cie_from_offset)?;
         let mut cache = UnwindContext::new();
         let row = fde.unwind_info_for_address(section, &self.bases, &mut cache, pc)?;
         cfa_value(row.cfa(), section, fde.cie().encoding(), context)
     }
+}
+
+enum CallFrameSection<'a> {
+    Eh(&'a EhFrame<Data>),
+    Debug(&'a DebugFrame<Data>),
 }
 
 fn cfa_value<S: UnwindSection<Data>>(
@@ -182,14 +226,7 @@ pub(crate) fn canonical_frame_address(
         cfa: None,
         bias,
     };
-    match image.cfa_section(&image.eh, link, context) {
-        Err(e)
-            if e.downcast_ref::<gimli::Error>() == Some(&gimli::Error::NoUnwindInfoForAddress) =>
-        {
-            image.cfa_section(&image.debug, link, context)
-        }
-        result => result,
-    }
+    image.cfa(link, context)
 }
 
 #[derive(Clone, Copy)]
@@ -352,6 +389,7 @@ pub struct Frame {
     pub(crate) args: Option<serde_json::Value>,
     #[serde(flatten)]
     names: Option<crate::cpp_names::Names>,
+    missing_debug_sections: Vec<&'static str>,
     pub(crate) method: &'static str,
     #[serde(skip)]
     link_pc: Option<u64>,
@@ -456,6 +494,8 @@ impl Images {
                     .symbols
                     .as_deref()
                     .and_then(|bytes| object::File::parse(bytes).ok());
+                frame.missing_debug_sections =
+                    crate::symbols::missing_debug_sections(&obj, debug.as_ref());
                 frame.names = debug
                     .as_ref()
                     .and_then(|debug| modules::symbol(debug, pc))
@@ -556,6 +596,7 @@ impl Images {
                     line: None,
                     args: None,
                     names: None,
+                    missing_debug_sections: Vec::new(),
                     method,
                     link_pc: None,
                     lookup_address: lookup,
@@ -716,11 +757,7 @@ pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
             }
             context.bias = lookup.wrapping_sub(link);
             frame.link = Some(link);
-            frame.cfa = image
-                .image
-                .cfa_section(&image.image.eh, link, context)
-                .or_else(|_| image.image.cfa_section(&image.image.debug, link, context))
-                .ok();
+            frame.cfa = image.image.cfa(link, context).ok();
             image.image.step(link, context).ok()
         });
         if frame.cfa.is_none()
