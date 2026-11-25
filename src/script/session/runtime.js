@@ -805,80 +805,129 @@
         return bytes;
     }
 
+    const typeMethods = {
+        at(type,address,tid) {
+            word(address);
+            return makeValue(type, {[valueKeys.address]:address, [valueKeys.tid]:tid, [valueKeys.root]:targetGeneration()});
+        },
+        $readBytes(type,address) {
+            word(address);
+            return readBytes(address, staticStorageSize(type));
+        },
+        $writeBytes(type,address,bytes) {
+            word(address);
+            if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
+            if (bytes.length !== staticStorageSize(type)) throw new RangeError("byte length differs from C storage size");
+            if (bytes.length) writeBytes(address, bytes);
+        },
+        offsetOf: fieldOffset,
+        layout: describeType,
+        align(type,value) {
+            const info = typeInfo(type);
+            const explicitAlign = alignment(value);
+            const align = Math.max(info.align, explicitAlign);
+            const size = info.fields ? rounded(info.size, align) : info.size;
+            return descriptor({...info, align, size, explicitAlign:align});
+        },
+        be: type => descriptor({...typeInfo(type), littleEndian:false}),
+        le: type => descriptor({...typeInfo(type), littleEndian:true}),
+        bitfield(type,width) {
+            const info = typeInfo(type);
+            width = integer(width, "invalid bitfield width");
+            if (width > info.size * 8 || info.littleEndian === false || info.explicitAlign || info.enumerators) {
+                throw new TypeError("unsupported bitfield type or width");
+            }
+            return descriptor({...info, kind:"bitfield", bit:[0,width]});
+        },
+        enum(type,values) {
+            const info = typeInfo(type);
+            const enumerators = Object.assign(Object.create(null), values);
+            for (const [name, value] of Object.entries(enumerators)) {
+                if (!/^[a-zA-Z_]\w*$/.test(name)) throw new TypeError("invalid enum name " + name);
+                scalarBytes(info.scalar, value);
+            }
+            return descriptor({...info, enumerators:Object.freeze(enumerators)});
+        },
+        value(type,value) {
+            return makeValue(type, {[valueKeys.bytes]:encodeValue(typeInfo(type), value)});
+        },
+        pointee(type) {
+            const {element} = typeInfo(type);
+            return typeInfo(element).kind === "self" ? element : resolve(element);
+        },
+        nullTerminate(type,limit = 4096) {
+            const info = typeInfo(type);
+            limit = integer(limit, "invalid termination limit");
+            const element = typeInfo(resolve(info.element));
+            if (!limit || info.length !== undefined || !["scalar", "ptr"].includes(element.kind)
+                || element.scalar.startsWith("f") || element.size % element.align) {
+                throw new TypeError("unsupported terminated pointer type or length");
+            }
+            return descriptor({...info, terminated:limit});
+        },
+        element: type => typeInfo(type).element,
+        field(type,name) {
+            const {fields,members} = typeInfo(type);
+            if (!Object.hasOwn(fields,name)) throw new Error("unknown C field " + name);
+            return members[fields[name] + memberType];
+        },
+        refine,
+        pack(type,value) {
+            const info = typeInfo(type);
+            if (!info.entries) throw new TypeError("cannot repack a resolved or refined layout");
+            const entries = info.entries === repackFromMembers
+                ? Object.fromEntries(Object.keys(info.fields).map(name => [name, info.members[info.fields[name] + memberType]]))
+                : info.entries;
+            return aggregate(info.kind, entries, {pack:value,align:info.explicitAlign});
+        },
+    };
+
+    const boundTypeMethods = new WeakMap();
+    const typeProperties = {
+        $size: {enumerable:true, get() {
+            const info = typeInfo(this);
+            return info.kind === "lazy" ? typeInfo(resolve(this)).size : info.size;
+        }},
+        $align: {enumerable:true, get() {
+            const info = typeInfo(this);
+            return info.kind === "lazy" ? typeInfo(resolve(this)).align : info.align;
+        }},
+    };
+    for (const [name,method] of Object.entries(typeMethods)) {
+        typeProperties[name] = {enumerable:true, get() {
+            let methods = boundTypeMethods.get(this);
+            if (!methods) boundTypeMethods.set(this,methods = Object.create(null));
+            return methods[name] ??= method.bind(undefined,this);
+        }};
+    }
+
     function descriptor(info) {
-        const type = {
-            get $size() { return info.kind === "lazy" ? typeInfo(resolve(type)).size : info.size; },
-            get $align() { return info.kind === "lazy" ? typeInfo(resolve(type)).align : info.align; },
-            at(address, tid) { word(address); return makeValue(type, {[valueKeys.address]:address, [valueKeys.tid]:tid, [valueKeys.root]:targetGeneration()}); },
-            $readBytes(address) {
-                word(address);
-                return readBytes(address, staticStorageSize(type));
-            },
-            $writeBytes(address, bytes) {
-                word(address);
-                if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
-                if (bytes.length !== staticStorageSize(type)) throw new RangeError("byte length differs from C storage size");
-                if (bytes.length) writeBytes(address, bytes);
-            },
-            offsetOf(path) { return fieldOffset(type, path); },
-            layout() { return describeType(type); },
+        const properties = {
+            $size:typeProperties.$size, $align:typeProperties.$align, at:typeProperties.at,
+            $readBytes:typeProperties.$readBytes, $writeBytes:typeProperties.$writeBytes,
+            offsetOf:typeProperties.offsetOf, layout:typeProperties.layout,
         };
-        if (info.align && info.kind !== "bitfield") {
-            type.align = value => {
-                const explicitAlign = alignment(value);
-                const align = Math.max(info.align, explicitAlign);
-                const size = info.fields ? rounded(info.size, align) : info.size;
-                return descriptor({...info, align, size, explicitAlign:align});
-            };
-        }
+        if (info.align && info.kind !== "bitfield") properties.align = typeProperties.align;
         if (info.kind === "scalar" && info.size > 1) {
-            type.be = () => descriptor({...info, littleEndian:false});
-            type.le = () => descriptor({...info, littleEndian:true});
+            properties.be = typeProperties.be;
+            properties.le = typeProperties.le;
         }
         if (info.kind === "scalar" && /^[ui]/.test(info.scalar)) {
-            type.bitfield = width => {
-                width = integer(width, "invalid bitfield width");
-                if (width > info.size * 8 || info.littleEndian === false || info.explicitAlign || info.enumerators) {
-                    throw new TypeError("unsupported bitfield type or width");
-                }
-                return descriptor({...info, kind:"bitfield", bit:[0,width]});
-            };
-            type.enum = values => {
-                const enumerators = Object.assign(Object.create(null), values);
-                for (const [name, value] of Object.entries(enumerators)) {
-                    if (!/^[a-zA-Z_]\w*$/.test(name)) throw new TypeError("invalid enum name " + name);
-                    scalarBytes(info.scalar, value);
-                }
-                return descriptor({...info, enumerators:Object.freeze(enumerators)});
-            };
+            properties.bitfield = typeProperties.bitfield;
+            properties.enum = typeProperties.enum;
         }
-        if (info.kind === "scalar" || info.kind === "ptr") {
-            type.value = value => makeValue(type, {[valueKeys.bytes]:encodeValue(info, value)});
-        }
+        if (info.kind === "scalar" || info.kind === "ptr") properties.value = typeProperties.value;
         if (info.kind === "ptr") {
-            type.pointee = () => typeInfo(info.element).kind === "self" ? info.element : resolve(info.element);
-            type.nullTerminate = (limit = 4096) => {
-                limit = integer(limit, "invalid termination limit");
-                const element = typeInfo(resolve(info.element));
-                if (!limit || info.length !== undefined || !["scalar", "ptr"].includes(element.kind)
-                    || element.scalar.startsWith("f") || element.size % element.align) {
-                    throw new TypeError("unsupported terminated pointer type or length");
-                }
-                return descriptor({...info, terminated:limit});
-            };
+            properties.pointee = typeProperties.pointee;
+            properties.nullTerminate = typeProperties.nullTerminate;
         }
-        if (info.kind === "array") type.element = () => info.element;
+        if (info.kind === "array") properties.element = typeProperties.element;
         if (info.fields) {
-            type.field = name => {
-                if (!Object.hasOwn(info.fields,name)) throw new Error("unknown C field " + name);
-                return info.fields[name].type;
-            };
-            type.refine = fields => refine(type, fields);
-            type.pack = value => {
-                if (!info.entries) throw new TypeError("cannot repack a resolved or refined layout");
-                return aggregate(info.kind, info.entries, {pack:value,align:info.explicitAlign});
-            };
+            properties.field = typeProperties.field;
+            properties.refine = typeProperties.refine;
+            properties.pack = typeProperties.pack;
         }
+        const type = Object.defineProperties({},properties);
         types.set(type,info);
         return Object.freeze(type);
     }
@@ -911,10 +960,13 @@
             if (info.fields) {
                 seen.add(type);
                 const indent = "    ".repeat(depth + 1);
-                const fields = info.declarations ?? Object.entries(info.fields).map(([name,field]) => ({...field,name}));
+                const {members} = info;
                 const lines = [align + info.kind + " {"];
                 let occupied = 0;
-                for (const {name,type,offset} of fields) {
+                for (let i = 0; i < members.length; i += memberStride) {
+                    const name = members[i];
+                    if (name === lookupOnlyMember) continue;
+                    const type = members[i + memberType], offset = members[i + memberOffset];
                     const member = typeInfo(resolve(type));
                     if (info.kind === "struct" && offset > occupied) lines.push(indent + "// padding: " + (offset - occupied));
                     const bit = member.bit ? ", bitoffset: " + member.bit[0] : "";
@@ -989,10 +1041,11 @@
                 remaining = remaining.slice(index[0].length);
             } else {
                 const member = /^[^.\[\]]+/.exec(remaining)?.[0];
-                const field = member && info.fields && Object.hasOwn(info.fields, member) && info.fields[member];
-                if (!field || !Number.isSafeInteger(field.offset)) throw new TypeError("unknown or dynamic C member");
-                type = field.type;
-                offset += field.offset;
+                const field = member && info.fields ? info.fields[member] : undefined;
+                const fieldOffset = field === undefined ? undefined : info.members[field + memberOffset];
+                if (!Number.isSafeInteger(fieldOffset)) throw new TypeError("unknown or dynamic C member");
+                type = info.members[field + memberType];
+                offset += fieldOffset;
                 remaining = remaining.slice(member.length);
             }
             if (remaining.startsWith(".")) {
@@ -1031,16 +1084,34 @@
             align:kind === "ptr" ? 8 : item.align});
     }
 
+    // Each member occupies [display name, type, byte offset]. The lookup table
+    // stores indices into this array, including promoted and refined members.
+    const memberType = 1, memberOffset = 2, memberStride = 3;
+    const lookupOnlyMember = Symbol();
+    const repackFromMembers = Symbol();
+
+    function addMember(fields, members, name, type, offset, displayName = name, duplicatePrefix = "duplicate C field name ") {
+        if (name != null) {
+            if (Object.hasOwn(fields,name)) throw new TypeError(duplicatePrefix + name);
+            fields[name] = members.length;
+        }
+        members.push(displayName,type,offset);
+    }
+
+    function promoteMembers(fields, members, info, offset, duplicatePrefix) {
+        for (const name of Object.keys(info.fields)) {
+            const index = info.fields[name];
+            addMember(fields,members,name,info.members[index + memberType],
+                offset + info.members[index + memberOffset],lookupOnlyMember,duplicatePrefix);
+        }
+    }
+
     function aggregate(kind, fields, option = {}) {
         const pack = option.pack === undefined || option.pack === 0 ? Infinity : alignment(option.pack);
         if (pack !== Infinity && pack > 16) throw new RangeError("GCC packing must be 0, 1, 2, 4, 8 or 16");
         const entries = Reflect.ownKeys(fields).filter(key => Object.prototype.propertyIsEnumerable.call(fields,key));
         const layout = Object.create(null);
-        const declarations = [];
-        const addField = (name, type, offset) => {
-            if (Object.hasOwn(layout,name)) throw new TypeError("duplicate C field name " + name);
-            layout[name] = {type,offset};
-        };
+        const members = [];
         let occupiedBits = 0, natural = 1, tail;
         for (const [index,name] of entries.entries()) {
             const type = fields[name];
@@ -1057,7 +1128,7 @@
                     if (!anonymous) throw new TypeError("zero-width bitfields must be unnamed");
                     if (arch === "aarch64") natural = Math.max(natural,info.align);
                     if (kind === "struct") occupiedBits = rounded(occupiedBits,info.align * 8);
-                    declarations.push({type:member,offset:kind === "struct" ? occupiedBits / 8 : 0});
+                    addMember(layout,members,undefined,member,kind === "struct" ? occupiedBits / 8 : 0);
                     continue;
                 }
                 const align = Math.min(info.align,pack);
@@ -1067,8 +1138,7 @@
                 if (pack >= info.align && start % unit + width > unit) start = rounded(start,unit);
                 const offset = Math.floor(start / 8);
                 const placed = descriptor({...info,bit:[start % 8,width]});
-                if (!anonymous) addField(name,placed,offset);
-                declarations.push({name:anonymous ? undefined : name,type:placed,offset});
+                addMember(layout,members,anonymous ? undefined : name,placed,offset);
                 const end = kind === "union" && contributesAlignment ? Math.max(width,align * 8) : start + width;
                 occupiedBits = Math.max(occupiedBits,end);
                 continue;
@@ -1079,9 +1149,9 @@
             const offset = kind === "struct" ? rounded(Math.ceil(occupiedBits / 8),align) : 0;
             if (anonymous) {
                 if (!info.fields || info.tail !== undefined) throw new TypeError("expected an anonymous fixed aggregate");
-                for (const [child, field] of Object.entries(info.fields)) addField(child,field.type,offset + field.offset);
-            } else addField(name,member,offset);
-            declarations.push({name:anonymous ? undefined : name,type:member,offset});
+                promoteMembers(layout,members,info,offset);
+            }
+            addMember(layout,members,anonymous ? undefined : name,member,offset);
             if (info.size === undefined) {
                 if (kind !== "struct" || index !== entries.length - 1 || info.kind !== "array") {
                     throw new TypeError("an unsized array must be the final struct field");
@@ -1092,23 +1162,32 @@
         }
         const explicitAlign = option.align === undefined ? undefined : alignment(option.align);
         const align = Math.max(natural, explicitAlign ?? 1);
-        return descriptor({kind, fields:layout, tail, size:rounded(Math.ceil(occupiedBits / 8),align),
-            align, explicitAlign, pack:option.pack, declarations, entries:Object.fromEntries(entries.map(key => [key,fields[key]]))});
+        const size = rounded(Math.ceil(occupiedBits / 8),align);
+        const packOption = option.pack;
+        const originalEntries = entries.map(key => [key,fields[key]]);
+        // Bitfields, anonymous entries and changing getters can require the original input.
+        const packEntries = originalEntries.every(([name,type]) =>
+            Object.hasOwn(layout,name) && members[layout[name] + memberType] === type)
+            ? repackFromMembers : Object.fromEntries(originalEntries);
+        return descriptor({kind, fields:layout, tail, size, align, explicitAlign,
+            pack:packOption, members, entries:packEntries});
     }
 
     function refine(type, fields) {
         const info = typeInfo(type);
         const layout = Object.assign(Object.create(null),info.fields);
+        const members = info.members.slice();
         for (const [name,type] of Object.entries(fields)) {
             const original = layout[name];
-            if (!original) throw new TypeError("unknown C field " + name);
-            const before = typeInfo(resolve(original.type)), after = typeInfo(resolve(type));
+            if (original === undefined) throw new TypeError("unknown C field " + name);
+            const before = typeInfo(resolve(members[original + memberType])), after = typeInfo(resolve(type));
             if (before.kind !== after.kind || before.size !== after.size || before.align !== after.align) {
                 throw new TypeError("refined field changes its C layout");
             }
-            layout[name] = {...original,type};
+            layout[name] = members.length;
+            members.push(lookupOnlyMember,type,members[original + memberOffset]);
         }
-        return descriptor({...info,fields:layout,entries:undefined});
+        return descriptor({...info,fields:layout,members,entries:undefined});
     }
 
     const m = {
@@ -1170,7 +1249,7 @@
         }
         if (info.tail !== undefined) {
             const tail = store[valueKeys.value][info.tail].$size;
-            return tail === undefined ? info.size : Math.max(info.size, info.fields[info.tail].offset + tail);
+            return tail === undefined ? info.size : Math.max(info.size, info.members[info.fields[info.tail] + memberOffset] + tail);
         }
         return info.size;
     }
@@ -1244,7 +1323,8 @@
     function valueField(store, name) {
         const info = store[valueKeys.info];
         bound(store);
-        const {offset,type} = info.fields[name];
+        const field = info.fields[name];
+        const type = info.members[field + memberType], offset = info.members[field + memberOffset];
         return makeValue(type,{[valueKeys.address]:addr(store[valueKeys.address],offset), [valueKeys.parent]:store[valueKeys.value],
             [valueKeys.inheritTid]:true, [valueKeys.self]:store[valueKeys.type], [valueKeys.root]:store[valueKeys.root]});
     }
@@ -1495,24 +1575,18 @@
                 break;
             case "aggregate": {
                 const fields = Object.create(null);
-                const declarations = [];
-                const insert = (name, type, offset) => {
-                    if (Object.hasOwn(fields,name)) throw new TypeError("duplicate DWARF member " + name);
-                    fields[name] = {type,offset};
-                };
+                const members = [];
+                const duplicatePrefix = "duplicate DWARF member ";
                 for (const {name,offset,ty,bit} of info.fields) {
                     const member = node(ty);
                     const underlying = typeInfo(member);
                     const type = bit ? descriptor({kind:"bitfield",scalar:underlying.scalar,bit}) : member;
-                    declarations.push({name,offset,type});
-                    if (name != null) insert(name,type,offset);
-                    else if (underlying.fields) {
-                        for (const [child,field] of Object.entries(underlying.fields)) {
-                            insert(child,field.type,offset + field.offset);
-                        }
+                    addMember(fields,members,name,type,offset,name,duplicatePrefix);
+                    if (name == null && underlying.fields) {
+                        promoteMembers(fields,members,underlying,offset,duplicatePrefix);
                     }
                 }
-                type = descriptor({kind:info.union ? "union" : "struct",size:info.size,align:info.align,fields,declarations});
+                type = descriptor({kind:info.union ? "union" : "struct",size:info.size,align:info.align,fields,members});
                 break;
             }
             case "function":
