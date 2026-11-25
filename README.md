@@ -2,6 +2,10 @@
 
 aidbg 是面向 Agent 的 Linux 调试器。客户端通过 MCP stdio 接收请求，通过明文 gRPC 访问服务端。服务端支持 Linux x86-64 和 AArch64，调试与服务端架构一致的 64 位目标。客户端也支持 Windows x64。
 
+## 下载
+
+GitHub Release 分别提供客户端 `aidbg-client-*` 和服务端 `aidbg-server-*`。Windows x64 提供客户端 ZIP，Linux x86-64 和 AArch64 提供客户端和服务端的 tar.gz。AArch64 的两种包分别标记为 `plain-ptrs`（非压缩指针）和 `compressed-ptrs`（压缩指针）。用户态虚拟地址范围较小的 AArch64 系统应选用 `plain-ptrs`。
+
 ## 启动
 
 在 Linux 调试主机上构建并启动服务端。
@@ -11,6 +15,8 @@ cargo build --release --locked --bins
 state_dir="$(mktemp -d)"
 target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.sock"
 ```
+
+在需要非压缩指针的 AArch64 系统上，从源码构建时加上 `--features plain-ptrs`。
 
 在 MCP 客户端配置中，将 `command` 设为 `aidbg` 可执行文件的绝对路径，并传入 `["--socket", "/absolute/path/to/aidbg.sock"]`。跨主机使用服务端的 `--listen HOST:PORT` 和客户端的 `--endpoint http://HOST:PORT`。Windows 客户端使用 TCP。明文服务应仅绑定可信网络或通过 SSH 转发访问。
 

@@ -17,9 +17,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+            package_arch: x86_64
+            features: ''
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             arch: aarch64
+            package_arch: aarch64-plain-ptrs
+            features: plain-ptrs
+            runner: ubuntu-24.04-arm
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            package_arch: aarch64-compressed-ptrs
+            features: ''
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -33,10 +42,11 @@ jobs:
         id: build
         env:
           TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
         run: |
           set -euo pipefail
           rustup target add "$TARGET"
-          cargo build --locked --release --bins --target "$TARGET"
+          cargo build --locked --release --bins --target "$TARGET" --features "$FEATURES"
       - name: Verify the MCP session
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 5
@@ -56,10 +66,15 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
+          PACKAGE_ARCH: ${{ matrix.package_arch }}
         run: |
           set -euo pipefail
           cd "target/$TARGET/release"
-          for bin in aidbg aidbg-server; do
+          for role in client server; do
+            case "$role" in
+              client) bin=aidbg ;;
+              server) bin=aidbg-server ;;
+            esac
             file "$bin"
             if readelf -lW "$bin" | grep 'INTERP' >/dev/null; then exit 1; fi
             if readelf -dW "$bin" | grep '(NEEDED)' >/dev/null; then exit 1; fi
@@ -68,23 +83,43 @@ jobs:
               aarch64) readelf -hW "$bin" | grep 'AArch64' ;;
               *) exit 1 ;;
             esac
+            tar -czf "$GITHUB_WORKSPACE/aidbg-$role-$GITHUB_REF_NAME-linux-$PACKAGE_ARCH.tar.gz" "$bin"
           done
-          tar -czf "$GITHUB_WORKSPACE/aidbg-$GITHUB_REF_NAME-linux-$ARCH.tar.gz" aidbg aidbg-server
       - uses: actions/upload-artifact@v4
         with:
-          name: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}
-          path: aidbg-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+          name: aidbg-${{ github.ref_name }}-linux-${{ matrix.package_arch }}
+          path: aidbg-*-${{ github.ref_name }}-linux-${{ matrix.package_arch }}.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package Windows x64 client
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $target = 'x86_64-pc-windows-msvc'
+          rustup target add $target
+          cargo build --locked --release --bin aidbg --target $target
+          $client = "target/$target/release/aidbg.exe"
+          & $client --version
+          Compress-Archive -LiteralPath $client -DestinationPath "aidbg-client-${env:GITHUB_REF_NAME}-windows-x86_64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aidbg-${{ github.ref_name }}-windows-x86_64
+          path: aidbg-client-${{ github.ref_name }}-windows-x86_64.zip
           if-no-files-found: error
 
   release:
-    needs: linux
+    needs: [linux, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: aidbg-${{ github.ref_name }}-linux-*
+          pattern: aidbg-${{ github.ref_name }}-*
           merge-multiple: true
           path: dist
       - name: Publish GitHub Release
@@ -93,6 +128,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
-            "dist/aidbg-$GITHUB_REF_NAME-linux-x86_64.tar.gz" \
-            "dist/aidbg-$GITHUB_REF_NAME-linux-aarch64.tar.gz"
+          assets=("dist/aidbg-client-$GITHUB_REF_NAME-windows-x86_64.zip")
+          for arch in x86_64 aarch64-plain-ptrs aarch64-compressed-ptrs; do
+            for role in client server; do
+              assets+=("dist/aidbg-$role-$GITHUB_REF_NAME-linux-$arch.tar.gz")
+            done
+          done
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes "${assets[@]}"
