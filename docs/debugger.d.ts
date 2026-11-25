@@ -955,6 +955,8 @@ export interface TypeSystem {
 
     /** 第二遍编译根据 DWARF 信息替换为精确类型 */
     fromDwarf<const S extends string>(name: S & LiteralString<S>): any;
+    /** 从变量中获取dwarf信息，有可能返回undefined代表找不到类型 */
+    typeOfVar<const S extends string>(name: S & LiteralString<S>): any;
 }
 
 export type ExitEvent = {
