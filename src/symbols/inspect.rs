@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 mod cache;
 mod expression;
+mod source_cache;
 pub(crate) mod type_graph;
 pub(crate) use cache::warm as warm_dwarf;
 pub(crate) mod offline;
@@ -167,6 +168,23 @@ pub(crate) fn live_data_at(
     Some(json!({"type":value["type"]["name"],"graph":graph}))
 }
 
+pub(crate) fn live_variable_image(
+    root: &Path,
+    module: &modules::Module,
+    executable: Option<&fs::Metadata>,
+) -> Result<Option<offline::DwarfImage>> {
+    let image = cache::live_image(root, module, executable)?;
+    Ok(image
+        .separate
+        .as_ref()
+        .or(image.primary.as_ref())
+        .map(|data| offline::DwarfImage {
+            data: data.clone(),
+            bias: 0,
+            path: module.path(),
+        }))
+}
+
 pub(crate) fn stopped_dwarf(
     root: &Path,
     memory: &dyn crate::unwind::UnwindMemory,
@@ -181,6 +199,7 @@ pub(crate) fn stopped_dwarf(
             Some("Stop in a module with matching debug information."),
         )
     };
+    let _context = crate::snapshot_timing::phase("variable_context");
     let module = modules::read(root)?
         .into_iter()
         .find(|module| module.executable_at(pc).is_some())
@@ -203,14 +222,16 @@ pub(crate) fn stopped_dwarf(
             .cloned()
             .ok_or_else(no_dwarf)?,
     };
-    let cfa = crate::unwind::canonical_frame_address(
-        cached.bytes.clone(),
-        &module,
-        link,
-        bias,
-        memory,
-        registers,
-    )
+    let cfa = crate::snapshot_timing::measure("variable_cfa", || {
+        crate::unwind::canonical_frame_address(
+            cached.bytes.clone(),
+            &module,
+            link,
+            bias,
+            memory,
+            registers,
+        )
+    })
     .ok();
     Ok((
         dwarf,
@@ -825,6 +846,33 @@ pub(crate) struct InlineFrame {
     call_line: Option<u64>,
 }
 
+fn inline_frame<'a>(
+    dwarf: &Dwarf<Reader<'a>>,
+    unit: &Unit<Reader<'a>>,
+    entry: &Die<'a>,
+) -> Result<InlineFrame> {
+    let symbol = name(dwarf, unit, entry)?.unwrap_or_else(|| "<inline>".to_owned());
+    let call_file = match (
+        unit.line_program.as_ref(),
+        entry.attr_value(gimli::DW_AT_call_file),
+    ) {
+        (Some(program), Some(AttributeValue::FileIndex(index))) => program
+            .header()
+            .file(index)
+            .map(|file| super::source_path(dwarf, &unit, program.header(), file))
+            .transpose()?,
+        _ => None,
+    };
+    let call_line = entry
+        .attr_value(gimli::DW_AT_call_line)
+        .and_then(|value| value.udata_value());
+    Ok(InlineFrame {
+        symbol,
+        call_file,
+        call_line,
+    })
+}
+
 pub(crate) fn inline_frames(
     dwarf: &Dwarf<Reader<'_>>,
     pc: u64,
@@ -860,29 +908,7 @@ pub(crate) fn inline_frames(
                 if !(range.begin..range.end).contains(&pc) {
                     continue;
                 }
-                let symbol = name(dwarf, &unit, entry)?.unwrap_or_else(|| "<inline>".to_owned());
-                let call_file = match (
-                    unit.line_program.as_ref(),
-                    entry.attr_value(gimli::DW_AT_call_file),
-                ) {
-                    (Some(program), Some(AttributeValue::FileIndex(index))) => program
-                        .header()
-                        .file(index)
-                        .map(|file| super::source_path(dwarf, &unit, program.header(), file))
-                        .transpose()?,
-                    _ => None,
-                };
-                let call_line = entry
-                    .attr_value(gimli::DW_AT_call_line)
-                    .and_then(|value| value.udata_value());
-                active.push((
-                    entry.depth(),
-                    InlineFrame {
-                        symbol,
-                        call_file,
-                        call_line,
-                    },
-                ));
+                active.push((entry.depth(), inline_frame(dwarf, &unit, entry)?));
                 if active.len() > best.len() {
                     best = active
                         .iter()
@@ -1467,6 +1493,7 @@ fn evaluate_variable<'a>(
     operations: &[Access],
     module: PathBuf,
 ) -> Result<Datum> {
+    let location = crate::snapshot_timing::phase("variable_location");
     let ty = typedef_target(eval.unit, entry)?;
     let place = if let Some(attr) = resolved_attr(eval.unit, entry, gimli::DW_AT_location, 0)? {
         let frame_base = frame_base.and_then(|attr| {
@@ -1493,6 +1520,7 @@ fn evaluate_variable<'a>(
             "DWARF variable has no materialized location or constant",
         ));
     };
+    drop(location);
     let address_of = matches!(operations.last(), Some(Access::Address));
     let operations = if address_of {
         &operations[..operations.len() - 1]
@@ -1621,6 +1649,7 @@ struct Scope<'a> {
     active: bool,
     namespace: String,
     frame_base: Option<Attr<'a>>,
+    frame_base_owner: Option<Offset>,
     frame_contains_pc: bool,
     ranges: std::sync::Arc<[gimli::Range]>,
     prologue: bool,
@@ -1635,6 +1664,7 @@ struct Candidate<'a> {
     ranges: std::sync::Arc<[gimli::Range]>,
     prologue: bool,
     frame_base: Option<Attr<'a>>,
+    frame_base_owner: Option<Offset>,
 }
 
 fn prefer<'a>(best: &mut Option<Candidate<'a>>, ambiguous: &mut bool, candidate: Candidate<'a>) {
@@ -1733,7 +1763,21 @@ fn find_variable<'a>(
     let mut declarations = BTreeMap::new();
     let mut best: Option<Candidate<'a>> = None;
     let mut ambiguous = false;
-    while let Some(entry) = entries.next_dfs()? {
+    let prune = visit.is_some()
+        && shadow.is_none()
+        && !all_locals
+        && link_pc.is_some()
+        && !crate::snapshot_timing::baseline();
+    let mut at_sibling = false;
+    loop {
+        let entry = if std::mem::take(&mut at_sibling) {
+            entries.current()
+        } else {
+            entries.next_dfs()?
+        };
+        let Some(entry) = entry else {
+            break;
+        };
         budget.entry()?;
         if function.is_some_and(|offset| entry.depth() <= 0 && entry.offset() != offset) {
             break;
@@ -1781,9 +1825,10 @@ fn find_variable<'a>(
                 scope.ranges = bounds.into();
             }
             scope.local = true;
-            scope.frame_base = entry
-                .attr_value(gimli::DW_AT_frame_base)
-                .or(scope.frame_base);
+            if let Some(frame_base) = entry.attr_value(gimli::DW_AT_frame_base) {
+                scope.frame_base = Some(frame_base);
+                scope.frame_base_owner = Some(entry.offset());
+            }
             if scope.active
                 && tag == gimli::DW_TAG_inlined_subroutine
                 && let Some(offset) = inline_origin_variable(dwarf, unit, entry, target)?
@@ -1800,9 +1845,21 @@ fn find_variable<'a>(
                         ranges: scope.ranges.clone(),
                         prologue: scope.prologue,
                         frame_base: scope.frame_base,
+                        frame_base_owner: scope.frame_base_owner,
                     },
                 );
             }
+        }
+        if prune
+            && scope.local
+            && !scope.active
+            && entry.has_children()
+            && matches!(entry.attr_value(gimli::DW_AT_sibling),
+                Some(AttributeValue::UnitRef(offset)) if offset.0 > entry.offset().0)
+        {
+            crate::snapshot_timing::count("variable_sibling_jumps");
+            at_sibling = entries.next_sibling()?.is_some();
+            continue;
         }
         if !scope.local
             && matches!(
@@ -1844,6 +1901,7 @@ fn find_variable<'a>(
                     ranges: scope.ranges.clone(),
                     prologue: scope.prologue,
                     frame_base: scope.frame_base,
+                    frame_base_owner: scope.frame_base_owner,
                 };
                 if let Some(visit) = visit.as_mut() {
                     if !visit(

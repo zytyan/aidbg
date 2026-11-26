@@ -79,10 +79,10 @@ impl Image {
         })
     }
 
-    fn step(&self, pc: u64, ctx: Context<'_>) -> Result<Step> {
+    fn step(&self, pc: u64, ctx: Context<'_>, saved_cfa: &mut Option<u64>) -> Result<Step> {
         self.with_fde(pc, |section, fde| match section {
-            CallFrameSection::Eh(section) => self.step_section(section, fde, pc, ctx),
-            CallFrameSection::Debug(section) => self.step_section(section, fde, pc, ctx),
+            CallFrameSection::Eh(section) => self.step_section(section, fde, pc, ctx, saved_cfa),
+            CallFrameSection::Debug(section) => self.step_section(section, fde, pc, ctx, saved_cfa),
         })
     }
 
@@ -122,6 +122,7 @@ impl Image {
         fde: FrameDescriptionEntry<Data>,
         pc: u64,
         mut c: Context<'_>,
+        saved_cfa: &mut Option<u64>,
     ) -> Result<Step> {
         if fde.is_signal_trampoline() {
             return Ok(Step::Unsupported("signal_trampoline"));
@@ -133,6 +134,13 @@ impl Image {
         let signed_return = cfg!(target_arch = "aarch64")
             && matches!(row.register(gimli::AArch64::RA_SIGN_STATE), Some(RegisterRule::Constant(v)) if v != 0);
         let cfa = cfa_value(row.cfa(), section, enc, c)?;
+        // Live variable inspection uses the adjusted lookup PC in caller frames.
+        // A direct rule on another register gives the same CFA in either context.
+        if c.regs.get(PC).ok() == Some(pc.wrapping_add(c.bias))
+            || matches!(row.cfa(), CfaRule::RegisterAndOffset { register, .. } if *register != PC)
+        {
+            *saved_cfa = Some(cfa);
+        }
         c.cfa = Some(cfa);
         // Only retain ABI callee-saved registers across a frame when CFI
         // doesn't supply a rule. An x86 return address requires a rule.
@@ -412,7 +420,7 @@ pub struct Frame {
     pc: String,
     lookup_pc: String,
     sp: String,
-    module_id: Option<usize>,
+    pub(crate) module_id: Option<usize>,
     file_offset: Option<String>,
     elf_address: Option<String>,
     module_instance: Option<String>,
@@ -429,7 +437,9 @@ pub struct Frame {
     pub(crate) inline_frames: Vec<crate::symbols::inspect::InlineFrame>,
     pub(crate) method: &'static str,
     #[serde(skip)]
-    link_pc: Option<u64>,
+    pub(crate) link_pc: Option<u64>,
+    #[serde(skip)]
+    pub(crate) cfa: Option<u64>,
     #[serde(skip)]
     pub(crate) lookup_address: u64,
 }
@@ -473,18 +483,22 @@ impl Images {
         self.data
             .entry(id)
             .or_insert_with(|| {
+                let _phase = crate::snapshot_timing::phase("elf_image");
                 let cap = (MAX_IMAGES_TOTAL - self.bytes).min(MAX_IMAGE);
                 let bytes = m.read_image(root, exe, cap).map_err(|e| e.to_string())?;
                 self.bytes += bytes.len() as u64;
                 let mut image = Image::new(Arc::new(bytes), m).map_err(|e| e.to_string())?;
                 if let Ok(obj) = object::File::parse(image.bytes.as_slice())
                     && !obj.has_debug_symbols()
-                    && let Some((_, symbols)) = crate::symbols::find_external_debug(
-                        Some(&root.join("root")),
-                        &m.path(),
-                        &obj,
-                        MAX_IMAGES_TOTAL - self.bytes,
-                    )
+                    && let Some((_, symbols)) =
+                        crate::snapshot_timing::measure("external_debug", || {
+                            crate::symbols::find_external_debug(
+                                Some(&root.join("root")),
+                                &m.path(),
+                                &obj,
+                                MAX_IMAGES_TOTAL - self.bytes,
+                            )
+                        })
                 {
                     self.bytes += symbols.len() as u64;
                     image.symbols = Some(symbols);
@@ -555,6 +569,7 @@ impl Images {
     ) {
         // A large DWARF line table must not consume the time available for
         // naming callers whose ELF symbols are already loaded.
+        let names = crate::snapshot_timing::phase("elf_names");
         for frame in &mut stack.frames {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return;
@@ -576,6 +591,7 @@ impl Images {
                     .clone()
             });
         }
+        drop(names);
         let mut loaded = BTreeMap::new();
         for frame in &mut stack.frames {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -588,10 +604,11 @@ impl Images {
                     crate::symbols::inspect::live_source_images(root, module, executable)
                 })
             {
-                if let Some(source) = images
-                    .iter()
-                    .find_map(|dwarf| dwarf.line(pc).ok().flatten())
-                {
+                if let Some(source) = images.iter().find_map(|dwarf| {
+                    crate::snapshot_timing::measure("dwarf_lines", || dwarf.line(pc))
+                        .ok()
+                        .flatten()
+                }) {
                     frame.file = Some(source.file);
                     frame.line = source.line;
                 }
@@ -601,7 +618,10 @@ impl Images {
                     frame.inline_frames = images
                         .iter()
                         .find_map(|dwarf| {
-                            let frames = dwarf.inline_frames(pc, deadline).ok()?;
+                            let frames = crate::snapshot_timing::measure("dwarf_inline", || {
+                                dwarf.inline_frames(pc, deadline)
+                            })
+                            .ok()?;
                             (!frames.is_empty()).then_some(frames)
                         })
                         .unwrap_or_default();
@@ -613,8 +633,20 @@ impl Images {
             };
             if let Some(source) = debug
                 .as_ref()
-                .and_then(|debug| crate::symbols::dwarf_line(debug, pc).ok().flatten())
-                .or_else(|| crate::symbols::dwarf_line(&object, pc).ok().flatten())
+                .and_then(|debug| {
+                    crate::snapshot_timing::measure("dwarf_lines", || {
+                        crate::symbols::dwarf_line(debug, pc)
+                    })
+                    .ok()
+                    .flatten()
+                })
+                .or_else(|| {
+                    crate::snapshot_timing::measure("dwarf_lines", || {
+                        crate::symbols::dwarf_line(&object, pc)
+                    })
+                    .ok()
+                    .flatten()
+                })
             {
                 frame.file = Some(source.file);
                 frame.line = source.line;
@@ -622,6 +654,7 @@ impl Images {
             if let Some(deadline) = deadline
                 && Instant::now() < deadline
             {
+                let _phase = crate::snapshot_timing::phase("dwarf_inline");
                 frame.inline_frames = crate::symbols::dwarf_inline_frames(
                     debug.as_ref().unwrap_or(&object),
                     pc,
@@ -713,6 +746,7 @@ impl Images {
                     inline_frames: Vec::new(),
                     method,
                     link_pc: None,
+                    cfa: None,
                     lookup_address: lookup,
                 };
                 if Instant::now() >= deadline {
@@ -738,7 +772,7 @@ impl Images {
                     frame.module_instance = Some(hex(instance.base));
                     frame.module_offset = Some(hex(link - image.layout.elf_base));
                     c.bias = lookup.wrapping_sub(link);
-                    image.step(link, c)
+                    image.step(link, c, &mut frame.cfa)
                 })();
                 frames.push(frame);
                 let step = step.or_else(|cfi| {
@@ -876,8 +910,11 @@ pub(crate) fn offline_frames<I: AsRef<OfflineImage>>(
             }
             context.bias = lookup.wrapping_sub(link);
             frame.link = Some(link);
-            frame.cfa = image.image.cfa(link, context).ok();
-            image.image.step(link, context).ok()
+            let step = image.image.step(link, context, &mut frame.cfa).ok();
+            if frame.cfa.is_none() {
+                frame.cfa = image.image.cfa(link, context).ok();
+            }
+            step
         });
         let step = step.or_else(|| {
             if index != 0 {

@@ -1020,6 +1020,14 @@ def validate_debug_cases(client, fixtures, owned):
         const listing = dbg.list(caller, 2);
         console.log(callee.symbol, caller.symbol, caller.locals?.bytes?.value,
                     listing?.lines.some(row => row.text.includes("blocks_for(bytes)")));
+        // Read the same caller PC again before resuming. The scope plan can
+        // be reused, but the value must reflect the changed stack slot.
+        const slot = caller.locals?.bytes?.address;
+        if (slot === undefined || slot === null) throw new Error("missing caller local address");
+        dbg.memory.writeUint32(BigInt(slot), 70001);
+        const updated = dbg.thread(stop.tid).backtrace(2)[1].locals?.bytes?.value;
+        dbg.memory.writeUint32(BigInt(slot), 70000);
+        console.log(updated);
         const controlled = await dbg.pauseThread(stop.tid);
         let parameter: import("aidbg").Variable["value"] = null;
         for (let i = 0; i < 5; ++i) {
@@ -1028,7 +1036,7 @@ def validate_debug_cases(client, fixtures, owned):
             if (parameter === 4464) break;
         }
         console.log(parameter);
-    """, [["blocks_for", "main", 70000, True], [4464]])
+    """, [["blocks_for", "main", 70000, True], [70001], [4464]])
     client.script("await dbg.kill();")
     owned.remove(pid)
 

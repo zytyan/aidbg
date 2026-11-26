@@ -36,6 +36,8 @@ pub mod script;
 pub mod script_observation;
 pub mod selection;
 #[cfg(target_os = "linux")]
+mod snapshot_timing;
+#[cfg(target_os = "linux")]
 mod software_breakpoint;
 #[cfg(target_os = "linux")]
 pub mod symbols;

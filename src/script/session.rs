@@ -599,7 +599,9 @@ impl State {
         pending: &[Pending<'_>],
     ) {
         if !reply.is_closed() {
-            let mut message = self.tool_reply(result, pending, true);
+            let mut message = crate::snapshot_timing::measure("reply_encoding", || {
+                self.tool_reply(result, pending, true)
+            });
             let output_cursor = match self.target.as_ref() {
                 Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
                     let (mut value, cursor) = stdio.mcp_output();
@@ -927,6 +929,9 @@ fn run(
                 Command::Script(_, ms, _) | Command::ScriptWait(_, ms) => *ms,
                 _ => 0,
             };
+            let _snapshot_timing = if matches!(&command, Command::Snapshot(..)) {
+                crate::snapshot_timing::begin()
+            } else { None };
             let result = (|| -> Result<Value> {
                 if wait_ms > 300_000 { return Err(error("wait_ms must be in 0..=300000")); }
                 match command {

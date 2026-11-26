@@ -3,6 +3,31 @@ use crate::unwind::UnwindMemory;
 use serde_json::{Value as Json, json};
 use std::ops::Range;
 
+const MAX_VISIBLE_PLANS: usize = 256;
+const MAX_VISIBLE_VARIABLES: usize = 128;
+
+// Cache immutable DWARF offsets only. All evaluation state belongs to the frame.
+#[derive(Default)]
+pub(super) struct VisibleVariables(Vec<(gimli::DebugInfoOffset, Vec<VariableRecipe>)>);
+
+struct VariableRecipe {
+    name: String,
+    tag: gimli::DwTag,
+    offset: Offset,
+    priority: usize,
+    prologue: bool,
+    frame_base_owner: Option<Offset>,
+}
+
+struct TimedVariableMemory<'a>(&'a dyn UnwindMemory);
+
+impl UnwindMemory for TimedVariableMemory<'_> {
+    fn read_word(&self, address: u64, size: usize) -> Result<u64> {
+        crate::snapshot_timing::count("variable_memory_reads");
+        crate::snapshot_timing::measure("variable_memory", || self.0.read_word(address, size))
+    }
+}
+
 pub(crate) struct Validation {
     pub status: &'static str,
     pub code: &'static str,
@@ -207,31 +232,134 @@ impl DwarfImage {
         let mut truncated = false;
         let mut prologue = false;
         let pc = frame.and_then(|frame| frame.link);
-        let indexed = pc.and_then(|pc| self.data.functions(pc));
+        let timed_memory = TimedVariableMemory(memory);
+        let accelerated = mode == VariableMode::Values && !crate::snapshot_timing::scope_baseline();
+        let key = pc
+            .filter(|_| accelerated && limit <= MAX_VISIBLE_VARIABLES)
+            .map(|pc| (pc, limit));
+        if let Some(key) = key {
+            let plan = self
+                .data
+                .visible
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .get(&key)
+                .cloned();
+            if let (Some(plan), Some(frame)) = (plan, frame) {
+                crate::snapshot_timing::count("variable_scope_cache_hits");
+                let _replay = crate::snapshot_timing::phase("variable_scope_replay");
+                for (id, recipes) in &plan.0 {
+                    let unit = dwarf.unit(dwarf.unit_header(*id)?)?;
+                    let eval = Eval {
+                        dwarf: &dwarf,
+                        unit: &unit,
+                        memory: &timed_memory,
+                        regs: frame.regs,
+                        link_pc: pc,
+                        cfa: frame.cfa,
+                        bias: i128::from(self.bias),
+                        preview_deadline: None,
+                    };
+                    for recipe in recipes {
+                        if Instant::now() >= deadline {
+                            return Err(failure(
+                                "limit_reached",
+                                "DWARF variable scan exceeded its budget",
+                            ));
+                        }
+                        let frame_base = match recipe.frame_base_owner {
+                            Some(owner) => unit.entry(owner)?.attr_value(gimli::DW_AT_frame_base),
+                            None => None,
+                        };
+                        let candidate = Candidate {
+                            offset: recipe.offset,
+                            priority: recipe.priority,
+                            concrete: true,
+                            active: true,
+                            ranges: Default::default(),
+                            prologue: recipe.prologue,
+                            frame_base,
+                            frame_base_owner: recipe.frame_base_owner,
+                        };
+                        items.push(self.render_variable(
+                            &eval,
+                            &candidate,
+                            &recipe.name,
+                            recipe.tag,
+                            mode,
+                        ));
+                    }
+                }
+                return Ok(Self::variable_result(
+                    items, true, offset, limit, false, false,
+                ));
+            }
+        }
+        let mut plan = VisibleVariables::default();
+        let mut cacheable = key.is_some();
+        let indexed = crate::snapshot_timing::measure("variable_index", || {
+            pc.and_then(|pc| self.data.functions(pc))
+        });
+        crate::snapshot_timing::count(if indexed.is_some() {
+            "variable_indexed_frames"
+        } else {
+            "variable_scan_frames"
+        });
+        let direct = match pc {
+            Some(pc) if accelerated && indexed.is_none() => {
+                crate::snapshot_timing::measure("variable_unit_index", || {
+                    self.data
+                        .sources
+                        .variable_units(&dwarf, pc, deadline)
+                        .ok()
+                        .flatten()
+                })
+            }
+            _ => None,
+        };
+        let mut direct = direct.as_ref().map(|units| units.iter());
         let mut indexed = indexed.as_ref().map(|functions| functions.iter());
         let mut units = dwarf.units();
+        let scope = crate::snapshot_timing::phase(if indexed.is_some() {
+            "variable_indexed_scope"
+        } else {
+            "variable_scan_scope"
+        });
+        let prune_units = mode == VariableMode::Values && !crate::snapshot_timing::baseline();
         loop {
             let (header, function) = if let Some(functions) = &mut indexed {
                 let Some((unit, function)) = functions.next() else {
                     break;
                 };
                 (dwarf.unit_header(*unit)?, Some(*function))
+            } else if let Some(units) = &mut direct {
+                let Some(id) = units.next() else { break };
+                crate::snapshot_timing::count("variable_direct_units");
+                (dwarf.unit_header(*id)?, None)
             } else {
                 let Some(header) = units.next()? else { break };
+                if prune_units && pc.is_some_and(|pc| self.data.sources.excludes(&header, pc)) {
+                    crate::snapshot_timing::count("variable_units_skipped");
+                    continue;
+                }
                 (header, None)
             };
+            let id = gimli::UnitOffset(0).to_debug_info_offset(&header);
+            cacheable &= id.is_some();
+            let mut recipes = cacheable.then(Vec::new);
             let unit = dwarf.unit(header)?;
             let eval = Eval {
                 dwarf: &dwarf,
                 unit: &unit,
-                memory,
+                memory: &timed_memory,
                 regs: frame.map_or_else(Registers::empty, |frame| frame.regs),
                 link_pc: pc,
                 cfa: frame.and_then(|frame| frame.cfa),
                 bias: i128::from(self.bias),
                 preview_deadline: None,
             };
-            find_variable(
+            let before = budget.scanned;
+            let scan = find_variable(
                 &dwarf,
                 &unit,
                 "",
@@ -256,26 +384,22 @@ impl DwarfImage {
                         return false;
                     }
                     if mode != VariableMode::Declarations {
-                        let outcome = Outcome::from_result(evaluate_candidate(
-                            &eval,
-                            candidate,
-                            &[],
-                            self.path.clone(),
-                        ));
-                        items.push(if mode == VariableMode::Values {
-                            let optimized = outcome.result.is_none()
-                                && unit.entry(candidate.offset).ok().is_some_and(|entry| {
-                                    matches!(resolved_attr(&unit, &entry, gimli::DW_AT_location, 0), Ok(None))
-                                        && matches!(resolved_attr(&unit, &entry, gimli::DW_AT_const_value, 0), Ok(None))
+                        items.push(self.render_variable(&eval, candidate, qualified, tag, mode));
+                        if let Some(recipes) = recipes.as_mut() {
+                            if qualified.len() <= 512 {
+                                recipes.push(VariableRecipe {
+                                    name: qualified.to_owned(),
+                                    tag,
+                                    offset: candidate.offset,
+                                    priority: candidate.priority,
+                                    prologue: candidate.prologue,
+                                    frame_base_owner: candidate.frame_base_owner,
                                 });
-                            let availability = if optimized { "optimized_out" }
-                                else if outcome.result.is_some() { "available" } else { outcome.status };
-                            json!({"name": qualified, "value":outcome, "scope_depth":candidate.priority,
-                                "availability":availability,
-                                "kind":if tag == gimli::DW_TAG_formal_parameter {"parameter"} else {"variable"}})
-                        } else {
-                            json!({"name": qualified, "value": outcome})
-                        });
+                            } else {
+                                recipes.clear();
+                                cacheable = false;
+                            }
+                        }
                         return true;
                     }
                     prologue |= candidate.prologue;
@@ -337,18 +461,95 @@ impl DwarfImage {
                 }),
                 frame.is_some() && mode == VariableMode::Declarations,
                 function,
-            )?;
+            );
+            crate::snapshot_timing::count_by("variable_dies_visited", budget.scanned - before);
+            scan?;
+            if let (Some(id), Some(recipes)) = (id, recipes) {
+                if !recipes.is_empty() {
+                    plan.0.push((id, recipes));
+                }
+            }
             if truncated || (mode == VariableMode::Parameters && !items.is_empty()) {
                 break;
             }
         }
+        drop(scope);
+        if let Some(key) = key.filter(|_| cacheable && !truncated && Instant::now() < deadline) {
+            let mut cache = self
+                .data
+                .visible
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            if cache.len() == MAX_VISIBLE_PLANS && !cache.contains_key(&key) {
+                cache.pop_first();
+            }
+            cache
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(plan));
+        }
+        Ok(Self::variable_result(
+            items,
+            frame.is_some(),
+            offset,
+            limit,
+            truncated,
+            prologue,
+        ))
+    }
+
+    fn render_variable<'a>(
+        &self,
+        eval: &Eval<'a, '_>,
+        candidate: &Candidate<'a>,
+        qualified: &str,
+        tag: gimli::DwTag,
+        mode: VariableMode,
+    ) -> Json {
+        let unit = eval.unit;
+        let _evaluation = crate::snapshot_timing::phase("variable_evaluate");
+        let outcome =
+            Outcome::from_result(evaluate_candidate(eval, candidate, &[], self.path.clone()));
+        if mode == VariableMode::Values {
+            let optimized = outcome.result.is_none()
+                && unit.entry(candidate.offset).ok().is_some_and(|entry| {
+                    matches!(
+                        resolved_attr(unit, &entry, gimli::DW_AT_location, 0),
+                        Ok(None)
+                    ) && matches!(
+                        resolved_attr(unit, &entry, gimli::DW_AT_const_value, 0),
+                        Ok(None)
+                    )
+                });
+            let availability = if optimized {
+                "optimized_out"
+            } else if outcome.result.is_some() {
+                "available"
+            } else {
+                outcome.status
+            };
+            json!({"name": qualified, "value":outcome, "scope_depth":candidate.priority,
+                                "availability":availability,
+                                "kind":if tag == gimli::DW_TAG_formal_parameter {"parameter"} else {"variable"}})
+        } else {
+            json!({"name": qualified, "value": outcome})
+        }
+    }
+
+    fn variable_result(
+        items: Vec<Json>,
+        has_frame: bool,
+        offset: usize,
+        limit: usize,
+        truncated: bool,
+        prologue: bool,
+    ) -> Json {
         let issue = if prologue {
             Some(crate::Diagnostic::new(
                 "PROLOGUE",
                 "Stopped at the function entry. Local storage may be uninitialized until the prologue has executed.",
                 None,
             ))
-        } else if frame.is_some() && items.is_empty() && offset == 0 {
+        } else if has_frame && items.is_empty() && offset == 0 {
             Some(crate::Diagnostic::new(
                 "NO_LOCALS",
                 "No local variable declarations were found for this frame and filter.",
@@ -357,9 +558,7 @@ impl DwarfImage {
         } else {
             None
         };
-        Ok(
-            json!({"items": items, "next_offset": truncated.then_some(offset + limit), "warnings": [], "issue": issue}),
-        )
+        json!({"items": items, "next_offset": truncated.then_some(offset + limit), "warnings": [], "issue": issue})
     }
 
     pub fn types(

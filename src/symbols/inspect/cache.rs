@@ -152,8 +152,10 @@ pub(super) struct Data {
     sections: DwarfSections<Vec<u8>>,
     index: OnceLock<Option<Index>>,
     index_queued: AtomicBool,
+    pub(super) sources: source_cache::Sources,
     lines: Mutex<BTreeMap<u64, Option<Line>>>,
     inline: Mutex<BTreeMap<u64, Vec<InlineFrame>>>,
+    pub(super) visible: Mutex<BTreeMap<(u64, usize), Arc<offline::VisibleVariables>>>,
     section_bytes: usize,
 }
 
@@ -162,6 +164,7 @@ fn cached_address<T: Clone>(
     cache: &Mutex<BTreeMap<u64, T>>,
     pc: u64,
     lookup: impl FnOnce() -> Result<T>,
+    counters: [&'static str; 2],
 ) -> Result<T> {
     if let Some(value) = cache
         .lock()
@@ -169,8 +172,10 @@ fn cached_address<T: Clone>(
         .get(&pc)
         .cloned()
     {
+        crate::snapshot_timing::count(counters[0]);
         return Ok(value);
     }
+    crate::snapshot_timing::count(counters[1]);
     let value = lookup()?;
     let mut cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
     if cache.len() >= 1024 {
@@ -192,8 +197,10 @@ impl Data {
             sections,
             index: OnceLock::new(),
             index_queued: AtomicBool::new(false),
+            sources: source_cache::Sources::default(),
             lines: Mutex::new(BTreeMap::new()),
             inline: Mutex::new(BTreeMap::new()),
+            visible: Mutex::new(BTreeMap::new()),
             section_bytes: section_bytes.get(),
         });
         data.schedule();
@@ -214,15 +221,21 @@ impl Data {
     }
 
     pub(super) fn line(&self, pc: u64) -> Result<Option<Line>> {
-        cached_address(&self.lines, pc, || {
-            super::super::line_for_pc(&self.borrow(), pc)
-        })
+        cached_address(
+            &self.lines,
+            pc,
+            || self.sources.line(&self.borrow(), pc),
+            ["line_hit", "line_miss"],
+        )
     }
 
     pub(super) fn inline_frames(&self, pc: u64, deadline: Instant) -> Result<Vec<InlineFrame>> {
-        cached_address(&self.inline, pc, || {
-            super::inline_frames(&self.borrow(), pc, deadline)
-        })
+        cached_address(
+            &self.inline,
+            pc,
+            || self.sources.inline(&self.borrow(), pc, deadline),
+            ["inline_hit", "inline_miss"],
+        )
     }
 
     pub fn schedule(self: &Arc<Self>) {
@@ -328,6 +341,7 @@ impl Data {
                                 ranges: Arc::from([]),
                                 prologue: false,
                                 frame_base: None,
+                                frame_base_owner: None,
                             };
                             Some((0, evaluate(dwarf, &unit, candidate)))
                         }
@@ -388,6 +402,7 @@ pub(super) fn live_image(
     module: &Module,
     exe: Option<&fs::Metadata>,
 ) -> Result<Arc<LiveImage>> {
+    let _phase = crate::snapshot_timing::phase("dwarf_image");
     static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
     let mut file = module.open(root, exe.is_some_and(|exe| module.matches(exe)))?;
     let stamp = Stamp::from(&file.metadata()?);
@@ -410,10 +425,12 @@ pub(super) fn live_image(
                     data.schedule();
                 }
                 cache.push(entry);
+                crate::snapshot_timing::count("image_hit");
                 return Ok(image);
             }
         }
     }
+    crate::snapshot_timing::count("image_miss");
     if stamp.2 > IMAGE_LIMIT {
         return Err(error("module exceeds image byte budget"));
     }
@@ -423,11 +440,13 @@ pub(super) fn live_image(
         return Err(error("module changed during image read"));
     }
     let object = object::File::parse(&*bytes)?;
-    let debug = DebugFile::discover(root, module, &object);
+    let debug = crate::snapshot_timing::measure("external_debug", || {
+        DebugFile::discover(root, module, &object)
+    });
     let separate = debug.as_ref().and_then(DebugFile::parse);
     let load = |object: &object::File<'_>| {
         if object.section_by_name(".debug_info").is_some() {
-            Data::load(object).map(Some)
+            crate::snapshot_timing::measure("dwarf_sections", || Data::load(object)).map(Some)
         } else {
             Ok(None)
         }
@@ -472,26 +491,33 @@ mod tests {
 
     #[test]
     fn source_cache_preserves_hits_and_does_not_store_failed_lookups() -> Result<()> {
+        let counters = ["test_hit", "test_miss"];
         let cache = Mutex::new(BTreeMap::new());
         assert!(
-            cached_address(&cache, 1, || -> Result<Option<u64>> {
-                Err(error("deadline expired"))
-            })
+            cached_address(
+                &cache,
+                1,
+                || -> Result<Option<u64>> { Err(error("deadline expired")) },
+                counters
+            )
             .is_err()
         );
-        assert_eq!(cached_address(&cache, 1, || Ok(Some(7)))?, Some(7));
         assert_eq!(
-            cached_address(&cache, 1, || panic!("cached source was reparsed"))?,
+            cached_address(&cache, 1, || Ok(Some(7)), counters)?,
             Some(7)
         );
-        assert_eq!(cached_address(&cache, 2, || Ok(None))?, None);
         assert_eq!(
-            cached_address(&cache, 2, || panic!("cached miss was reparsed"))?,
+            cached_address(&cache, 1, || panic!("cached source was reparsed"), counters)?,
+            Some(7)
+        );
+        assert_eq!(cached_address(&cache, 2, || Ok(None), counters)?, None);
+        assert_eq!(
+            cached_address(&cache, 2, || panic!("cached miss was reparsed"), counters)?,
             None
         );
         for address in 3..=1025 {
             assert_eq!(
-                cached_address(&cache, address, || Ok(Some(address)))?,
+                cached_address(&cache, address, || Ok(Some(address)), counters)?,
                 Some(address)
             );
         }

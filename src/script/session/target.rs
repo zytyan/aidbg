@@ -68,6 +68,15 @@ struct FrameImages {
     images: Images,
     modules: Vec<modules::Module>,
     executable: Option<fs::Metadata>,
+    variables: BTreeMap<usize, Option<symbols::inspect::offline::DwarfImage>>,
+    reuse_variable_context: bool,
+}
+
+struct VariableFrame {
+    registers: regs::Registers,
+    module: Option<usize>,
+    link: Option<u64>,
+    cfa: Option<u64>,
 }
 
 pub(super) struct Live {
@@ -654,6 +663,7 @@ impl Live {
         };
         let started = Instant::now();
         let stop_deadline = started + Duration::from_millis(stop_timeout_ms.into());
+        let stopping = crate::snapshot_timing::phase("pause");
         let stop = if stop_timeout_ms == 0 {
             if threads_requested.is_subset(&previous) {
                 Ok(())
@@ -666,6 +676,7 @@ impl Live {
                 None => self.trace.freeze(stop_deadline),
             }
         };
+        drop(stopping);
         if tid.is_none() {
             threads_requested.extend(self.tids());
         }
@@ -678,6 +689,7 @@ impl Live {
             if let Err(err) = &stop {
                 incomplete.push(json!({"stage":"stop","error":err.to_string()}));
             }
+            let registers_phase = crate::snapshot_timing::phase("registers");
             let mut captured = Vec::new();
             for &tid in &threads_requested {
                 if live
@@ -700,16 +712,19 @@ impl Live {
                     }
                 }
             }
-            let mappings = match live.mappings() {
+            drop(registers_phase);
+            let mappings = match crate::snapshot_timing::measure("mappings", || live.mappings()) {
                 Ok(mappings) => mappings,
                 Err(err) => {
                     incomplete.push(json!({"stage":"mappings","error":err.to_string()}));
                     json!([])
                 }
             };
+            let mut variable_images = None;
             if !captured.is_empty() {
-                match live.frame_images() {
+                match crate::snapshot_timing::measure("mappings", || live.frame_images()) {
                     Ok(mut images) => {
+                        images.reuse_variable_context = stop.is_ok() && tid.is_none();
                         let count = captured.len();
                         for (index, (tid, registers, frames)) in captured.iter_mut().enumerate() {
                             let now = Instant::now();
@@ -737,6 +752,7 @@ impl Live {
                                 ),
                             }
                         }
+                        variable_images = Some(images);
                     }
                     Err(err) => incomplete.push(json!({"stage":"frames","error":err.to_string()})),
                 }
@@ -747,7 +763,11 @@ impl Live {
                 let mut skipped = false;
                 for (mut row, stack) in frames {
                     if Instant::now() < deadline {
-                        live.add_frame_values(&mut row, stack, deadline);
+                        crate::snapshot_timing::measure("variables", || {
+                            if let Some(images) = variable_images.as_mut() {
+                                live.add_frame_values(&mut row, stack, images, deadline);
+                            }
+                        });
                     } else {
                         skipped = true;
                     }
@@ -776,7 +796,35 @@ impl Live {
             Ok(snapshot)
         };
         let result = collect(self);
-        let cleanup = self.restore_temporary_stops(&previous);
+        let cleanup =
+            crate::snapshot_timing::measure("restore", || self.restore_temporary_stops(&previous));
+        crate::snapshot_timing::details(|| {
+            let mut detail = json!({"pid":self.pid, "requested":threads_requested.len(),
+                "restore_ok":cleanup.is_ok(), "state":self.execution_state(),
+                "stopped_before":previous, "stopped_after":self.trace.threads.iter()
+                    .filter_map(|(&tid,thread)| thread.stop.map(|_| tid)).collect::<Vec<_>>()});
+            if let Ok(snapshot) = &result {
+                let threads = snapshot["threads"].as_array().into_iter().flatten();
+                let frames = threads
+                    .clone()
+                    .flat_map(|thread| thread["frames"].as_array().into_iter().flatten());
+                detail["captured_threads"] = json!(threads.count());
+                detail["frames"] = json!(frames.clone().count());
+                detail["named_frames"] = json!(
+                    frames
+                        .clone()
+                        .filter(|frame| frame["symbol"].is_string())
+                        .count()
+                );
+                detail["source_frames"] = json!(
+                    frames
+                        .filter(|frame| frame["file"].is_string() && frame["line"].is_number())
+                        .count()
+                );
+                detail["incomplete"] = snapshot["incomplete"].clone();
+            }
+            detail
+        });
         result.and_then(|snapshot| cleanup.map(|()| snapshot))
     }
 
@@ -922,6 +970,8 @@ impl Live {
             images: Images::new(),
             modules: modules::read(&self.root)?,
             executable: fs::metadata(self.root.join("exe")).ok(),
+            variables: BTreeMap::new(),
+            reuse_variable_context: false,
         })
     }
 
@@ -932,7 +982,7 @@ impl Live {
             .unwind_frames(regs, limit, deadline, &mut images)?
             .into_iter()
             .map(|(mut row, registers)| {
-                self.add_frame_values(&mut row, registers, deadline);
+                self.add_frame_values(&mut row, registers, &mut images, deadline);
                 row
             })
             .collect())
@@ -944,8 +994,9 @@ impl Live {
         limit: usize,
         deadline: Instant,
         loaded: &mut FrameImages,
-    ) -> Result<Vec<(Value, regs::Registers)>> {
+    ) -> Result<Vec<(Value, VariableFrame)>> {
         let mut frame_registers = Vec::new();
+        let unwind = crate::snapshot_timing::phase("unwind");
         let mut stack = loaded.images.walk_registers(
             &self.trace,
             regs,
@@ -955,6 +1006,7 @@ impl Live {
             deadline,
             |_, registers| frame_registers.push(registers),
         );
+        drop(unwind);
         stack.frames.truncate(limit);
         loaded.images.symbolize_until(
             &mut stack,
@@ -977,6 +1029,12 @@ impl Live {
                 } else {
                     frame.inline_frames.clone()
                 };
+                let variable_frame = VariableFrame {
+                    registers,
+                    module: frame.module_id,
+                    link: frame.link_pc,
+                    cfa: frame.cfa,
+                };
                 let frame = serde_json::to_value(frame)?;
                 let fp = registers.get(regs::FP).ok().map(hex);
                 let source = (Instant::now() < deadline)
@@ -993,19 +1051,75 @@ impl Live {
                 Ok((json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
                     "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
                     "file":file,"line":line,"unwindMethod":frame["method"],
-                    "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames}), registers))
+                    "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames}), variable_frame))
             })
             .collect()
     }
 
-    fn add_frame_values(&self, row: &mut Value, registers: regs::Registers, deadline: Instant) {
-        if let Ok(Value::Object(fields)) = self.frame_values(registers, deadline) {
+    fn add_frame_values(
+        &self,
+        row: &mut Value,
+        frame: VariableFrame,
+        images: &mut FrameImages,
+        deadline: Instant,
+    ) {
+        let values = if images.reuse_variable_context
+            && Instant::now() < deadline
+            && self.dwarf.is_empty()
+            && !crate::snapshot_timing::baseline()
+            && let (Some(module), Some(link), Some(cfa)) = (frame.module, frame.link, frame.cfa)
+            && let Ok(pc) = frame.registers.get(regs::PC)
+            && let Some(bias) = pc.checked_sub(link)
+        {
+            self.unwound_frame_values(frame.registers, images, module, link, bias, cfa, deadline)
+        } else {
+            crate::snapshot_timing::count("variable_context_fallback");
+            self.frame_values(frame.registers, deadline)
+        };
+        if let Ok(Value::Object(fields)) = values {
             for (key, value) in fields {
                 if !value.is_null() {
                     row[key] = value;
                 }
             }
         }
+    }
+
+    fn unwound_frame_values(
+        &self,
+        registers: regs::Registers,
+        images: &mut FrameImages,
+        module: usize,
+        link: u64,
+        bias: u64,
+        cfa: u64,
+        deadline: Instant,
+    ) -> Result<Value> {
+        use std::collections::btree_map::Entry;
+        let context = crate::snapshot_timing::phase("variable_context");
+        let image = match images.variables.entry(module) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(symbols::inspect::live_variable_image(
+                &self.root,
+                &images.modules[module],
+                images.executable.as_ref(),
+            )?),
+        };
+        let Some(mut image) = image.clone() else {
+            return Ok(Value::Null);
+        };
+        image.bias = bias;
+        let pc = registers.get(regs::PC)?;
+        let frame = crate::unwind::OfflineFrame {
+            regs: registers,
+            pc,
+            link: Some(link),
+            lookup_pc: pc,
+            cfa: Some(cfa),
+        };
+        crate::snapshot_timing::count("variable_context_reused");
+        drop(context);
+        image.frame_values(&self.trace, &frame, 64, deadline)
     }
 
     fn frame_values(&self, registers: regs::Registers, deadline: Instant) -> Result<Value> {
