@@ -34,6 +34,7 @@ pub mod run;
 #[cfg(target_os = "linux")]
 pub mod script;
 pub mod script_observation;
+pub mod script_types;
 pub mod selection;
 #[cfg(target_os = "linux")]
 mod snapshot_timing;

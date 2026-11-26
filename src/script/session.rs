@@ -12,7 +12,7 @@ mod target;
 
 use self::target::{Event, Live, Target};
 use super::{MAX_SOURCE_BYTES, compiler::Compiler};
-use crate::{Result, error, procfs, regs, rpc::*};
+use crate::{Result, error, procfs, regs, rpc::*, script_types};
 use rquickjs::{
     CatchResultExt, Context, Ctx, Exception, Function, Module, Object, Promise, Runtime,
     Value as JsValue,
@@ -941,32 +941,6 @@ impl Exports {
     }
 }
 
-pub const DEBUGGER_DECLARATIONS: &str = include_str!("../../docs/debugger.d.ts");
-pub const NODE_DECLARATIONS: &str = include_str!("session/node.d.ts");
-
-/// The aidbg module and globals available at the start of a script session.
-pub fn declarations() -> String {
-    let api = DEBUGGER_DECLARATIONS.replace("export declare ", "export ");
-    format!(
-        r#"declare module "aidbg" {{
-{api}
-}}
-interface AidbgGlobals {{}}
-declare const dbg: import("aidbg").Debugger;
-declare const m: import("aidbg").TypeSystem;
-declare const $: AidbgGlobals & import("aidbg").GlobalScope;
-declare const console: import("aidbg").Console;
-declare const fmt: import("aidbg").Format;
-declare const setTimeout: typeof import("aidbg").setTimeout;
-declare const clearTimeout: typeof import("aidbg").clearTimeout;
-declare const queueMicrotask: typeof import("aidbg").queueMicrotask;
-declare const sleep: typeof import("aidbg").sleep;
-declare const AbortController: typeof import("aidbg").AbortController;
-type AbortSignal = import("aidbg").AbortSignal;
-"#
-    )
-}
-
 fn run(
     state_dir: PathBuf,
     session_id: String,
@@ -1011,7 +985,7 @@ fn run(
         timers: BTreeMap::new(),
         next_timer: 0,
     }));
-    let declarations = format!("{}\n{NODE_DECLARATIONS}", declarations());
+    let declarations = format!("{}\n{}", script_types::declarations(), script_types::NODE_DECLARATIONS);
     let mut compiler = Compiler::with_session_api(&declarations, true);
     let result = context.with(|ctx| {
         ctx.store_userdata(files::Jobs::default()).map_err(|_| error("cannot initialize filesystem jobs"))?;
