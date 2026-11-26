@@ -526,53 +526,68 @@ impl Images {
         self.symbolize_frames(stack, Some(deadline));
     }
 
+    fn symbol_objects(
+        &self,
+        frame: &Frame,
+    ) -> Option<(u64, object::File<'_>, Option<object::File<'_>>)> {
+        let (module, pc) = frame.module_id.zip(frame.link_pc)?;
+        let image = self.data.get(&module)?.as_ref().ok()?;
+        let object = object::File::parse(image.bytes.as_slice()).ok()?;
+        let debug = image
+            .symbols
+            .as_deref()
+            .and_then(|bytes| object::File::parse(bytes).ok());
+        Some((pc, object, debug))
+    }
+
     fn symbolize_frames(&self, stack: &mut Stack, deadline: Option<Instant>) {
+        // A large DWARF line table must not consume the time available for
+        // naming callers whose ELF symbols are already loaded.
+        for frame in &mut stack.frames {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return;
+            }
+            let Some((pc, object, debug)) = self.symbol_objects(frame) else {
+                continue;
+            };
+            frame.missing_debug_sections =
+                crate::symbols::missing_debug_sections(&object, debug.as_ref());
+            frame.names = debug
+                .as_ref()
+                .and_then(|debug| modules::symbol(debug, pc))
+                .or_else(|| modules::symbol(&object, pc));
+            frame.function = frame.names.as_ref().map(|names| {
+                names
+                    .demangled_name
+                    .as_ref()
+                    .unwrap_or(&names.display_name)
+                    .clone()
+            });
+        }
         for frame in &mut stack.frames {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
             }
-            let Some((module, pc)) = frame.module_id.zip(frame.link_pc) else {
+            let Some((pc, object, debug)) = self.symbol_objects(frame) else {
                 continue;
             };
-            let Some(Ok(image)) = self.data.get(&module) else {
-                continue;
-            };
-            if let Ok(obj) = object::File::parse(image.bytes.as_slice()) {
-                let debug = image
-                    .symbols
-                    .as_deref()
-                    .and_then(|bytes| object::File::parse(bytes).ok());
-                frame.missing_debug_sections =
-                    crate::symbols::missing_debug_sections(&obj, debug.as_ref());
-                frame.names = debug
-                    .as_ref()
-                    .and_then(|debug| modules::symbol(debug, pc))
-                    .or_else(|| modules::symbol(&obj, pc));
-                frame.function = frame.names.as_ref().map(|names| {
-                    names
-                        .demangled_name
-                        .as_ref()
-                        .unwrap_or(&names.display_name)
-                        .clone()
-                });
-                if let Some(source) = debug
-                    .as_ref()
-                    .and_then(|debug| crate::symbols::dwarf_line(debug, pc).ok().flatten())
-                    .or_else(|| crate::symbols::dwarf_line(&obj, pc).ok().flatten())
-                {
-                    frame.file = Some(source.file);
-                    frame.line = source.line;
-                }
-                if let Some(deadline) = deadline
-                    && Instant::now() < deadline
-                {
-                    frame.inline_frames = crate::symbols::dwarf_inline_frames(
-                        debug.as_ref().unwrap_or(&obj),
-                        pc,
-                        deadline,
-                    )
-                    .unwrap_or_default();
-                }
+            if let Some(source) = debug
+                .as_ref()
+                .and_then(|debug| crate::symbols::dwarf_line(debug, pc).ok().flatten())
+                .or_else(|| crate::symbols::dwarf_line(&object, pc).ok().flatten())
+            {
+                frame.file = Some(source.file);
+                frame.line = source.line;
+            }
+            if let Some(deadline) = deadline
+                && Instant::now() < deadline
+            {
+                frame.inline_frames = crate::symbols::dwarf_inline_frames(
+                    debug.as_ref().unwrap_or(&object),
+                    pc,
+                    deadline,
+                )
+                .unwrap_or_default();
             }
         }
     }
