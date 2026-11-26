@@ -3,6 +3,8 @@ declare const dbg: Debugger;
 declare const m: TypeSystem;
 declare const $: Record<string, unknown>;
 declare const console: Console;
+// Shared output methods, live inspection, and compatibility commands.
+declare const fmt: import("aidbg").Format;
 declare function setTimeout(callback: () => void, ms?: number): number;
 declare function clearTimeout(id: number): void;
 declare function queueMicrotask(callback: () => void): void;
@@ -16,7 +18,7 @@ interface Debugger {
     readonly process: Process;
     thread(tid: number): Thread;
     threads(): readonly Thread[];
-    snapshot(options?: number | { tid?: number; context?: boolean }): Promise<DebugSnapshot>;
+    snapshot(options?: number | { tid?: number; context?: boolean; stopTimeoutMs?: number }): Promise<DebugSnapshot>;
     backtraceAll(): Promise<Pick<DebugSnapshot, "threads" | "incomplete">>;
     traceHits(at: bigint | string, options?: { tid?: number; timeoutMs?: number; limit?: number }): Promise<{ stop: WaitResult<StopEvent>; hits: readonly { tid: number; hitCount: number }[]; limitReached: boolean }>;
     waitOutput(tid: number, timeoutMs?: number): Promise<WaitOutputResult>;

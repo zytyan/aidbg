@@ -1096,6 +1096,10 @@ pub struct ResolvedAddress {
     symbol_override: Option<OverrideRule>,
     #[serde(skip_serializing_if = "Option::is_none")]
     original_symbol: Option<Symbol>,
+    #[serde(skip)]
+    preceding_symbol: Option<Symbol>,
+    #[serde(skip)]
+    section: Option<String>,
     source_line: Option<Line>,
     issues: Vec<String>,
 }
@@ -1218,6 +1222,21 @@ impl ResolvedAddress {
         }))
     }
 
+    pub(crate) fn symbol_at(&self) -> Option<serde_json::Value> {
+        let symbol = self.symbol.as_ref().or(self.preceding_symbol.as_ref())?;
+        let parse = |address: &str| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok();
+        let offset =
+            parse(self.elf_address.as_deref()?)?.checked_sub(parse(&symbol.elf_address)?)?;
+        let address =
+            u64::from_str_radix(self.runtime_address.trim_start_matches("0x"), 16).ok()?;
+        Some(serde_json::json!({
+            "name": symbol.name, "address": hex(address.checked_sub(offset)?),
+            "offset": hex(offset), "module": self.module, "kind": symbol.kind,
+            "section": self.section,
+            "match": if self.symbol.is_none() { "nearest" } else if offset == 0 { "exact" } else { "within" },
+        }))
+    }
+
     pub(crate) fn stop_site(&self) -> serde_json::Value {
         serde_json::json!({
             "address": self.runtime_address,
@@ -1231,6 +1250,19 @@ impl ResolvedAddress {
 }
 
 pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<ResolvedAddress> {
+    resolve_address(pid, address, overrides, false)
+}
+
+pub(crate) fn symbol_at(pid: i32, address: u64) -> Result<Option<serde_json::Value>> {
+    Ok(resolve_address(pid, address, &[], true)?.symbol_at())
+}
+
+fn resolve_address(
+    pid: i32,
+    address: u64,
+    overrides: &[OverrideRule],
+    lookup_only: bool,
+) -> Result<ResolvedAddress> {
     let process = Process::open(pid)?;
     let mut result = ResolvedAddress {
         runtime_address: hex(address),
@@ -1243,6 +1275,8 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
         symbol: None,
         symbol_override: None,
         original_symbol: None,
+        preceding_symbol: None,
+        section: None,
         source_line: None,
         issues: Vec::new(),
     };
@@ -1315,6 +1349,22 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
             .into_iter()
             .map(stripped_issue),
     );
+    let section = lookup_only
+        .then(|| {
+            image.sections().find(|section| {
+                section.kind() != object::SectionKind::Metadata
+                    && section.address() != 0
+                    && link
+                        .checked_sub(section.address())
+                        .is_some_and(|delta| delta < section.size())
+            })
+        })
+        .flatten();
+    result.section = section
+        .as_ref()
+        .and_then(|section| section.name().ok())
+        .map(str::to_owned);
+    let mut nearest = None;
     let is_exec = map.executable();
     let mut best = None;
     for (sym, table, external) in symbol_entries(&image, debug_image.as_ref()) {
@@ -1326,7 +1376,29 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
         let Some(delta) = link.checked_sub(sym.address()) else {
             continue;
         };
-        if delta >= sym.size().max(1) {
+        let (size, kind, start) = (sym.size(), sym.kind(), sym.address());
+        let record = || {
+            symbol_record(
+                sym,
+                name,
+                Source {
+                    table,
+                    debug_file: external
+                        .then(|| debug.as_ref().expect("parsed debug image").display_path()),
+                },
+            )
+        };
+        if delta >= size.max(1) {
+            if lookup_only
+                && matches!(kind, SymbolKind::Text | SymbolKind::Data | SymbolKind::Tls)
+                && section
+                    .as_ref()
+                    .is_some_and(|section| start >= section.address())
+                && nearest.is_none_or(|nearest| delta < nearest)
+            {
+                nearest = Some(delta);
+                result.preceding_symbol = Some(record());
+            }
             continue;
         }
         if best.is_none_or(|best| delta < best) {
@@ -1336,16 +1408,11 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
             } else {
                 format!("{name}+{}", hex(delta))
             });
-            result.symbol = Some(symbol_record(
-                sym,
-                name,
-                Source {
-                    table,
-                    debug_file: external
-                        .then(|| debug.as_ref().expect("parsed debug image").display_path()),
-                },
-            ));
+            result.symbol = Some(record());
         }
+    }
+    if lookup_only {
+        return Ok(result);
     }
     if let (Some(file), Some(obj)) = (debug.as_ref(), debug_image.as_ref()) {
         match dwarf_line(obj, link) {
@@ -1383,6 +1450,194 @@ pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<Res
         }
     }
     Ok(result)
+}
+
+pub(crate) struct RuntimeImports {
+    pub slots: BTreeMap<u64, String>,
+    plt: Vec<std::ops::Range<u64>>,
+}
+
+impl RuntimeImports {
+    pub fn is_plt(&self, address: u64) -> bool {
+        self.plt.iter().any(|range| range.contains(&address))
+    }
+}
+
+pub(crate) fn runtime_imports(pid: i32, pc: u64) -> Option<RuntimeImports> {
+    use object::{ObjectSymbolTable, RelocationFlags, RelocationTarget};
+    let process = Process::open(pid).ok()?;
+    let (module, map) = process
+        .modules
+        .iter()
+        .find_map(|module| Some((module, module.executable_at(pc)?)))?;
+    let bytes = module
+        .read_image(&process.root, process.exe.as_ref(), IMAGE_LIMIT)
+        .ok()?;
+    let image = object::File::parse(&*bytes).ok()?;
+    let layout = Layout::new(&image, module).ok()?;
+    let (instance, _) = layout.for_address(map, pc)?;
+    let architecture = image.architecture();
+    let mut requested = BTreeMap::new();
+    if let Some(table) = image.dynamic_symbol_table() {
+        for (address, relocation) in image
+            .dynamic_relocations()
+            .into_iter()
+            .flatten()
+            .take(100_000)
+        {
+            if let (RelocationFlags::Elf { r_type }, RelocationTarget::Symbol(index)) =
+                (relocation.flags(), relocation.target())
+                && import_relocation(architecture, r_type)
+                && let Ok(symbol) = table.symbol_by_index(index)
+                && let Ok(name) = symbol.name()
+                && !name.is_empty()
+            {
+                requested.insert(address, name.to_owned());
+            }
+        }
+    }
+    if requested.is_empty() {
+        requested = dynamic_segment_imports(&bytes, architecture).unwrap_or_default();
+    }
+    let slots = requested
+        .into_iter()
+        .filter_map(|(address, name)| {
+            Some((
+                layout.runtime(instance, address, module, &process.anonymous)?,
+                name,
+            ))
+        })
+        .collect();
+    let plt = [".plt", ".plt.sec", ".plt.got", ".iplt"]
+        .into_iter()
+        .filter_map(|name| {
+            let section = image.section_by_name(name)?;
+            let start = layout.runtime(instance, section.address(), module, &process.anonymous)?;
+            Some(start..start.checked_add(section.size())?)
+        })
+        .collect();
+    Some(RuntimeImports { slots, plt })
+}
+
+fn import_relocation(
+    architecture: object::Architecture,
+    kind: object::elf::RelocationType,
+) -> bool {
+    use object::elf::*;
+    match architecture {
+        object::Architecture::X86_64 => matches!(kind, R_X86_64_JUMP_SLOT | R_X86_64_GLOB_DAT),
+        object::Architecture::Aarch64 => matches!(kind, R_AARCH64_JUMP_SLOT | R_AARCH64_GLOB_DAT),
+        _ => false,
+    }
+}
+
+// Section headers may be absent. Use the file-backed PT_LOAD segments to
+// interpret the relocation and symbol addresses from PT_DYNAMIC.
+fn dynamic_segment_imports(
+    bytes: &[u8],
+    architecture: object::Architecture,
+) -> Option<BTreeMap<u64, String>> {
+    use object::{
+        elf::*,
+        read::elf::{Dyn, ElfFile64, ProgramHeader, Rel, Rela, Sym},
+    };
+    let image = ElfFile64::<object::Endianness>::parse(bytes).ok()?;
+    let endian = image.endian();
+    let segments = image.elf_program_headers();
+    let dynamic = segments
+        .iter()
+        .find_map(|segment| segment.dynamic(endian, bytes).ok().flatten())?;
+    let mut tags = BTreeMap::new();
+    for entry in dynamic.iter().take(4096) {
+        let tag = entry.d_tag(endian);
+        if tag == DT_NULL {
+            break;
+        }
+        tags.entry(tag).or_insert_with(|| entry.d_val(endian));
+    }
+    let segment_data = |address, size| {
+        segments
+            .iter()
+            .filter(|segment| segment.p_type(endian) == PT_LOAD)
+            .find_map(|segment| {
+                segment
+                    .data_range(endian, bytes, address, size)
+                    .ok()
+                    .flatten()
+            })
+    };
+    let strings = segment_data(*tags.get(&DT_STRTAB)?, *tags.get(&DT_STRSZ)?)?;
+    let symbols = *tags.get(&DT_SYMTAB)?;
+    let symbol_size = size_of::<Sym64<object::Endianness>>() as u64;
+    if tags.get(&DT_SYMENT) != Some(&symbol_size) {
+        return None;
+    }
+    let mut found = BTreeMap::new();
+    let mut add = |address, kind, index: u32| -> Option<()> {
+        if !import_relocation(architecture, kind) || index == 0 {
+            return None;
+        }
+        let symbol = segment_data(
+            symbols.checked_add(u64::from(index).checked_mul(symbol_size)?)?,
+            symbol_size,
+        )?;
+        let (symbol, _) = object::pod::from_bytes::<Sym64<object::Endianness>>(symbol).ok()?;
+        let name = strings.get(symbol.st_name(endian) as usize..)?;
+        let end = name.iter().take(4096).position(|&byte| byte == 0)?;
+        let name = std::str::from_utf8(&name[..end]).ok()?;
+        if !name.is_empty() {
+            found.insert(address, name.to_owned());
+        }
+        Some(())
+    };
+    let jump_kind = tags.get(&DT_PLTREL).copied();
+    for (address_tag, size_tag, rela) in [
+        (DT_RELA, DT_RELASZ, true),
+        (DT_REL, DT_RELSZ, false),
+        (DT_JMPREL, DT_PLTRELSZ, jump_kind == Some(DT_RELA.0 as u64)),
+    ] {
+        if address_tag == DT_JMPREL
+            && !matches!(jump_kind, Some(kind) if kind == DT_REL.0 as u64 || kind == DT_RELA.0 as u64)
+        {
+            continue;
+        }
+        let Some((&address, &size)) = tags.get(&address_tag).zip(tags.get(&size_tag)) else {
+            continue;
+        };
+        let Some(entries) = segment_data(address, size) else {
+            continue;
+        };
+        if rela {
+            for bytes in entries
+                .chunks_exact(size_of::<Rela64<object::Endianness>>())
+                .take(100_000)
+            {
+                if let Ok((entry, _)) = object::pod::from_bytes::<Rela64<object::Endianness>>(bytes)
+                {
+                    add(
+                        entry.r_offset(endian),
+                        entry.r_type(endian, false),
+                        entry.r_sym(endian, false),
+                    );
+                }
+            }
+        } else {
+            for bytes in entries
+                .chunks_exact(size_of::<Rel64<object::Endianness>>())
+                .take(100_000)
+            {
+                if let Ok((entry, _)) = object::pod::from_bytes::<Rel64<object::Endianness>>(bytes)
+                {
+                    add(
+                        entry.r_offset(endian),
+                        entry.r_type(endian),
+                        entry.r_sym(endian),
+                    );
+                }
+            }
+        }
+    }
+    Some(found)
 }
 
 pub(crate) fn code_start(root: &Path, address: u64) -> Option<u64> {

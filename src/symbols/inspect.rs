@@ -102,6 +102,53 @@ pub(crate) fn discover_stopped(
     })
 }
 
+pub(crate) fn live_data_at(
+    root: &Path,
+    memory: &dyn crate::unwind::UnwindMemory,
+    address: u64,
+    hit: &serde_json::Value,
+    deadline: Instant,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    if hit["kind"] != "data" || hit["match"] == "nearest" {
+        return None;
+    }
+    let name = hit["name"].as_str()?;
+    let path = std::path::Path::new(hit["module"]["path"].as_str()?);
+    let space = modules::address_space(root).ok()?;
+    let exe = fs::metadata(root.join("exe")).ok();
+    let module = space.modules.iter().find(|module| module.path() == path)?;
+    let cached = cache::live_image(root, module, exe.as_ref()).ok()?;
+    let image = object::File::parse(cached.bytes.as_slice()).ok()?;
+    let layout = Layout::new(&image, module).ok()?;
+    let relocated = module
+        .mapping_at(address)
+        .and_then(|map| layout.for_address(map, address))
+        .or_else(|| {
+            space
+                .anonymous
+                .iter()
+                .find(|map| map.contains(address))
+                .and_then(|map| layout.zerofill_address(map, address, module))
+        })?;
+    let dwarf = offline::DwarfImage {
+        bias: u64::try_from(relocated.0.bias).ok()?,
+        path: path.to_path_buf(),
+        data: cached
+            .separate
+            .as_ref()
+            .or(cached.primary.as_ref())?
+            .clone(),
+    };
+    let value = dwarf.inspect(name, memory, Registers::empty(), None, None, deadline, None);
+    let value = value.get("result")?;
+    if value["address"] != hit["address"] {
+        return None;
+    }
+    let graph = dwarf.variable_type_graph(name, None, deadline).ok()??;
+    Some(json!({"type":value["type"]["name"],"graph":graph}))
+}
+
 pub(crate) fn stopped_dwarf(
     root: &Path,
     memory: &dyn crate::unwind::UnwindMemory,

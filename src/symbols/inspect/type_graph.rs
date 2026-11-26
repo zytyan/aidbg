@@ -2,12 +2,23 @@ use super::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Graph {
     root: usize,
+    identity: Option<String>,
     nodes: Vec<Node>,
     pub(crate) module: std::path::PathBuf,
 }
+
+// Structural equality still deduplicates equivalent definitions found by the
+// name query. The identity is used only to intern the entity chosen by it.
+impl PartialEq for Graph {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root && self.nodes == other.nodes && self.module == other.module
+    }
+}
+
+impl Eq for Graph {}
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -15,6 +26,8 @@ enum Node {
     Void,
     Scalar {
         scalar: String,
+        boolean: bool,
+        character: bool,
     },
     Pointer {
         element: usize,
@@ -24,6 +37,7 @@ enum Node {
         dimensions: Vec<u64>,
     },
     Aggregate {
+        name: Option<String>,
         union: bool,
         size: usize,
         align: usize,
@@ -149,6 +163,7 @@ impl offline::DwarfImage {
                 candidate.priority,
                 Graph {
                     root,
+                    identity: graph_identity(&self.data.id, &builder, root),
                     nodes: builder.nodes,
                     module: self.path.clone(),
                 },
@@ -231,6 +246,7 @@ impl offline::DwarfImage {
                 };
                 let graph = builder.entry(entry.offset(), 0).map(|root| Graph {
                     root,
+                    identity: graph_identity(&self.data.id, &builder, root),
                     nodes: builder.nodes,
                     module: self.path.clone(),
                 });
@@ -246,6 +262,15 @@ impl offline::DwarfImage {
         }
         Ok((results, matched))
     }
+}
+
+fn graph_identity(image: &str, builder: &Builder<'_, '_>, root: usize) -> Option<String> {
+    let offset = builder
+        .seen
+        .iter()
+        .find_map(|(offset, &node)| (node == root).then_some(offset))?;
+    let offset = offset.to_debug_info_offset(&builder.unit.header)?;
+    Some(format!("{image}:{:#x}", offset.0))
 }
 
 struct Builder<'a, 'b> {
@@ -379,6 +404,7 @@ impl Builder<'_, '_> {
                     .filter(|value| value.is_power_of_two())
                     .unwrap_or(layout_align);
                 Node::Aggregate {
+                    name: name(self.dwarf, self.unit, &entry)?,
                     union,
                     size,
                     align,
@@ -409,6 +435,9 @@ impl Builder<'_, '_> {
                     if matches!(size, 1 | 2 | 4 | 8) && !prefix.is_empty() {
                         Node::Scalar {
                             scalar: format!("{prefix}{}", size * 8),
+                            boolean: encoding == gimli::DW_ATE_boolean,
+                            character: size == 1
+                                && name(self.dwarf, self.unit, &entry)?.as_deref() == Some("char"),
                         }
                     } else {
                         Node::Opaque {
@@ -460,7 +489,7 @@ impl Builder<'_, '_> {
 
     fn size(&self, id: usize) -> Option<usize> {
         match &self.nodes[id] {
-            Node::Scalar { scalar } => scalar[1..].parse::<usize>().ok().map(|bits| bits / 8),
+            Node::Scalar { scalar, .. } => scalar[1..].parse::<usize>().ok().map(|bits| bits / 8),
             Node::Pointer { .. } => Some(8),
             Node::Aggregate { size, .. } | Node::Opaque { size, .. } => Some(*size),
             Node::Array {
@@ -491,7 +520,7 @@ impl Graph {
             match &nodes[id] {
                 Node::Aggregate { size, .. } | Node::Opaque { size, .. } => Some(*size),
                 Node::Pointer { .. } => Some(8),
-                Node::Scalar { scalar } => Some(scalar[1..].parse::<usize>().ok()? / 8),
+                Node::Scalar { scalar, .. } => Some(scalar[1..].parse::<usize>().ok()? / 8),
                 Node::Array {
                     element,
                     dimensions,
@@ -517,7 +546,7 @@ impl Graph {
         };
         let scalar = |id: usize| match &self.nodes[id] {
             Node::Void => Some("void"),
-            Node::Scalar { scalar } => Some(scalar.as_str()),
+            Node::Scalar { scalar, .. } => Some(scalar.as_str()),
             Node::Pointer { .. } => Some("ptr"),
             _ => None,
         };
@@ -545,7 +574,7 @@ impl Graph {
         for (id, node) in self.nodes.iter().enumerate() {
             let ty = match node {
                 Node::Void => format!("{api}.Type.Base<void>"),
-                Node::Scalar { scalar: kind } => format!("{api}.Type.Scalar<{}>", scalar(kind)),
+                Node::Scalar { scalar: kind, .. } => format!("{api}.Type.Scalar<{}>", scalar(kind)),
                 Node::Pointer { element } => format!("{api}.Type.Pointer<{}>", key(*element)),
                 Node::Array {
                     element,
@@ -569,7 +598,7 @@ impl Graph {
                         };
                         let field_name = serde_json::to_string(name).unwrap();
                         let ty = match (&field.bit, &self.nodes[field.ty]) {
-                            (Some(_), Node::Scalar { scalar: kind }) => {
+                            (Some(_), Node::Scalar { scalar: kind, .. }) => {
                                 format!("{api}.Type.Base<{api}.Value.Bitfield<{}>>", scalar(kind))
                             }
                             _ => key(field.ty),

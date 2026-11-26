@@ -141,6 +141,13 @@ impl Queue {
         }
     }
 
+    pub fn row(&self, sequence: u64) -> Option<&Value> {
+        self.events
+            .iter()
+            .find(|entry| entry.row["sequence"] == sequence)
+            .map(|entry| &entry.row)
+    }
+
     pub fn is_breakpoint(&self, sequence: u64) -> bool {
         self.events
             .iter()

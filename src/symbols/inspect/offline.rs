@@ -164,21 +164,23 @@ impl DwarfImage {
         }
         let mut locals = serde_json::Map::new();
         let mut parameters = serde_json::Map::new();
+        let mut unavailable_locals = serde_json::Map::new();
+        let mut unavailable_parameters = serde_json::Map::new();
         for (name, (_, item)) in visible {
             let value = &item["value"]["result"];
-            if value.is_null() {
-                continue;
-            }
-            let rows = if item["kind"] == "parameter" {
-                &mut parameters
-            } else {
-                &mut locals
+            let rows = match (item["kind"] == "parameter", value.is_null()) {
+                (true, true) => &mut unavailable_parameters,
+                (true, false) => &mut parameters,
+                (false, true) => &mut unavailable_locals,
+                (false, false) => &mut locals,
             };
             rows.insert(name.to_owned(),json!({
                 "name":name, "type":value["type"]["name"], "address":value["address"], "value":value["value"],
+                "availability": item["availability"].as_str().unwrap_or("available"),
             }));
         }
-        Ok(json!({"locals":locals,"parameters":parameters}))
+        Ok(json!({"locals":locals,"parameters":parameters,
+            "unavailableLocals":unavailable_locals,"unavailableParameters":unavailable_parameters}))
     }
 
     fn variable_page(
@@ -263,7 +265,15 @@ impl DwarfImage {
                             self.path.clone(),
                         ));
                         items.push(if mode == VariableMode::Values {
+                            let optimized = outcome.result.is_none()
+                                && unit.entry(candidate.offset).ok().is_some_and(|entry| {
+                                    matches!(resolved_attr(&unit, &entry, gimli::DW_AT_location, 0), Ok(None))
+                                        && matches!(resolved_attr(&unit, &entry, gimli::DW_AT_const_value, 0), Ok(None))
+                                });
+                            let availability = if optimized { "optimized_out" }
+                                else if outcome.result.is_some() { "available" } else { outcome.status };
                             json!({"name": qualified, "value":outcome, "scope_depth":candidate.priority,
+                                "availability":availability,
                                 "kind":if tag == gimli::DW_TAG_formal_parameter {"parameter"} else {"variable"}})
                         } else {
                             json!({"name": qualified, "value": outcome})

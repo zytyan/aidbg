@@ -6,6 +6,7 @@ package aidbg;
 service Debugger {
   rpc Heartbeat (HeartbeatRequest) returns (ToolReply);
   rpc Run (RunProcessRequest) returns (ToolReply);
+  rpc Status (HeartbeatRequest) returns (ToolReply);
   rpc Attach (AttachRequest) returns (ToolReply);
   rpc ScriptRun (RunScriptRequest) returns (ToolReply);
   rpc ScriptWait (WaitScriptRequest) returns (ToolReply);
@@ -23,8 +24,9 @@ message HeartbeatRequest {}
 message RunProcessRequest {
   string path = 1;
   repeated string arg = 2;
+  bool pause = 3;
 }
-message AttachRequest { int32 pid = 1; }
+message AttachRequest { int32 pid = 1; bool pause = 2; }
 message RunScriptRequest {
   string src = 1;
   uint32 wait_ms = 2;
@@ -47,6 +49,7 @@ message InterruptInputRequest {
 message SessionSnapshotRequest {
   optional int32 tid = 1;
   bool context = 2;
+  optional uint32 stop_timeout_ms = 3;
 }
 message ProcessListRequest {
   bool threads = 1;

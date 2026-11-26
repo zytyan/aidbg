@@ -51,7 +51,8 @@ pub(crate) fn read(
             continue;
         }
         rows.push(
-            json!({ "name":name, "address":hex(address), "size":symbol.size(), "module":module }),
+            json!({ "name":name, "address":hex(address), "size":symbol.size(), "module":module,
+                "kind":format!("{:?}",symbol.kind()).to_ascii_lowercase() }),
         );
         if rows.len() == PAGE_ITEMS {
             break;

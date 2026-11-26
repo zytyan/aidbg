@@ -58,6 +58,7 @@ const PUBLIC_SLOTS: [(Slot, &str); 5] = [
 struct CompactKeys<'js> {
     atoms: Vec<Atom<'js>>,
     public_slots: Vec<(Slot, Atom<'js>)>,
+    to_primitive: Atom<'js>,
     hooks: Object<'js>,
 }
 
@@ -73,6 +74,7 @@ impl<'js> Trace<'js> for CompactKeys<'js> {
         for (_, atom) in &self.public_slots {
             atom.trace(tracer);
         }
+        self.to_primitive.trace(tracer);
         self.hooks.trace(tracer);
     }
 }
@@ -198,7 +200,7 @@ impl<'js> JsClass<'js> for CompactValue<'js> {
         key: Atom<'js>,
         receiver: Value<'js>,
     ) -> Result<Value<'js>> {
-        let hooks = {
+        let (hooks, is_to_primitive) = {
             let state = this.borrow();
             if let Some(slot) = state.slot(&key) {
                 return state.get_slot(ctx, slot, receiver);
@@ -214,11 +216,15 @@ impl<'js> JsClass<'js> for CompactValue<'js> {
                     }
                 }
             }
-            keys.hooks.clone()
+            (keys.hooks.clone(), key == keys.to_primitive)
         };
-        hooks
-            .get::<_, Function>("get")?
-            .call((receiver, key.to_value()?))
+        // Atom::to_value converts symbols to strings. Preserve this well-known symbol.
+        let key = if is_to_primitive {
+            hooks.get("toPrimitive")?
+        } else {
+            key.to_value()?
+        };
+        hooks.get::<_, Function>("get")?.call((receiver, key))
     }
 
     fn exotic_set_property(
@@ -274,6 +280,11 @@ fn retain_set_argument(ctx: &Ctx<'_>, value: &Value<'_>) {
     unsafe { rquickjs::qjs::JS_DupValue(ctx.as_raw().as_ptr(), value.as_raw()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static VALUE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn install<'js>(ctx: &Ctx<'js>, api: &Object<'js>) -> Result<()> {
     let symbols: Object = api.get("nativeValueKeys")?;
     let atoms = PRIVATE_SLOTS
@@ -284,12 +295,15 @@ pub(super) fn install<'js>(ctx: &Ctx<'js>, api: &Object<'js>) -> Result<()> {
         .into_iter()
         .map(|(slot, name)| Ok((slot, Atom::from_str(ctx.clone(), name)?)))
         .collect::<Result<Vec<_>>>()?;
+    let hooks: Object = api.get("nativeValueHooks")?;
+    let to_primitive = Atom::from_value(ctx.clone(), &hooks.get("toPrimitive")?)?;
     let keys = Class::instance(
         ctx.clone(),
         CompactKeys {
             atoms,
             public_slots,
-            hooks: api.get("nativeValueHooks")?,
+            to_primitive,
+            hooks,
         },
     )?;
     let create = Function::new(
@@ -329,6 +343,8 @@ pub(super) fn install<'js>(ctx: &Ctx<'js>, api: &Object<'js>) -> Result<()> {
             .filter_map(|(slot, value)| Some((slot, value?)))
             .collect();
             let tid = store.get::<_, Value>(key(Slot::Tid))?.as_number();
+            #[cfg(test)]
+            VALUE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
             Class::instance(
                 store.ctx().clone(),
                 CompactValue {

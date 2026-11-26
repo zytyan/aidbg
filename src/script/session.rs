@@ -50,12 +50,13 @@ fn append_exit_status(output: &mut Value, exit: Option<crate::trace::LaunchExit>
 
 pub enum Command {
     Run(RunProcessRequest),
-    Attach(i32),
+    Attach(i32, bool),
+    Status,
     Core(OpenCoreRequest),
     Script(String, u32, Option<RunProcessRequest>),
     ScriptWait(u64, u32),
     Input(String, std::result::Result<String, String>),
-    Snapshot(Option<i32>, bool),
+    Snapshot(Option<i32>, bool, u32),
     Processes(crate::rpc::ProcessListRequest),
     SyscallTable(Option<u64>, Option<String>),
     SetForkPolicy(String),
@@ -71,14 +72,14 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn start(state_dir: PathBuf) -> Result<Self> {
+    pub fn start(state_dir: PathBuf, session_id: String) -> Result<Self> {
         let (queue, commands) = mpsc::sync_channel(32);
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = cancelled.clone();
         let thread = thread::Builder::new()
             .name("aidbg-session".into())
             .spawn(move || {
-                if let Err(err) = run(state_dir, commands, flag) {
+                if let Err(err) = run(state_dir, session_id, commands, flag) {
                     eprintln!("aidbg session: {err}");
                 }
             })?;
@@ -119,6 +120,7 @@ struct Waiting {
 }
 
 struct State {
+    session_id: String,
     target: Option<Target>,
     released_output: VecDeque<(i32, process_io::ProcessIo, Option<crate::trace::LaunchExit>)>,
     follow_fork: bool,
@@ -132,6 +134,7 @@ struct State {
     output_dropped: bool,
     script_outcomes: BTreeMap<u64, &'static str>,
     script_waiting: BTreeSet<u64>,
+    active_scripts: BTreeSet<u64>,
     target_error: Option<String>,
     signals: BTreeSet<i32>,
     events: events::Queue,
@@ -144,15 +147,57 @@ struct State {
 }
 
 impl State {
+    fn status(&self) -> String {
+        use std::fmt::Write;
+        let mut text = format!("Session: {}\n", self.session_id);
+        text.push_str(&match &self.target {
+            Some(Target::Live(live)) => live.describe_status(),
+            Some(Target::Core(core)) => {
+                format!("Target: core (PID {})\nState: core\n", core.session_pid())
+            }
+            None => String::from("Target: none\n"),
+        });
+        writeln!(text, "Pending events: {}", self.events.len()).unwrap();
+        let scripts = self
+            .active_scripts
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>();
+        if !scripts.is_empty() {
+            writeln!(text, "Active scripts: {}", scripts.join(", ")).unwrap();
+        }
+        if !self.signals.is_empty() {
+            let names = self
+                .signals
+                .iter()
+                .map(|&number| {
+                    nix::sys::signal::Signal::try_from(number)
+                        .map_or_else(|_| format!("SIG{number}"), |signal| signal.to_string())
+                })
+                .collect::<Vec<_>>();
+            writeln!(text, "Signal callbacks: {}", names.join(", ")).unwrap();
+        }
+        if let Some(err) = &self.target_error {
+            writeln!(text, "Target error: {err}").unwrap();
+        }
+        text.truncate(text.trim_end().len());
+        text
+    }
+
     fn launch(&mut self, args: RunProcessRequest) -> Result<Value> {
+        let pause = args.pause;
         let mut target = Live::launch(args)?;
         let scratchpad = target
             .prepare_scratch(None)
             .or_else(|_| target.prepare_scratch(None));
+        if !pause {
+            target.resume_initial()?;
+        }
         let pid = target.pid;
+        let current = target.execution_state();
         let released = self.replace(Some(Target::Live(target)));
         Ok(
-            json!({"pid":pid,"state":"paused","reason":"exec","released":released,"scratchpad":scratchpad.is_ok(),
+            json!({"pid":pid,"state":current,"reason":pause.then_some("exec"),"released":released,"scratchpad":scratchpad.is_ok(),
             "scratchpad_error":scratchpad.err().map(|err|err.to_string())}),
         )
     }
@@ -248,10 +293,25 @@ impl State {
         };
         live.finish_callback(tid, pause, pass);
         let held = live.paused.contains(&tid);
+        let mut summaries = Vec::new();
         for sequence in self.dispatches.remove(&tid).unwrap() {
             live.track_stop(tid, sequence);
-            self.events
-                .complete(sequence, held, counts[sequence.to_string()].as_u64());
+            let hits = counts[sequence.to_string()].as_u64();
+            self.events.complete(sequence, held, hits);
+            if let Some((id, hits)) = self
+                .events
+                .row(sequence)
+                .and_then(|row| row["breakpointId"].as_u64())
+                .zip(hits)
+            {
+                live.record_point_hits(id as u32, hits);
+            }
+            if held
+                && let Some(row) = self.events.row(sequence)
+                && let Some(summary) = live.stop_summary(tid, row)
+            {
+                summaries.push(summary);
+            }
             if let Some(report) = self
                 .reported_signals
                 .iter_mut()
@@ -259,6 +319,9 @@ impl State {
             {
                 report["paused"] = json!(held);
             }
+        }
+        for text in summaries {
+            self.log(0, json!({"kind":"stop_summary", "text":text}));
         }
     }
 
@@ -327,6 +390,7 @@ impl State {
 
     fn operation(&mut self, op: &str, args: Value) -> Result<Value> {
         match op {
+            "sessionStatus" => Ok(json!(self.status())),
             "clock" => Ok(json!(self.started.elapsed().as_millis() as u64)),
             "reportError" => {
                 self.report_error(
@@ -535,7 +599,7 @@ impl State {
         pending: &[Pending<'_>],
     ) {
         if !reply.is_closed() {
-            let mut message = self.tool_reply(result, pending);
+            let mut message = self.tool_reply(result, pending, true);
             let output_cursor = match self.target.as_ref() {
                 Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
                     let (mut value, cursor) = stdio.mcp_output();
@@ -570,13 +634,18 @@ impl State {
         }
     }
 
-    fn tool_reply(&mut self, result: Result<Value>, pending: &[Pending<'_>]) -> ToolReply {
+    fn tool_reply(
+        &mut self,
+        result: Result<Value>,
+        pending: &[Pending<'_>],
+        collect_output: bool,
+    ) -> ToolReply {
         let (result_json, error) = match result {
             Ok(value) => (value.to_string().into_bytes(), None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
         let mut script_output = Vec::new();
-        for _ in 0..self.output.len() {
+        for _ in 0..if collect_output { self.output.len() } else { 0 } {
             let row = self.output.pop_front().unwrap();
             if self.script_waiting.contains(&row.script_id) {
                 self.output.push_back(row);
@@ -606,13 +675,17 @@ impl State {
                 })
                 .collect(),
             script_output,
-            output_dropped: std::mem::take(&mut self.output_dropped),
+            output_dropped: collect_output && std::mem::take(&mut self.output_dropped),
             running_scripts: pending.iter().map(|script| script.id).collect(),
             target_error: self.target_error.clone(),
             waiting_events_json: json!(self.events.status()).to_string().into_bytes(),
-            signals_json: json!(self.reported_signals.drain(..).collect::<Vec<_>>())
-                .to_string()
-                .into_bytes(),
+            signals_json: if collect_output {
+                json!(self.reported_signals.drain(..).collect::<Vec<_>>())
+                    .to_string()
+                    .into_bytes()
+            } else {
+                Vec::new()
+            },
             pending_events: self.events.len() as u32,
             event_queue_full: self.events.len() >= events::QUEUE_LIMIT,
             process_output_json: Vec::new(),
@@ -724,6 +797,7 @@ declare const dbg: import("aidbg").Debugger;
 declare const m: import("aidbg").TypeSystem;
 declare const $: AidbgGlobals & import("aidbg").GlobalScope;
 declare const console: import("aidbg").Console;
+declare const fmt: import("aidbg").Format;
 declare const setTimeout: typeof import("aidbg").setTimeout;
 declare const clearTimeout: typeof import("aidbg").clearTimeout;
 declare const queueMicrotask: typeof import("aidbg").queueMicrotask;
@@ -736,6 +810,7 @@ type AbortSignal = import("aidbg").AbortSignal;
 
 fn run(
     state_dir: PathBuf,
+    session_id: String,
     commands: mpsc::Receiver<Message>,
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -751,6 +826,7 @@ fn run(
     })));
     let context = Context::full(&runtime)?;
     let state = Rc::new(RefCell::new(State {
+        session_id,
         target: None,
         released_output: VecDeque::new(),
         follow_fork: false,
@@ -764,6 +840,7 @@ fn run(
         output_dropped: false,
         script_outcomes: BTreeMap::new(),
         script_waiting: BTreeSet::new(),
+        active_scripts: BTreeSet::new(),
         target_error: None,
         signals: BTreeSet::new(),
         events: events::Queue::default(),
@@ -839,6 +916,12 @@ fn run(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
             if cancelled.load(Ordering::Relaxed) || reply.is_closed() { continue; }
+            if matches!(command, Command::Status) {
+                let mut state = state.borrow_mut();
+                let text = state.status();
+                let _ = reply.send(state.tool_reply(Ok(json!(text)), &pending, false));
+                continue;
+            }
             deadline.set(Instant::now() + SCRIPT_SLICE);
             let wait_ms = match &command {
                 Command::Script(_, ms, _) | Command::ScriptWait(_, ms) => *ms,
@@ -848,25 +931,31 @@ fn run(
                 if wait_ms > 300_000 { return Err(error("wait_ms must be in 0..=300000")); }
                 match command {
                     Command::Run(args) => state.borrow_mut().launch(args),
-                    Command::Attach(pid) => {
+                    Command::Status => unreachable!(),
+                    Command::Attach(pid, pause) => {
                         let existing = matches!(&state.borrow().target, Some(Target::Live(live)) if live.pid == pid && live.verify().is_ok());
                         if !existing {
                             let mut target = Live::attach(pid)?;
                             let scratchpad = target.prepare_scratch(None);
+                            if !pause { target.resume_initial()?; }
+                            let current = target.execution_state();
                             let released = state.borrow_mut().replace(Some(Target::Live(target)));
-                            return Ok(json!({"pid":pid,"state":"attached","reason":"attach","released":released,"scratchpad":scratchpad.is_ok(),
+                            return Ok(json!({"pid":pid,"state":current,"attached":true,"reason":pause.then_some("attach"),"released":released,"scratchpad":scratchpad.is_ok(),
                                 "scratchpad_error":scratchpad.err().map(|err|err.to_string())}));
                         }
-                        Ok(json!({"pid":pid,"state":"attached","released":[]}))
+                        let mut state = state.borrow_mut();
+                        let Some(Target::Live(live)) = &mut state.target else { unreachable!() };
+                        if pause { live.pause(None)?; }
+                        Ok(json!({"pid":pid,"state":live.execution_state(),"attached":true,"released":[]}))
                     }
                     Command::Core(args) => {
                         let (target, mut info) = Target::open(args)?;
                         info["released"] = json!(state.borrow_mut().replace(Some(target)));
                         Ok(info)
                     }
-                    Command::Snapshot(tid, context) => {
+                    Command::Snapshot(tid, context, stop_timeout_ms) => {
                         let mut state = state.borrow_mut();
-                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid, context)
+                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid, context, stop_timeout_ms, 64)
                     }
                     Command::Input(handler, result) => {
                         if state.borrow_mut().waiting.remove(&handler).is_none() { return Err(error("input handler is not waiting")); }
@@ -901,10 +990,12 @@ fn run(
                         if current.source_maps.len()>=512 {current.source_maps.pop_first();}
                         current.source_maps.insert(id,source_map::SourceMap::parse(&map)?);
                         drop(current);
-                        let js = format!("const console = globalThis.__aidbgConsole({id}, {generation});\n{js}");
+                        let js = format!("const [console, fmt] = globalThis.__aidbgOutput({id}, {generation});\n{js}");
                         deadline.set(Instant::now() + SCRIPT_SLICE);
-                        let (module, promise) = Module::declare(ctx.clone(), format!("script-{id}.js"), js)
-                            .and_then(|module| module.eval()).catch(&ctx).map_err(|err| error(err.to_string()))?;
+                        state.borrow_mut().active_scripts.insert(id);
+                        let evaluated = Module::declare(ctx.clone(), format!("script-{id}.js"), js)
+                            .and_then(|module| module.eval()).catch(&ctx).map_err(|err| error(err.to_string()));
+                        let (module, promise) = evaluated.inspect_err(|_| { state.borrow_mut().active_scripts.remove(&id); })?;
                         pending.push(Pending { id, generation, module, promise, declarations });
                         response["script_id"] = json!(id);
                         response["status"] = json!("accepted");
@@ -1121,6 +1212,12 @@ fn tick(
                         live.track_stop(tid, sequence);
                     }
                     row["sequence"] = json!(sequence);
+                    if !callback
+                        && let Some(Target::Live(live)) = &state.target
+                        && let Some(text) = live.stop_summary(tid, &row)
+                    {
+                        state.log(0, json!({"kind":"stop_summary", "text":text}));
+                    }
                     state.reported_signals.push_back(row.clone());
                     if callback {
                         by_tid.entry(tid).or_default().push(row);
@@ -1271,6 +1368,10 @@ fn pump<'js>(
         }
         false
     });
+    state
+        .borrow_mut()
+        .active_scripts
+        .retain(|id| pending.iter().any(|script| script.id == *id));
     Ok(())
 }
 

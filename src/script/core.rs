@@ -892,7 +892,8 @@ impl Target {
                         "sp":frame.regs.get(regs::SP).ok().map(hex), "fp":frame.regs.get(regs::FP).ok().map(hex),
                         "symbol":site["function"], "file":file, "line":line,
                         "missingDebugSections":site["missingDebugSections"], "inlineFrames":inline_frames,
-                        "locals":values["locals"], "parameters":values["parameters"]})
+                        "locals":values["locals"], "parameters":values["parameters"],
+                        "unavailableLocals":values["unavailableLocals"], "unavailableParameters":values["unavailableParameters"]})
                 })
                 .collect::<Vec<_>>()
         ))
@@ -1309,6 +1310,19 @@ impl Target {
             });
         }
         Err(self.missing_memory(address).into())
+    }
+
+    pub(super) fn symbol_at(&self, address: u64) -> Option<Value> {
+        let row = self.address_symbol(address)?;
+        let offset = row["offset"].as_u64()?;
+        let module = self
+            .mapped_file(address)
+            .map(|(module, _)| module.identity(None));
+        Some(json!({
+            "name": row["name"], "address": hex(address.checked_sub(offset)?),
+            "offset": hex(offset), "module": module,
+            "match": if offset == 0 { "exact" } else { "within" },
+        }))
     }
 
     fn address_symbol(&self, address: u64) -> Option<Value> {

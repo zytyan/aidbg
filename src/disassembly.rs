@@ -288,13 +288,77 @@ pub(crate) fn references(
         engine.set_skipdata(true)?;
     }
     let instructions = engine.disasm_all(code, start)?;
-    let mut arm = ArmReferences::default();
     let mut report = References {
         matches: Vec::new(),
         decoded_end: start,
         next_address: None,
         skipped_words: 0,
     };
+    for row in analyze_references(&engine, &instructions, arm64)? {
+        report.skipped_words += usize::from(row.skipped);
+        if row.pc >= resume_from
+            && let Some((_, kind)) = row
+                .references
+                .into_iter()
+                .find(|(address, _)| *address == target)
+        {
+            if report.matches.len() == limit {
+                report.next_address = Some(row.pc);
+                break;
+            }
+            report.matches.push(InstructionReference {
+                instruction: hex(row.pc),
+                kind,
+                mnemonic: row.mnemonic,
+            });
+        }
+        report.decoded_end = row.end;
+    }
+    Ok(report)
+}
+
+struct AnalyzedInstruction {
+    pc: u64,
+    end: u64,
+    mnemonic: Option<String>,
+    skipped: bool,
+    references: Vec<(u64, &'static str)>,
+}
+
+pub(crate) fn instruction_targets(
+    architecture: &str,
+    start: u64,
+    code: &[u8],
+) -> Result<std::collections::BTreeMap<u64, Vec<serde_json::Value>>> {
+    let (mut engine, _) = decoder(architecture)?;
+    engine.set_detail(true)?;
+    let arm64 = architecture == "aarch64";
+    if arm64 {
+        engine.set_skipdata(true)?;
+    }
+    let instructions = engine.disasm_all(code, start)?;
+    Ok(analyze_references(&engine, &instructions, arm64)?
+        .into_iter()
+        .filter(|row| !row.references.is_empty())
+        .map(|row| {
+            (
+                row.pc,
+                row.references
+                    .into_iter()
+                    .map(|(address, kind)| serde_json::json!({"address":hex(address),"kind":kind}))
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
+fn analyze_references(
+    engine: &Capstone,
+    instructions: &capstone::Instructions<'_>,
+    arm64: bool,
+) -> Result<Vec<AnalyzedInstruction>> {
+    let mut rows = Vec::new();
+    let mut arm = ArmReferences::default();
     let targets: std::collections::BTreeSet<_> =
         if arm64 {
             use capstone::arch::{DetailsArchInsn, arm64::Arm64OperandType};
@@ -321,37 +385,30 @@ pub(crate) fn references(
     for instruction in instructions.iter() {
         let pc = instruction.address();
         let end = pc + instruction.bytes().len() as u64;
-        if instruction.id().0 == 0 {
+        let skipped = instruction.id().0 == 0;
+        let mut references = Vec::new();
+        if skipped || targets.contains(&pc) {
             arm.addresses.clear();
-            report.skipped_words += (end - pc) as usize / 4;
-            report.decoded_end = end;
-            continue;
+            arm.slots.clear();
         }
-        if targets.contains(&pc) {
-            arm.addresses.clear();
+        if !skipped {
+            let detail = engine.insn_detail(instruction)?;
+            references = if arm64 {
+                arm.reference(engine, instruction, &detail)
+                    .unwrap_or_default()
+            } else {
+                x86_references(&detail, end)
+            };
         }
-        let detail = engine.insn_detail(instruction)?;
-        let kind = if arm64 {
-            arm.reference(&engine, instruction, &detail, target)
-        } else {
-            x86_reference(&detail, end, target)
-        };
-        if pc >= resume_from
-            && let Some(kind) = kind
-        {
-            if report.matches.len() == limit {
-                report.next_address = Some(pc);
-                break;
-            }
-            report.matches.push(InstructionReference {
-                instruction: hex(pc),
-                kind,
-                mnemonic: instruction.mnemonic().map(str::to_owned),
-            });
-        }
-        report.decoded_end = end;
+        rows.push(AnalyzedInstruction {
+            pc,
+            end,
+            skipped,
+            references,
+            mnemonic: instruction.mnemonic().map(str::to_owned),
+        });
     }
-    Ok(report)
+    Ok(rows)
 }
 
 fn control_flow(detail: &InsnDetail<'_>) -> bool {
@@ -362,33 +419,46 @@ fn control_flow(detail: &InsnDetail<'_>) -> bool {
     })
 }
 
-fn x86_reference(detail: &InsnDetail<'_>, end: u64, target: u64) -> Option<&'static str> {
+fn x86_references(detail: &InsnDetail<'_>, end: u64) -> Vec<(u64, &'static str)> {
     use capstone::arch::{
         DetailsArchInsn,
         x86::{X86OperandType, X86Reg},
     };
 
-    detail
-        .arch_detail()
-        .x86()?
-        .operands()
-        .find_map(|operand| match operand.op_type {
-            X86OperandType::Imm(value) if control_flow(detail) && value as u64 == target => {
-                Some("branch_target")
+    let arch = detail.arch_detail();
+    let Some(x86) = arch.x86() else {
+        return Vec::new();
+    };
+    x86.operands()
+        .filter_map(|operand| match operand.op_type {
+            X86OperandType::Imm(value) if control_flow(detail) => {
+                Some((value as u64, "branch_target"))
             }
             X86OperandType::Mem(memory)
                 if memory.base().0 == X86Reg::X86_REG_RIP as u16
-                    && end.checked_add_signed(memory.disp()) == Some(target) =>
+                    && ![X86Reg::X86_REG_FS, X86Reg::X86_REG_GS]
+                        .contains(&u32::from(memory.segment().0)) =>
             {
-                Some("pc_relative")
+                end.checked_add_signed(memory.disp()).map(|address| {
+                    (
+                        address,
+                        if control_flow(detail) {
+                            "indirect_slot"
+                        } else {
+                            "pc_relative"
+                        },
+                    )
+                })
             }
             _ => None,
         })
+        .collect()
 }
 
 #[derive(Default)]
 struct ArmReferences {
     addresses: std::collections::BTreeMap<RegId, u64>,
+    slots: std::collections::BTreeMap<RegId, u64>,
 }
 
 impl ArmReferences {
@@ -397,8 +467,7 @@ impl ArmReferences {
         engine: &Capstone,
         insn: &capstone::Insn<'_>,
         detail: &InsnDetail<'_>,
-        target: u64,
-    ) -> Option<&'static str> {
+    ) -> Option<Vec<(u64, &'static str)>> {
         use capstone::arch::{
             DetailsArchInsn,
             arm64::{Arm64OperandType::*, Arm64Shift},
@@ -408,37 +477,128 @@ impl ArmReferences {
         let arch = detail.arch_detail();
         let operands = arch.arm64()?.operands().collect::<Vec<_>>();
         if control_flow(detail) || matches!(mnemonic, "brk" | "svc" | "hvc" | "smc") {
-            self.addresses.clear();
-            return operands.last().and_then(|operand| match operand.op_type {
-                Imm(address) if control_flow(detail) && address as u64 == target => {
-                    Some("branch_target")
-                }
+            let reference = operands.last().and_then(|operand| match operand.op_type {
+                Imm(address) if control_flow(detail) => Some((address as u64, "branch_target")),
+                Reg(register) if matches!(mnemonic, "br" | "blr") => self
+                    .slots
+                    .get(&register)
+                    .map(|&slot| (slot, "indirect_slot"))
+                    .or_else(|| {
+                        self.addresses
+                            .get(&register)
+                            .map(|&address| (address, "branch_target"))
+                    }),
                 _ => None,
             });
+            self.addresses.clear();
+            self.slots.clear();
+            return Some(reference.into_iter().collect());
         }
 
-        let mut found = operands.iter().find_map(|operand| match operand.op_type {
-            Mem(memory)
-                if memory.index() == RegId::INVALID_REG
-                    && self
+        let slot = match operands.as_slice() {
+            [dst, source] if mnemonic == "ldr" => match dst.op_type {
+                Reg(dst)
+                    if engine
+                        .reg_name(dst)
+                        .is_some_and(|name| name.starts_with('x')) =>
+                {
+                    match source.op_type {
+                        Imm(address) => Some((dst, address as u64)),
+                        Mem(memory) if memory.index() == RegId::INVALID_REG => self
+                            .addresses
+                            .get(&memory.base())
+                            .and_then(|base| base.checked_add_signed(i64::from(memory.disp())))
+                            .map(|address| (dst, address)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            [dst, source] if mnemonic == "mov" => match (&dst.op_type, &source.op_type) {
+                (Reg(dst), Reg(source))
+                    if engine
+                        .reg_name(*dst)
+                        .is_some_and(|name| name.starts_with('x')) =>
+                {
+                    self.slots.get(source).map(|&slot| (*dst, slot))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut found = operands
+            .iter()
+            .filter_map(|operand| {
+                let kind = if mnemonic.starts_with("ld") {
+                    "read"
+                } else if mnemonic.starts_with("st") {
+                    "write"
+                } else {
+                    return None;
+                };
+                match operand.op_type {
+                    Mem(memory) if memory.index() == RegId::INVALID_REG => self
                         .addresses
                         .get(&memory.base())
                         .and_then(|base| base.checked_add_signed(i64::from(memory.disp())))
-                        == Some(target) =>
-            {
-                match mnemonic {
-                    name if name.starts_with("ld") => Some("read"),
-                    name if name.starts_with("st") => Some("write"),
+                        .map(|address| (address, kind)),
                     _ => None,
                 }
-            }
-            _ => None,
-        });
+            })
+            .collect::<Vec<_>>();
+        if let [_, literal] = operands.as_slice()
+            && matches!(mnemonic, "ldr" | "ldrsw" | "prfm")
+            && let Imm(address) = literal.op_type
+        {
+            found.push((address as u64, "pc_relative"));
+        }
         let derived = match operands.as_slice() {
             [dst, immediate] if matches!(mnemonic, "adr" | "adrp") => {
                 match (&dst.op_type, &immediate.op_type) {
                     (Reg(dst), Imm(address)) => Some((*dst, *address as u64)),
                     _ => None,
+                }
+            }
+            [dst, src] if matches!(mnemonic, "mov" | "movz" | "movk") => {
+                let Reg(dst) = dst.op_type else {
+                    return None;
+                };
+                if engine
+                    .reg_name(dst)
+                    .is_some_and(|name| name.starts_with('x'))
+                {
+                    match src.op_type {
+                        Reg(src) if mnemonic == "mov" => {
+                            self.addresses.get(&src).copied().map(|value| (dst, value))
+                        }
+                        Imm(value) if mnemonic == "mov" => Some((dst, value as u64)),
+                        Imm(value)
+                            if matches!(mnemonic, "movk" | "movz")
+                                && (0..=65535).contains(&value) =>
+                        {
+                            let shift = match src.shift {
+                                Arm64Shift::Invalid => Some(0),
+                                Arm64Shift::Lsl(shift) if shift < 64 && shift % 16 == 0 => {
+                                    Some(shift)
+                                }
+                                _ => None,
+                            };
+                            shift.and_then(|shift| {
+                                let old = if mnemonic == "movk" {
+                                    self.addresses.get(&dst).copied()?
+                                } else {
+                                    0
+                                };
+                                Some((
+                                    dst,
+                                    (old & !(0xffffu64 << shift)) | ((value as u64) << shift),
+                                ))
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
             }
             [dst, base, displacement] if mnemonic == "add" => {
@@ -463,25 +623,29 @@ impl ArmReferences {
         };
         for register in detail.regs_write() {
             self.addresses.remove(register);
+            self.slots.remove(register);
             if let Some(name) = engine.reg_name(*register) {
                 let alias = name.strip_prefix('w').map(|number| format!("x{number}"));
-                self.addresses.retain(|tracked, _| {
-                    let tracked = engine.reg_name(*tracked);
-                    tracked != alias || alias.is_none()
-                });
+                if let Some(alias) = alias {
+                    self.addresses
+                        .retain(|tracked, _| engine.reg_name(*tracked).as_deref() != Some(&alias));
+                    self.slots
+                        .retain(|tracked, _| engine.reg_name(*tracked).as_deref() != Some(&alias));
+                }
             }
+        }
+        if let Some((register, address)) = slot {
+            self.slots.insert(register, address);
         }
         if let Some((register, address)) = derived {
             self.addresses.insert(register, address);
-            if address == target {
-                found = match mnemonic {
-                    "adr" => Some("pc_relative"),
-                    "add" => Some("address"),
-                    _ => found,
-                };
+            match mnemonic {
+                "adr" => found.push((address, "pc_relative")),
+                "add" => found.push((address, "address")),
+                _ => {}
             }
         }
-        found
+        Some(found)
     }
 }
 
@@ -520,6 +684,27 @@ mod tests {
             matches,
             [("0x1008", "write"), ("0x100c", "read"), ("0x101c", "read")]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn follows_aarch64_indirect_branches_and_movk() -> Result<()> {
+        let words = [
+            0x90000010u32, // adrp x16, 0x1000
+            0xf9404611,    // ldr x17, [x16, #0x88]
+            0xd63f0220,    // blr x17
+            0xd2800029,    // movz x9, #1
+            0xf2a00049,    // movk x9, #2, lsl #16
+            0xd61f0120,    // br x9
+            0x58000040,    // ldr x0, pc + 8
+            0xd63f0000,    // blr x0
+        ];
+        let code: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let rows = instruction_targets("aarch64", 0x1000, &code)?;
+        assert_eq!(rows[&0x1008][0]["kind"], "indirect_slot");
+        assert_eq!(rows[&0x1008][0]["address"], "0x1088");
+        assert_eq!(rows[&0x1014][0]["address"], "0x20001");
+        assert_eq!(rows[&0x101c][0]["address"], "0x1020");
         Ok(())
     }
 

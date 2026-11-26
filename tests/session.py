@@ -11,7 +11,7 @@ import tempfile
 import time
 
 TOOLS = {"connect", "run", "attach", "script_run", "script_wait", "core_open", "send_input", "interrupt_input",
-         "snapshot", "perf", "ps", "set_fork_policy", "docs", "syscall_table"}
+         "snapshot", "status", "gdb", "perf", "ps", "set_fork_policy", "docs", "syscall_table"}
 
 
 class Client:
@@ -146,7 +146,8 @@ def validate_types_and_input(client):
     reply = client.script("console.log(await dbg.ask({}));")
     assert len(reply["running_scripts"]) == 1 and len(reply["waiting_inputs"]) == 1, reply
     handler = reply["waiting_inputs"][0]["handler"]
-    status = client.tool("ps")
+    status = client.tool("status")
+    assert "Active scripts:" in status["result"], status
     assert status["waiting_inputs"] == reply["waiting_inputs"]
     assert status["running_scripts"] == reply["running_scripts"]
     reply = client.tool("send_input", handler=handler, data="first response")
@@ -159,6 +160,84 @@ def validate_types_and_input(client):
     if reply["waiting_inputs"]:
         reply = await_state(client, lambda state: not state["waiting_inputs"])
     assert logs(reply) == [["input timed out"]], reply
+
+
+def validate_presentation(client, fixture, owned):
+    result = client.tool("run", path="/bin/sleep", arg=["30"])
+    pid = result["result"]["pid"]
+    owned.add(pid)
+    assert result["result"]["state"] == "running" and not result["paused_threads"], result
+    assert "State: running" in client.tool("status")["result"]
+    partial = client.tool("snapshot", stop_timeout_ms=0)["result"]
+    assert partial["consistency"] == "partial" and partial["threadCount"] == 1, partial
+    assert not partial["threads"] and any(row.get("tid") == pid for row in partial["incomplete"]), partial
+    snapshot = client.tool("snapshot")
+    assert not snapshot["paused_threads"] and snapshot["result"]["threads"], snapshot
+    client.script("await dbg.kill(15);")
+    owned.remove(pid)
+
+    with subprocess.Popen([fixture, "attach"], stdout=subprocess.PIPE, text=True) as target:
+        try:
+            assert target.stdout.readline().strip() == "ready"
+            attached = client.tool("attach", pid=target.pid)
+            assert attached["result"]["state"] == "running" and not attached["paused_threads"], attached
+            status = client.tool("status")
+            assert "Attached: true" in status["result"] and "State: running" in status["result"], status
+            relocated = client.tool("script_run", wait_ms=3000, src="""
+                const rows = dbg.disassemble("event_fixture",128);
+                if (!rows.some(row => row.references.some(ref =>
+                    ref.requested === "puts" && ref.resolvedAddress !== undefined))) {
+                    throw new Error("runtime PLT binding unavailable");
+                }
+            """)
+            assert relocated["result"]["status"] == "completed", relocated
+            client.script("await dbg.detach();")
+        finally:
+            target.kill()
+
+    launched = client.tool("run", pause=True, path=fixture, arg=[])
+    pid = launched["result"]["pid"]
+    owned.add(pid)
+    assert launched["result"]["state"] == "paused" and launched["paused_threads"] == [pid], launched
+    reply = client.tool("script_run", wait_ms=3000, src="""
+        const Packet = m.fromDwarf("Packet");
+        const packetSymbol = await dbg.getSymbol("packet");
+        if (Packet !== m.fromDwarf("Packet") || packetSymbol === null) throw new Error("DWARF identity");
+        if (dbg.symbolAt(packetSymbol.address)?.name !== "packet") throw new Error("symbolAt");
+        const integer = m.i32().value(42);
+        if (integer.$toJS() !== 42 || `${integer}` !== "42") throw new Error("scalar presentation");
+        const custom = m.i32().withFormatter(value => "value=" + value.$read());
+        if (custom.value(42).$format() !== "value=42" || custom.value(42).$toJS() !== 42) {
+            throw new Error("formatter changed conversion");
+        }
+        const value = Packet.at(packetSymbol.address);
+        const same = value.$asType(m.u8());
+        if (same.$address() !== packetSymbol.address) throw new Error("reinterpretation");
+        const before: { age: number; self?: unknown } = {age:20};
+        const after: { age: number; self?: unknown } = {age:21};
+        before.self = before;
+        after.self = after;
+        fmt.diff(before,after);
+        fmt.address(packetSymbol.address + BigInt(Packet.offsetOf("node")));
+        const point = dbg.softwareBreakpoint("fixture_stop",null);
+        await fmt.gdb("disable " + point.id);
+        await fmt.gdb("enable " + point.id);
+        await fmt.gdb("delete " + point.id);
+        fmt.status();
+        fmt.snapshot();
+        await fmt.gdb("info threads");
+    """)
+    assert reply["result"]["status"] == "completed", reply
+    formatted = [row["value"]["text"] for row in reply["output"] if row["value"]["kind"] == "fmt"]
+    assert any("age: 20 -> 21" in text for text in formatted), formatted
+    assert any("Snapshot" in text for text in formatted), formatted
+    assert any(("Type: Packet" in text or "Type: struct Packet" in text) and "Member: node" in text
+               for text in formatted), formatted
+    assert reply["paused_threads"] == [pid], reply
+    disassembly = client.tool("gdb", command="disassemble fixture_sum")
+    assert disassembly["result"]["status"] == "completed", disassembly
+    client.script("await dbg.kill(15);")
+    owned.remove(pid)
 
 
 def validate_session_extensions(client, fixture, owned):
@@ -187,7 +266,7 @@ def validate_session_extensions(client, fixture, owned):
     assert output == [[Path(fixture).name, True, 127, True, True]], reply
 
     client.tool("set_fork_policy", mode="parent")
-    pid = client.tool("run", path=fixture, arg=["child"])["result"]["pid"]
+    pid = client.tool("run", pause=True, path=fixture, arg=["child"])["result"]["pid"]
     owned.add(pid)
     table = client.tool("ps")["result"]["items"]
     assert any(row["pid"] == pid and row["threads"] == 1 and "args" not in row for row in table)
@@ -225,7 +304,7 @@ def validate_session_extensions(client, fixture, owned):
 
 
 def validate_inline_frames(client, fixture, owned):
-    pid = client.tool("run", path=fixture, arg=["inline"])["result"]["pid"]
+    pid = client.tool("run", pause=True, path=fixture, arg=["inline"])["result"]["pid"]
     owned.add(pid)
     reply = client.tool("script_run", wait_ms=5000, src="""
         dbg.softwareBreakpoint("fixture_stop");
@@ -243,7 +322,7 @@ def validate_inline_frames(client, fixture, owned):
 
 
 def validate_spec03(client, fixture, owned):
-    pid = client.tool("run", path=fixture, arg=["memory"])["result"]["pid"]
+    pid = client.tool("run", pause=True, path=fixture, arg=["memory"])["result"]["pid"]
     owned.add(pid)
     reply = client.script("""
         const Type = m.struct({
@@ -299,7 +378,7 @@ def validate_spec03(client, fixture, owned):
     client.script("await dbg.kill();")
     owned.remove(pid)
 
-    pid = client.tool("run", path=fixture, arg=["output"])["result"]["pid"]
+    pid = client.tool("run", pause=True, path=fixture, arg=["output"])["result"]["pid"]
     owned.add(pid)
     reply = client.script("""
         const pid = dbg.pid;
@@ -325,7 +404,7 @@ def validate_spec03(client, fixture, owned):
     assert output == [["stdout tail\n", "stderr tail\n", 39]], (reply, output)
     owned.remove(pid)
 
-    previous = client.tool("run", path=fixture, arg=["output"])["result"]["pid"]
+    previous = client.tool("run", pause=True, path=fixture, arg=["output"])["result"]["pid"]
     owned.add(previous)
     waiter = client.script("""
         dbg.resumeAll();
@@ -336,7 +415,7 @@ def validate_spec03(client, fixture, owned):
         waiter = await_state(client, lambda row: not row["running_scripts"])
     assert not any(row["value"]["kind"] == "script_error" for row in waiter["output"]), waiter
     owned.remove(previous)
-    switched = client.tool("run", path=fixture, arg=["child"])["result"]
+    switched = client.tool("run", pause=True, path=fixture, arg=["child"])["result"]
     owned.add(switched["pid"])
     assert switched["released"] == [previous], switched
     archived = client.script(f"""
@@ -349,7 +428,7 @@ def validate_spec03(client, fixture, owned):
 
 
 def validate_stripped_cfi(client, binary, debug_image, owned):
-    pid = client.tool("run", path=binary, arg=["child"])["result"]["pid"]
+    pid = client.tool("run", pause=True, path=binary, arg=["child"])["result"]["pid"]
     owned.add(pid)
     result = client.script("""
         dbg.softwareBreakpoint("fixture_stop");
@@ -418,7 +497,7 @@ def validate_xref(client):
 
 
 def validate_debugging(client, fixture, directory, object_file, owned):
-    reply = client.tool("run", path=fixture, arg=[])
+    reply = client.tool("run", pause=True, path=fixture, arg=[])
     pid = reply["result"]["pid"]
     owned.add(pid)
     assert reply["paused_threads"] == [pid], reply
@@ -448,7 +527,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
         const address = await thread.allocate(4096);
         dbg.memory.writeUint32(address, 0x11223344, "be");
         console.log(dbg.memory.readUint32(address, "le"), dbg.memory.search(
-            console.bytesFromHex("11 22 33 44"), address, address + 4096n)[0] === address);
+            fmt.bytesFromHex("11 22 33 44"), address, address + 4096n)[0] === address);
         await thread.free(address, 4096);
     """)
     assert logs(reply) == [[8, 22, 6, 0x12345678, 0x78], [str(pid)], [0x44332211, True]], reply
@@ -540,7 +619,7 @@ def validate_debugging(client, fixture, directory, object_file, owned):
 
 
 def validate_event_queue(client, fixture, owned):
-    result = client.tool("run", path=fixture, arg=["events"])
+    result = client.tool("run", pause=True, path=fixture, arg=["events"])
     pid = result["result"]["pid"]
     owned.add(pid)
     assert result["result"]["scratchpad"] and not result["signals"], result
@@ -633,7 +712,7 @@ def validate_event_queue(client, fixture, owned):
     assert logs(output) == [["enter data\n","stderr ready\n"],[7],[37],["ended"]], output
     owned.remove(pid)
 
-    result = client.tool("run", path="/bin/sh", arg=["-c", "exit 29"])
+    result = client.tool("run", pause=True, path="/bin/sh", arg=["-c", "exit 29"])
     pid = result["result"]["pid"]
     owned.add(pid)
     result = client.script("""
@@ -649,7 +728,7 @@ def validate_event_queue(client, fixture, owned):
 
 
 def validate_next_hit(client, fixture, owned):
-    target = client.tool("run", path=fixture, arg=[])
+    target = client.tool("run", pause=True, path=fixture, arg=[])
     pid = target["result"]["pid"]
     owned.add(pid)
     reply = client.script("""
@@ -685,7 +764,7 @@ def validate_next_hit(client, fixture, owned):
 
 
 def validate_fault_and_kill(client, fixture, owned):
-    result = client.tool("run", path=fixture, arg=["fault"])
+    result = client.tool("run", pause=True, path=fixture, arg=["fault"])
     pid = result["result"]["pid"]
     owned.add(pid)
     hit = client.script("""
@@ -719,7 +798,7 @@ def validate_fault_and_kill(client, fixture, owned):
     with subprocess.Popen([fixture, "attach"], stdout=subprocess.PIPE, text=True) as target:
         try:
             assert target.stdout.readline().strip() == "ready"
-            client.tool("attach", pid=target.pid)
+            client.tool("attach", pause=True, pid=target.pid)
             os.kill(target.pid, signal.SIGUSR1)
             waiting = client.script("""
                 const stop = await dbg.continueForStop("all", {timeoutMs:3000});
@@ -741,11 +820,13 @@ def validate_attach(client, fixture, client_exe, socket, token, lease):
     with subprocess.Popen([fixture, "attach"], stdout=subprocess.PIPE, text=True) as target:
         try:
             assert target.stdout.readline().strip() == "ready"
-            reply = client.tool("attach", pid=target.pid)
+            reply = client.tool("attach", pause=True, pid=target.pid)
             assert reply["paused_threads"] == [target.pid], reply
             if lease:
+                previous_status = client.tool("status")["result"]
                 client.close()
                 client = Client(client_exe, socket, token)
+                assert client.tool("status")["result"] == previous_status
                 reply = client.tool("snapshot")
                 assert reply["paused_threads"] == [target.pid], reply
                 client.close()
@@ -769,7 +850,7 @@ def validate_attach(client, fixture, client_exe, socket, token, lease):
 
 def validate_process_lifecycle(client, fixture, library, owned):
     def launch(*args):
-        result = client.tool("run", path=fixture, arg=list(args))
+        result = client.tool("run", pause=True, path=fixture, arg=list(args))
         pid = result["result"]["pid"]
         owned.add(pid)
         return pid
@@ -820,7 +901,7 @@ def validate_process_lifecycle(client, fixture, library, owned):
 
 def validate_debug_cases(client, fixtures, owned):
     def launch(case):
-        target = client.tool("run", path=str(fixtures / case), arg=[])
+        target = client.tool("run", pause=True, path=str(fixtures / case), arg=[])
         pid = target["result"]["pid"]
         owned.add(pid)
         return pid
@@ -832,7 +913,7 @@ def validate_debug_cases(client, fixtures, owned):
             result["output"] += tail["output"]
         assert logs(result) == expected, result
 
-    reply = client.tool("script_run", run={"path": str(fixtures / "D02")}, wait_ms=5000, src="""
+    reply = client.tool("script_run", run={"path": str(fixtures / "D02"), "pause": True}, wait_ms=5000, src="""
         const trace = await dbg.traceHits("push", {timeoutMs:3000});
         const history = await dbg.waitStops(64, 0);
         if (history.kind !== "stops") throw new Error(history.kind);
@@ -977,6 +1058,7 @@ def main():
                 token = "integration-session-" + os.urandom(16).hex()
                 client = Client(client_exe, socket, token)
                 validate_types_and_input(client)
+                validate_presentation(client, fixtures[0], owned)
                 validate_session_extensions(client, fixtures[0], owned)
                 validate_inline_frames(client, fixtures[0], owned)
                 validate_spec03(client, fixtures[0], owned)

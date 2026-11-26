@@ -231,7 +231,7 @@ impl Compiler {
                     && is_declaration_name(node)
                     && matches!(
                         node.as_identifier().text(),
-                        "$" | "m" | "dbg" | "console" | "__aidbgConsole"
+                        "$" | "m" | "dbg" | "console" | "fmt" | "__aidbgOutput"
                     )
                     && node.parent().is_some_and(|parent| {
                         !matches!(

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 pub(super) struct Decoded {
     pub mnemonic: String,
+    pub operands: String,
     pub length: usize,
     pub memory: Vec<MemoryAccess>,
     pub registers: Vec<String>,
@@ -52,6 +53,7 @@ pub(super) fn decode(trace: &Trace, pc: u64, regs: &regs::Snapshot) -> Result<De
     let memory = memory_accesses(&decoder, insn, &detail, &regs.general, &mut registers);
     Ok(Decoded {
         mnemonic,
+        operands: insn.op_str().unwrap_or_default().to_owned(),
         length: insn.bytes().len(),
         memory,
         registers,

@@ -209,12 +209,310 @@
                 check();
                 rpc("log", {id, value:{kind:"console", values:parse(jsonText(values))}});
             },
-            printf(format, ...args) {
-                check();
-                rpc("log", {id, value:{kind:"printf", text:sprintf(format, ...args)}});
-            },
-            sprintf, hexdump, bytesFromHex,
+
         });
+    }
+
+    let selectedTid, selectedFrame = 0;
+    const sourcePaths = new Map();
+    const storedSourcePaths = () => [...sourcePaths].map(([from,to]) => ({from,to}));
+    function makeFormat(id, generation) {
+        const write = (kind,text) => {
+            if (generation !== targetGeneration()) throw new Error("debugger target changed");
+            rpc("log", {id, value:{kind,text}});
+        };
+        const print = (...items) => write("fmt",items.map(display).join(" "));
+        const resolveAddress = at => typeof at === "bigint" ? at : /^\d+$/.test(at) ? BigInt(at) :
+            BigInt(rpc("address", {at:checkedAddress(at)}));
+        const currentTid = () => callbackTid ?? selectedTid ?? dbg.pid;
+        const trace = tid => rpc("backtrace", {tid, limit:25}).map(frame);
+        const frames = rows => rows.slice(0, 24).flatMap((row, i) => {
+            const source = row.file ? " at " + row.file.split("/").pop() + ":" + row.line : "";
+            const args = Object.entries(parametersOf(row)).map(([name, item]) => name + "=" + shownVariable(item)).join(", ");
+            const inline = (row.inlineFrames ?? []).slice(0,8).map(item =>
+                "    [inline] " + item.symbol + (item.callFile ? " at " + item.callFile.split("/").pop() + ":" + item.callLine : ""));
+            return [...inline, "#" + i + " " + (row.symbol ?? word(row.pc)) + "(" + args + ")" + source];
+        }).concat(rows.length > 24 ? ["… " + (rows.length - 24) + " more frames"] : []);
+        const shownVariable = item => item.value == null ? ({
+            optimized_out:"<optimized out>", read_failed:"<unreadable>", missing_page:"<unreadable>",
+        }[item.availability] ?? "<not available>") : display(item.value);
+        const variables = (label, values) => Object.entries(values ?? {}).map(([name, item]) =>
+            "  " + name + (item.type ? ": " + item.type : "") + " = " + shownVariable(item)
+        ).reduce((lines, line) => (lines.push(line), lines), [label]);
+        const parametersOf = row => ({...row.unavailableParameters, ...row.parameters});
+        const localsOf = row => ({...row.unavailableLocals, ...row.locals});
+        const currentFrame = () => {
+            const row = trace(currentTid())[selectedFrame];
+            if (!row) throw new RangeError("frame is unavailable");
+            return row;
+        };
+        const snapshotText = options => {
+            const request = typeof options === "object" ? {...options} : {tid:options};
+            request.frameLimit = 25;
+            const row = snapshot(rpc("snapshot", request));
+            const lines = [row.incomplete?.length ? "Snapshot: partial" : "Snapshot",
+                "Captured threads: " + row.threads.length + "/" + (row.threadCount ?? row.threads.length)];
+            for (const thread of row.threads) lines.push("Thread " + thread.tid, ...frames(thread.frames));
+            for (const item of row.incomplete ?? []) {
+                lines.push((item.tid ? "Thread " + item.tid + ": " : "") + item.stage + ": " + item.error);
+            }
+            print(lines.join("\n"));
+        };
+        const location = (address, row = dbg.symbolAt(address)) => {
+            return word(address) + (row && row.match !== "nearest" ? " <" + row.name + (row.offset ? "+" + word(row.offset) : "") + ">" : "");
+        };
+        const fmt = {
+            print,
+            printf(format,...args) { write("fmt",sprintf(format,...args)); },
+            sprintf, hexdump, bytesFromHex,
+            pVar:print,
+            pType(...items) { print(...items.map(item => (item?.$type ?? item).layout())); },
+            status() { print(rpc("sessionStatus")); },
+            snapshot:snapshotText,
+            backtrace(tid = currentTid()) { print(["Thread " + tid,...frames(trace(tid))].join("\n")); },
+            backtraceAll:snapshotText,
+            locals() { print(variables("Locals:",localsOf(currentFrame())).join("\n")); },
+            args() { print(variables("Arguments:",parametersOf(currentFrame())).join("\n")); },
+            frame() {
+                const row = currentFrame();
+                print(["Frame " + frames([row]).at(-1).replace(/^#0 /,"#" + selectedFrame + " "),
+                    ...variables("Arguments:",parametersOf(row)), ...variables("Locals:",localsOf(row))].join("\n"));
+            },
+            registers() {
+                const raw = registers(rpc("registers", {tid:currentTid()}));
+                const maps = dbg.mappings();
+                print(Object.entries(raw).map(([name, value]) => {
+                    if (typeof value !== "bigint") return name + "  " + display(value);
+                    const map = maps.find(row => row.start <= value && value < row.end);
+                    return name.padEnd(5) + (map ? location(value) + (map.name?.startsWith("[") ? " " + map.name : "") :
+                        word(value) + (value > 0n && value < 65536n ? " (" + value + ")" : ""));
+                }).join("\n"));
+            },
+            address(at) {
+                const address = resolveAddress(at);
+                const map = dbg.mappings().find(row => row.start <= address && address < row.end);
+                const line = dbg.addrToLine(address);
+                const row = dbg.symbolAt(address);
+                const typed = row?.kind === "data" && row.match !== "nearest"
+                    ? rpc("dataAt",{address:word(address)}) : null;
+                const data = typed ? describeDataAddress(row,typed) : [];
+                print(["Address: " + location(address,row),
+                    ...(row?.match === "nearest" ? ["Nearest preceding symbol: " + row.name + "+" + word(row.offset)] : []),
+                    ...(row?.section ? ["Section: " + row.section] : []),
+                    ...(map ? ["Mapping: " + word(map.start) + "-" + word(map.end) + " " + map.prot + " " + (map.name || "anonymous")] : []),
+                    ...(line ? ["Source: " + line.file + ":" + line.line] : []), ...data].join("\n"));
+            },
+            memory(at, length) {
+                const address = resolveAddress(at);
+                const count = Math.min(integer(length, "invalid memory length"), 512);
+                print([location(address), hexdump(readBytes(address,count), {showAscii:true}),
+                    ...(length > count ? ["… " + (length - count) + " more bytes"] : [])].join("\n"));
+            },
+            disassemble(at, {count = 16} = {}) {
+                print(dbg.disassemble(at, count).map(row => word(row.address) + "  " + row.mnemonic + " " + row.opStr +
+                    (row.references?.length ? "  ; " + row.references.map(ref => ref.requested ?
+                        ref.kind + " " + location(ref.address) + " requested: " + ref.requested +
+                            (ref.resolved ? ", resolved: " + ref.resolved : "") :
+                        ref.kind + " " + location(ref.address)).join(", ") : "")).join("\n"));
+            },
+            modules() {
+                const paths = new Map();
+                for (const map of dbg.mappings()) {
+                    if (map.name?.startsWith("/") && !paths.has(map.name)) paths.set(map.name,map.start);
+                }
+                print([...paths].map(([path,address]) => word(address) + "  " + path).join("\n"));
+            },
+            async symbols({pattern = /.*/, limit = 32, functionsOnly = false} = {}) {
+                integer(limit, "invalid symbol limit");
+                if (limit > 128) throw new RangeError("symbol limit exceeds 128");
+                const rows = [];
+                for await (const row of dbg.iterSymbols(pattern)) {
+                    if (functionsOnly && row.kind !== "text") continue;
+                    if (rows.length === limit) { rows.push("… more symbols"); break; }
+                    rows.push(word(row.address) + "  " + (row.demangledName ?? row.name));
+                }
+                print(rows.join("\n"));
+            },
+            diff(before, after) { print(diffData(before,after).join("\n") || "No changes"); },
+            async gdb(command) {
+                const tokens = command.trim().split(/\s+/);
+                const [verb, sub, ...rest] = tokens;
+                const noArgs = sub === undefined;
+                if (verb === "bt" && noArgs) return fmt.backtrace();
+                if (command.trim() === "thread apply all bt") return fmt.backtraceAll();
+                if (verb === "thread" && /^\d+$/.test(sub) && !rest.length) {
+                    const tid = Number(sub);
+                    if (!rpc("threads").includes(tid)) throw new RangeError("thread is unavailable");
+                    selectedTid = tid;
+                    selectedFrame = 0;
+                    return fmt.frame();
+                }
+                if ((verb === "frame" && (noArgs || /^\d+$/.test(sub)) && !rest.length) ||
+                    (["up","down"].includes(verb) && noArgs)) {
+                    const index = verb === "frame" ? (noArgs ? selectedFrame : Number(sub)) :
+                        selectedFrame + (verb === "up" ? 1 : -1);
+                    if (!trace(currentTid())[index]) throw new RangeError("frame is unavailable");
+                    selectedFrame = index;
+                    return fmt.frame();
+                }
+                if (verb === "info") {
+                    if (!rest.length && ["locals","args","registers"].includes(sub)) return fmt[sub]();
+                    if (!rest.length && sub === "breakpoints") return fmt.status();
+                    if (!rest.length && sub === "threads") {
+                        return print(rpc("threads").map(tid => (tid === currentTid() ? "* " : "  ") + tid).join("\n"));
+                    }
+                    if (sub === "symbol" && rest.length === 1) {
+                        const row = dbg.symbolAt(resolveAddress(rest[0]));
+                        return print(row?.match === "nearest" ? "Nearest preceding symbol: " + row.name + "+" + word(row.offset) :
+                            row ? location(row.address + row.offset,row) : "No matching symbol");
+                    }
+                    if (sub === "address" && rest.length === 1) return fmt.address(rest[0]);
+                    if (sub === "functions" && rest.length <= 1) {
+                        const pattern = rest[0] === undefined ? /.*/ : new RegExp(rest[0]);
+                        return fmt.symbols({pattern,functionsOnly:true});
+                    }
+                }
+                if (["p","ptype"].includes(verb) && /^[a-zA-Z_$][\w$]*$/.test(sub) && !rest.length) {
+                    const row = currentFrame();
+                    const item = localsOf(row)[sub] ?? parametersOf(row)[sub];
+                    if (!item) throw new Error("Unsupported expression or variable is unavailable: " + sub);
+                    return print(verb === "ptype" ? item.type ?? "<not available>" : shownVariable(item));
+                }
+                if (verb === "disassemble" && sub && !rest.length) return fmt.disassemble(sub);
+                if (verb === "b" && sub && !rest.length) return print("Breakpoint #" + dbg.softwareBreakpoint(sub).id);
+                if (["delete","disable","enable"].includes(verb) && /^\d+$/.test(sub) && !rest.length) {
+                    const point = points.get(Number(sub))?.point;
+                    if (!point) throw new RangeError("breakpoint is unavailable");
+                    return verb === "delete" ? point.remove() : point[verb]();
+                }
+                if (verb === "c" && noArgs) {
+                    const row = await dbg.continueForStop("all", {pausedOnly:true});
+                    return print(stopSummary(row));
+                }
+                if (["si","ni","finish"].includes(verb) && noArgs && selectedFrame === 0) {
+                    const tid = currentTid();
+                    if (verb === "finish") {
+                        const caller = trace(tid)[1];
+                        if (!caller?.pc || !caller.sp) throw new Error("caller frame is unavailable");
+                        rpc("step",{tid,mode:"untilFrame",at:word(caller.pc),sp:word(caller.sp)});
+                    } else {
+                        rpc("step",{tid,mode:verb === "si" ? "step" : "next"});
+                    }
+                    return fmt.backtrace(tid);
+                }
+                if (verb === "x" && sub && !rest.length) {
+                    const address = resolveAddress(sub);
+                    return print(location(address) + ": " + word(BigInt(view(readBytes(address,4)).getUint32(0,true))));
+                }
+                if (verb === "x/16xb" && sub && !rest.length) return fmt.memory(sub,16);
+                if (verb === "list" && noArgs) {
+                    const row = dbg.list(currentFrame());
+                    if (!row) return print("Source unavailable");
+                    return print([row.file, ...row.lines.map(line => line.line + "  " + line.text)].join("\n"));
+                }
+                if (verb === "set" && sub === "substitute-path" && rest.length === 2) {
+                    return dbg.substitutePath(rest[0],rest[1]);
+                }
+                throw new Error("Unsupported GDB command or arguments: " + command);
+            },
+        };
+        return Object.freeze(fmt);
+    }
+
+    function describeDataAddress(symbol, typed) {
+        const type = dwarfType(typed);
+        const lines = typed.type ? ["Type: " + typed.type] : [];
+        let value = type.at(symbol.address);
+        if (symbol.offset === 0n) return value ? [...lines,"Value: " + value.$format()] : lines;
+        let offset = Number(symbol.offset);
+        if (!Number.isSafeInteger(offset)) return lines;
+        const path = [];
+        for (let depth = 0; depth < 8; depth++) {
+            const info = typeInfo(value.$type);
+            if (info.kind !== "struct") break;
+            const matches = Object.entries(info.fields).filter(([, index]) => {
+                const start = info.members[index + memberOffset];
+                const member = typeInfo(resolve(info.members[index + memberType],value.$type));
+                return member.kind !== "bitfield" && member.size !== undefined
+                    && start <= offset && offset - start < member.size;
+            });
+            if (matches.length !== 1) break;
+            const [name,index] = matches[0];
+            offset -= info.members[index + memberOffset];
+            value = value[name];
+            path.push(name);
+            if (offset === 0) return [...lines,"Member: " + path.join("."),"Value: " + value.$format()];
+        }
+        return lines;
+    }
+
+    function stopSummary(row) {
+        const kind = row.kind === "signal" ? row.signalName ?? "signal" : row.kind;
+        return ["Stopped: " + kind + (row.breakpointId === undefined ? "" : " #" + row.breakpointId),
+            ...(row.tid === undefined ? [] : ["Thread: " + row.tid]),
+            ...(row.faultAddress == null ? [] : ["Fault address: " + row.faultAddress]),
+            ...(row.address == null ? [] : ["Address: " + row.address])].join("\n");
+    }
+
+    function display(value) {
+        const active = new WeakSet();
+        const format = (item,depth) => {
+            if (valueStore(item)) return item.$format();
+            if (typeof item === "string") {
+                return depth === 0 ? item : JSON.stringify(item.slice(0,256)) + (item.length > 256 ? " …" : "");
+            }
+            if (item === undefined) return "<not available>";
+            if (typeof item === "bigint") return item.toString() + "n";
+            if (item === null || typeof item !== "object") return String(item);
+            if (active.has(item)) return "<cycle>";
+            if (depth >= 4) return "…";
+            active.add(item);
+            const indexed = Array.isArray(item) || ArrayBuffer.isView(item) && Number.isSafeInteger(item.length);
+            const keys = indexed ? undefined : Object.keys(item);
+            const length = keys?.length ?? item.length;
+            const rows = [];
+            for (let i = 0; i < Math.min(32,length); i++) {
+                rows.push(indexed ? format(item[i],depth+1) : keys[i] + ": " + format(item[keys[i]],depth+1));
+            }
+            if (length > 32) rows.push("… " + (length - 32) + " more " + (indexed ? "items" : "fields"));
+            active.delete(item);
+            return (indexed ? "[" : "{") + rows.join(", ") + (indexed ? "]" : "}");
+        };
+        return format(value,0);
+    }
+
+    function diffData(before, after) {
+        const visited = new WeakMap(), lines = [];
+        let budget = 10000;
+        const walk = (left, right, path, depth) => {
+            --budget;
+            if (Object.is(left,right)) return;
+            if (depth < 32 && left && right && typeof left === "object" && typeof right === "object" &&
+                Array.isArray(left) === Array.isArray(right)) {
+                let matches = visited.get(left);
+                if (!matches) visited.set(left, matches = new WeakSet());
+                if (matches.has(right)) return;
+                matches.add(right);
+                for (const key of new Set([...Object.keys(left), ...Object.keys(right)])) {
+                    if (budget <= 0 || lines.length >= 128) break;
+                    const child = /^\d+$/.test(key) && Array.isArray(left) ? path + "[" + key + "]" :
+                        (path ? path + "." : "") + key;
+                    walk(Object.hasOwn(left,key) ? left[key] : missing,
+                        Object.hasOwn(right,key) ? right[key] : missing,child,depth+1);
+                }
+                if (Array.isArray(left) && left.length !== right.length) {
+                    walk(left.length,right.length,path + ".length",depth+1);
+                }
+                return;
+            }
+            const render = value => value === missing ? "<absent>" :
+                typeof value === "string" ? JSON.stringify(value.slice(0,256)) + (value.length > 256 ? " …" : "") : display(value);
+            lines.push((path || "<root>") + ": " + render(left) + " -> " + render(right));
+        };
+        const missing = Symbol();
+        walk(before,after,"",0);
+        if (budget <= 0 || lines.length >= 128) lines.push("… diff limit reached");
+        return lines;
     }
 
     function readBytes(address, length) {
@@ -315,6 +613,7 @@
         );
         return Object.freeze({...row, pc:BigInt(raw.pc), sp:BigInt(raw.sp ?? 0), fp:BigInt(raw.fp ?? 0),
             lookupPc:BigInt(raw.lookupPc ?? raw.pc), locals:variables(raw.locals), parameters:variables(raw.parameters),
+            unavailableLocals:variables(raw.unavailableLocals), unavailableParameters:variables(raw.unavailableParameters),
             inlineFrames:raw.inlineFrames == null ? undefined : Object.freeze(raw.inlineFrames.map(Object.freeze)),
             unwindMethod:optional(raw.unwindMethod),
             missingDebugSections:raw.missingDebugSections == null ? undefined : Object.freeze(raw.missingDebugSections),
@@ -499,10 +798,10 @@
         const address = pending
             ? rpc("addPendingPoint", {id, name:at, ...targetOptions})
             : BigInt(rpc("addPoint", {id, kind:type, at:checkedAddress(at), ...targetOptions}));
-        const change = remove => {
+        const change = (remove,enable = false) => {
             if (generation !== targetGeneration()) throw new Error("breakpoint no longer exists");
-            rpc("point", {id, remove});
-            points.delete(id);
+            rpc("point", {id, remove, enable});
+            if (remove) points.delete(id);
         };
         const point = Object.freeze({
             id, type:pending ? "software_breakpoint" : type,
@@ -522,6 +821,7 @@
                 callback = value;
             },
             disable() { change(false); },
+            enable() { change(false,true); },
             remove() { change(true); },
         });
         points.set(id, {point, condition, count:0});
@@ -644,11 +944,21 @@
             const result = rpc("lineToAddr",{file,line});
             return result == null ? null : BigInt(result);
         },
+        symbolAt(address) {
+            const row = rpc("symbolAt", {address:word(address)});
+            return row == null ? null : Object.freeze({...row,address:BigInt(row.address),offset:BigInt(row.offset)});
+        },
+        substitutePath(from,to) {
+            if (typeof from !== "string" || typeof to !== "string" || !from || !to) {
+                throw new TypeError("expected source path prefixes");
+            }
+            sourcePaths.set(from,to);
+        },
         addrToLine(address) { return rpc("addrToLine",{address:word(address)}); },
         stringify(value) { return jsonText(value); },
         list(at, radius = 5, sourcePaths = []) {
             return rpc("listSource", {address:word(typeof at === "bigint" ? at : at.lookupPc),
-                radius:integer(radius,"invalid source context"), sourcePaths});
+                radius:integer(radius,"invalid source context"), sourcePaths:[...sourcePaths, ...storedSourcePaths()]});
         },
         async getSymbol(name) {
             const rows = rpc("symbols", {pattern:name});
@@ -688,7 +998,9 @@
         softwareWatchpoint(at, callback, options) { return install("software_watchpoint",at,callback,options); },
         assemble(at, src) { return bytesFromHex(rpc("assemble", {at:checkedAddress(at), src}).bytes); },
         disassemble(at, count) {
-            return rpc("disassemble", {at:checkedAddress(at), count}).map(row => ({...row,address:BigInt(row.address), bytes:typeof row.bytes === "string" ? bytesFromHex(row.bytes) : Uint8Array.from(row.bytes)}));
+            return rpc("disassemble", {at:checkedAddress(at), count}).map(row => ({...row,address:BigInt(row.address), bytes:typeof row.bytes === "string" ? bytesFromHex(row.bytes) : Uint8Array.from(row.bytes), references:(row.references ?? []).map(ref => ({...ref,address:BigInt(ref.address),
+                resolvedAddress:ref.resolvedAddress == null ? undefined : BigInt(ref.resolvedAddress),
+                slot:ref.slot == null ? undefined : BigInt(ref.slot)}))}));
         },
         async linkObjAt(path, address) { rpc("linkObjAt", {path, address:word(address)}); },
         coredump(path, kind) { rpc("coredump", {path, kind}); },
@@ -917,6 +1229,10 @@
             return members[fields[name] + memberType];
         },
         refine,
+        withFormatter(type,formatter) {
+            if (typeof formatter !== "function") throw new TypeError("expected a formatter function");
+            return descriptor({...typeInfo(type),formatter});
+        },
         pack(type,value) {
             const info = typeInfo(type);
             if (!info.entries) throw new TypeError("cannot repack a resolved or refined layout");
@@ -950,7 +1266,7 @@
         const properties = {
             $size:typeProperties.$size, $align:typeProperties.$align, at:typeProperties.at,
             $readBytes:typeProperties.$readBytes, $writeBytes:typeProperties.$writeBytes,
-            offsetOf:typeProperties.offsetOf, layout:typeProperties.layout,
+            offsetOf:typeProperties.offsetOf, layout:typeProperties.layout, withFormatter:typeProperties.withFormatter,
         };
         if (info.align && info.kind !== "bitfield") properties.align = typeProperties.align;
         if (info.kind === "scalar" && info.size > 1) {
@@ -1050,6 +1366,17 @@
         while (offset < total) {
             const length = Math.min(total - offset,4096);
             const chunk = rpc("readPrefix", {address:word(addr(base,offset)), length});
+            if (element.char) {
+                const end = chunk.indexOf(0);
+                if (end !== -1) {
+                    collected.push(...chunk.slice(0,end));
+                    return Uint8Array.from(collected);
+                }
+                collected.push(...chunk);
+                if (chunk.length < length) throw new Error("terminated sequence crosses unavailable memory");
+                offset += length;
+                continue;
+            }
             for (let i = 0; i + element.size <= chunk.length; i += element.size) {
                 const bytes = chunk.slice(i,i + element.size);
                 if (bytes.every(byte => byte === 0)) return Uint8Array.from(collected);
@@ -1443,11 +1770,241 @@
 
     const missingValueProperty = Symbol();
 
+    function valueFormatOptions(options) {
+        const defaults = {indent:2, maxDepth:4, maxElements:32, maxStringLength:256};
+        return Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => {
+            const n = integer(options?.[key] ?? fallback, "invalid " + key);
+            if (n > (key === "maxElements" || key === "maxStringLength" ? 4096 : 32)) {
+                throw new RangeError(key + " exceeds the format limit");
+            }
+            return [key,n];
+        }));
+    }
+
+    // Decode a contiguous leaf range in one target read. Aggregate and dynamic
+    // members use the existing typed views, including bitfields and length hooks.
+    function scalarRange(element, base, count) {
+        if (!count) return [];
+        const spec = scalarSpec[element.scalar];
+        const result = new Array(count);
+        const perChunk = Math.floor(16384 / element.size);
+        for (let i = 0; i < count; i += perChunk) {
+            const length = Math.min(count - i, perChunk);
+            const data = view(readBytes(addr(base,i * element.size), length * element.size));
+            for (let j = 0; j < length; j++) {
+                result[i+j] = data["get" + spec[0]](j * element.size, element.littleEndian ?? true);
+            }
+        }
+        return result;
+    }
+
+    function plainPointer(info, self) {
+        return info.kind === "ptr" && info.length === undefined && info.terminated === undefined
+            && !typeInfo(resolve(info.element,self)).char;
+    }
+
+    function convertScalar(value, info) {
+        return info.boolean ? Boolean(value) : info.kind === "ptr" && value === 0n ? null : value;
+    }
+
+    function recordPlan(type, depth = 0) {
+        if (depth > 16) return undefined;
+        const info = typeInfo(type);
+        if (!info.fields || info.tail || !info.size) return undefined;
+        const fields = [];
+        for (const [name,index] of Object.entries(info.fields)) {
+            const member = resolve(info.members[index + memberType],type);
+            const offset = info.members[index + memberOffset];
+            const descriptor = typeInfo(member);
+            if (descriptor.kind === "scalar" || plainPointer(descriptor,type)) {
+                fields.push({name,offset,descriptor});
+            } else {
+                const nested = recordPlan(member,depth+1);
+                if (!nested) return undefined;
+                fields.push({name,offset,nested});
+            }
+        }
+        return {type,size:info.size,fields};
+    }
+
+    function presentValue(store, options) {
+        bound(store);
+        const formatting = options !== undefined;
+        const seen = new Map();
+        let budget = 1000000;
+        const formatScalar = (value, info) => {
+            const name = info.enumerators && Object.entries(info.enumerators).find(([, n]) => BigInt(n) === BigInt(value))?.[0];
+            return name ?? (info.kind === "ptr" || info.kind === "fn" ? word(value) : String(value));
+        };
+        const conversionViews = (type, self) => {
+            let entries = seen.get(type);
+            if (!entries) seen.set(type, entries = new Map());
+            let views = entries.get(self);
+            if (!views) entries.set(self, views = new Map());
+            return views;
+        };
+        const record = (plan, data, offset, base) => {
+            const views = conversionViews(plan.type,undefined);
+            const key = String(addr(base,offset)) + ":undefined";
+            if (views.has(key)) return views.get(key);
+            const output = {};
+            views.set(key,output);
+            for (const {name,offset:field,descriptor,nested} of plan.fields) {
+                if (--budget < 0) throw new RangeError("Value conversion resource limit reached");
+                const at = offset + field;
+                const value = nested ? record(nested,data,at,base) :
+                    convertScalar(data["get" + scalarSpec[descriptor.scalar][0]](at,descriptor.littleEndian ?? true),descriptor);
+                Object.defineProperty(output,name,{value,enumerable:true, writable:true, configurable:true});
+            }
+            return output;
+        };
+        const walk = (item, depth) => {
+            if (--budget < 0 || depth > 64) throw new RangeError("Value conversion resource limit reached");
+            const type = item[valueKeys.type], info = item[valueKeys.info], kind = info.kind;
+            const value = item[valueKeys.value];
+            if (formatting) {
+                const printer = info.formatter ?? prettyPrinters.get(type);
+                if (printer && !activePrinters.has(type)) {
+                    activePrinters.add(type);
+                    try {
+                        const text = printer(value);
+                        if (text !== undefined) {
+                            if (typeof text !== "string") throw new TypeError("formatter must return a string");
+                            return text;
+                        }
+                    } finally {
+                        activePrinters.delete(type);
+                    }
+                }
+            }
+            if (kind === "scalar" || kind === "bitfield" || kind === "fn") {
+                const scalar = kind === "scalar" ? readScalar(item) : kind === "bitfield" ? readBitfield(item) : valueAddress(item);
+                const converted = info.boolean ? Boolean(scalar) : scalar;
+                return formatting ? formatScalar(converted,info) : converted;
+            }
+            if (formatting && depth >= options.maxDepth) return "…";
+            const base = kind === "ptr" ? readScalar(item) : item[valueKeys.address];
+            const element = info.element === undefined ? undefined : resolve(info.element,item[valueKeys.self]);
+            const scalar = element === undefined ? undefined : typeInfo(element);
+            if (kind === "ptr" && base === 0n) return formatting ? "NULL" : null;
+            if (kind === "ptr" && scalar?.char && info.length === undefined) {
+                const limit = info.terminated ?? 4096;
+                if (!formatting) {
+                    if (limit > budget) throw new RangeError("string conversion budget exceeded");
+                    return fromUtf8(terminatedBytes(base,scalar,limit));
+                }
+                const count = Math.min(limit, options.maxStringLength + 1);
+                const data = rpc("readPrefix", {address:word(base),length:count});
+                const end = data.indexOf(0);
+                if (end < 0 && data.length < count) return "<unreadable string>";
+                if (end < 0 && count === limit && count <= options.maxStringLength) return "<unterminated string>";
+                return JSON.stringify(fromUtf8(data.slice(0,end < 0 ? options.maxStringLength : end))) +
+                    (end < 0 ? " … (truncated)" : "");
+            }
+            const length = kind === "opaque" ? info.size :
+                (kind === "array" || kind === "ptr") ? dynamicLength(info,item) : undefined;
+            if (kind === "ptr" && length === undefined && info.terminated === undefined) {
+                if (!formatting) return base;
+                let hit;
+                try { hit = rpc("symbolAt", {address:word(base)}); } catch (_) {}
+                const label = hit && hit.match !== "nearest"
+                    ? " <" + hit.name + (hit.offset === "0x0" ? "" : "+" + hit.offset) + ">" : "";
+                return word(base) + label;
+            }
+            if (kind === "array" && length === undefined) throw new TypeError("array length is unknown");
+            // Pointer and array views can share an address while describing
+            // different lengths. Aggregate self resolution can also change a view.
+            const self = info.fields ? undefined : item[valueKeys.self];
+            const views = conversionViews(type,self);
+            const key = base === undefined ? value : String(base) + ":" + length;
+            if (views.has(key)) return formatting ? "<cycle>" : views.get(key);
+            const plan = !formatting && scalar?.fields ? recordPlan(element) : undefined;
+            const ownPlan = !formatting && info.fields ? recordPlan(type) : undefined;
+            if (ownPlan && ownPlan.size <= 16384) {
+                return record(ownPlan,view(readBytes(base,ownPlan.size)),0,base);
+            }
+            const output = info.fields ? {} : [];
+            views.set(key,output);
+            const child = (get, fallback) => {
+                if (!formatting) return walk(valueStore(get()),depth+1);
+                try { return walk(valueStore(get()),depth+1); }
+                catch (error) {
+                    return "<" + fallback + ": " + String(error.message ?? error).slice(0,160) + ">";
+                }
+            };
+            let rendered;
+            if (info.fields) {
+                const names = Object.keys(info.fields);
+                const shown = formatting ? names.slice(0,options.maxElements) : names;
+                for (const name of shown) {
+                    Object.defineProperty(output,name,{value:child(() => value[name],"unavailable"),
+                        enumerable:true, writable:true, configurable:true});
+                }
+                if (formatting) {
+                    const indent = " ".repeat(options.indent * (depth + 1));
+                    const lines = shown.map(name => indent + name + ": " + output[name]);
+                    if (shown.length < names.length) lines.push(indent + "… " + (names.length - shown.length) + " more fields");
+                    rendered = (info.name ?? kind) + " {" + (lines.length ?
+                        "\n" + lines.join("\n") + "\n" + " ".repeat(options.indent * depth) : "") + "}";
+                }
+            } else if (length === undefined) {
+                if (formatting) rendered = word(base) + " <terminated sequence>";
+                else {
+                    if (info.terminated > budget) throw new RangeError("terminated sequence conversion budget exceeded");
+                    const result = value.$deref();
+                    budget -= result.length;
+                    views.set(key,result);
+                    return result;
+                }
+            } else {
+                const count = formatting ? Math.min(length,options.maxElements) : length;
+                if (count > budget) throw new RangeError("Value conversion element limit reached");
+                if (kind === "opaque") {
+                    for (let i = 0; i < count; i += 16384) {
+                        output.push(...readBytes(addr(base,i),Math.min(16384,count-i)));
+                    }
+                    budget -= count;
+                } else if (scalar && ((scalar.kind === "scalar" && !(formatting && (scalar.formatter || prettyPrinters.has(element)))) ||
+                    (!formatting && plainPointer(scalar,item[valueKeys.self])))) {
+                    const data = scalarRange(scalar,base,count);
+                    for (const n of data) {
+                        const converted = convertScalar(n,scalar);
+                        output.push(formatting ? formatScalar(converted,scalar) : converted);
+                    }
+                    budget -= count;
+                } else if (plan && plan.size <= 16384) {
+                    const stride = Math.floor(16384 / plan.size);
+                    for (let i = 0; i < count; i += stride) {
+                        const length = Math.min(count-i,stride);
+                        const baseAddress = addr(base,i * plan.size);
+                        const data = view(readBytes(baseAddress,length * plan.size));
+                        for (let j = 0; j < length; j++) output.push(record(plan,data,j * plan.size,baseAddress));
+                    }
+                    budget -= count;
+                } else {
+                    for (let i = 0; i < count; i++) output.push(child(() => value[i],"unreadable"));
+                }
+                if (formatting) rendered = "[" + output.join(", ") +
+                    (count < length ? (count ? ", " : "") + "… " + (length - count) + " more elements" : "") + "]";
+            }
+            if (formatting) views.delete(key);
+            return formatting ? rendered : output;
+        };
+        return walk(store,0);
+    }
+
     function getValueProperty(store,key) {
         const info = store[valueKeys.info];
         const {kind} = info;
         switch (key) {
         case "$type": return store[valueKeys.type];
+        case "$asType": return type => type.at(valueAddress(store),store[valueKeys.value].$tid);
+        case "$toJS": return () => presentValue(store);
+        case "$format": return options => presentValue(store,valueFormatOptions(options));
+        case Symbol.toPrimitive: return hint => {
+            if (hint !== "string") throw new TypeError("Value requires an explicit numeric read");
+            return presentValue(store,valueFormatOptions());
+        };
         case "$size": return valueSize(info,store);
         case "$parent": return store[valueKeys.parent];
         case "$tid": return store[valueKeys.tid] ?? (store[valueKeys.inheritTid] ? store[valueKeys.parent]?.$tid : undefined);
@@ -1520,6 +2077,7 @@
     };
 
     const nativeValueHooks = {
+        toPrimitive:Symbol.toPrimitive,
         get(store,key) {
             const value = getValueProperty(store,key);
             if (value !== missingValueProperty) return value;
@@ -1629,8 +2187,15 @@
         } while (offset != null);
     }
 
+    const dwarfTypes = new Map();
+    const dwarfTypeFinalizer = new FinalizationRegistry(([key,ref]) => {
+        if (dwarfTypes.get(key) === ref) dwarfTypes.delete(key);
+    });
     function dwarfType(row) {
-        const {nodes,root} = row.graph;
+        const {nodes,root,identity,module} = row.graph;
+        const key = identity == null ? undefined : stringify([module,identity]);
+        const cached = dwarfTypes.get(key)?.deref();
+        if (cached !== undefined) return cached;
         const cache = new Map();
         function node(id) {
             if (cache.has(id)) return cache.get(id);
@@ -1638,7 +2203,10 @@
             let type;
             switch (info.kind) {
             case "void": type = voidType; break;
-            case "scalar": type = scalar(info.scalar); break;
+            case "scalar":
+                type = scalar(info.scalar);
+                if (info.boolean || info.character) type = descriptor({...typeInfo(type), boolean:info.boolean, char:info.character});
+                break;
             case "pointer": type = m.pointer(m.lazy(() => node(info.element))); break;
             case "array":
                 type = node(info.element);
@@ -1659,7 +2227,7 @@
                         promoteMembers(fields,members,underlying,offset,duplicatePrefix);
                     }
                 }
-                type = descriptor({kind:info.union ? "union" : "struct",size:info.size,align:info.align,fields,members});
+                type = descriptor({kind:info.union ? "union" : "struct",name:info.name,size:info.size,align:info.align,fields,members});
                 break;
             }
             case "function":
@@ -1672,7 +2240,13 @@
             cache.set(id,type);
             return type;
         }
-        return node(root);
+        const type = node(root);
+        if (key !== undefined) {
+            const ref = new WeakRef(type);
+            dwarfTypes.set(key,ref);
+            dwarfTypeFinalizer.register(type,[key,ref]);
+        }
+        return type;
     }
 
     function immediateWatch(length,value) {
@@ -1702,7 +2276,7 @@
                         : undefined;
                 },
             });
-            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgConsole:makeConsole,setTimeout,clearTimeout,queueMicrotask,sleep,AbortController})) {
+            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgOutput(id,generation) { return [makeConsole(id,generation),makeFormat(id,generation)]; },setTimeout,clearTimeout,queueMicrotask,sleep,AbortController})) {
                 Object.defineProperty(globalThis,name,{value});
             }
         },
@@ -1736,9 +2310,12 @@
             for (const waiter of eventWaiters.values()) waiter.reject(new Error("target changed"));
             eventWaiters.clear();
             points.clear();
+            selectedTid = undefined;
+            selectedFrame = 0;
             syscallCatches.clear();
             signals.clear();
             prettyPrinters = new WeakMap();
+            dwarfTypes.clear();
             for (const key of Object.keys(exports)) delete exports[key];
         },
     };

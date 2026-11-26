@@ -36,6 +36,7 @@ struct Args {
 }
 
 struct Lease {
+    id: String,
     renewed: Instant,
     worker: Option<Worker>,
 }
@@ -67,9 +68,17 @@ impl Service {
             return Err(Status::resource_exhausted("too many debugger sessions"));
         }
         let now = Instant::now();
-        let lease = sessions.entry(token.to_owned()).or_insert(Lease {
-            renewed: now,
-            worker: None,
+        let lease = sessions.entry(token.to_owned()).or_insert_with(|| {
+            use sha2::{Digest, Sha256};
+            let id = Sha256::digest(token.as_bytes())[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            Lease {
+                id,
+                renewed: now,
+                worker: None,
+            }
         });
         lease.renewed = now;
         Ok(lease)
@@ -81,7 +90,9 @@ impl Service {
             let lease = Self::lease(&request, &mut sessions)?;
             let worker = match &mut lease.worker {
                 Some(worker) => worker,
-                slot => slot.insert(Worker::start(self.state_dir.clone()).map_err(internal)?),
+                slot => slot.insert(
+                    Worker::start(self.state_dir.clone(), lease.id.clone()).map_err(internal)?,
+                ),
             };
             worker
                 .request(command(request.into_inner()))
@@ -105,8 +116,11 @@ impl Debugger for Service {
     async fn run(&self, request: Request<RunProcessRequest>) -> Reply {
         self.command(request, Command::Run).await
     }
+    async fn status(&self, request: Request<HeartbeatRequest>) -> Reply {
+        self.command(request, |_| Command::Status).await
+    }
     async fn attach(&self, request: Request<AttachRequest>) -> Reply {
-        self.command(request, |args| Command::Attach(args.pid))
+        self.command(request, |args| Command::Attach(args.pid, args.pause))
             .await
     }
     async fn script_run(&self, request: Request<RunScriptRequest>) -> Reply {
@@ -138,8 +152,10 @@ impl Debugger for Service {
         .await
     }
     async fn snapshot(&self, request: Request<SessionSnapshotRequest>) -> Reply {
-        self.command(request, |args| Command::Snapshot(args.tid, args.context))
-            .await
+        self.command(request, |args| {
+            Command::Snapshot(args.tid, args.context, args.stop_timeout_ms.unwrap_or(1000))
+        })
+        .await
     }
     async fn ps(&self, request: Request<ProcessListRequest>) -> Reply {
         self.command(request, Command::Processes).await

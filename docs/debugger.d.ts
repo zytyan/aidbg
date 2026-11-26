@@ -66,6 +66,7 @@ export interface Module {
 }
 
 export interface SymbolInfo {
+    readonly kind?: string;
     readonly name: string;
     readonly demangledName?: string;
     readonly address: bigint;
@@ -73,11 +74,29 @@ export interface SymbolInfo {
     readonly module?: string;
 }
 
+export interface AddressSymbol {
+    readonly name: string;
+    readonly address: bigint;
+    readonly offset: bigint;
+    readonly module?: { readonly path: string } | null;
+    readonly kind?: string;
+    readonly section?: string | null;
+    readonly match: "exact" | "within" | "nearest";
+}
+
 export interface Instruction {
     readonly address: bigint;
     readonly bytes: Uint8Array;
     readonly mnemonic: string;
     readonly opStr: string;
+    readonly references: readonly {
+        address: bigint;
+        kind: string;
+        slot?: bigint;
+        requested?: string;
+        resolved?: string;
+        resolvedAddress?: bigint;
+    }[];
 }
 
 export interface Variable {
@@ -85,6 +104,7 @@ export interface Variable {
     readonly type?: string;
     readonly address?: bigint;
     readonly value: Value.Base | string | number | bigint | boolean | null;
+    readonly availability?: string;
 }
 
 export type LocalVariables = Record<string, Variable>;
@@ -247,6 +267,8 @@ export interface StackFrame {
     readonly locals?: LocalVariables;
     /** 此帧可读的形参。 */
     readonly parameters?: LocalVariables;
+    readonly unavailableLocals?: LocalVariables;
+    readonly unavailableParameters?: LocalVariables;
     /** 若dwarf信息存在，则显示文件名与行号 */
     readonly file?: string;
     readonly line?: number;
@@ -267,11 +289,12 @@ export interface SourceListing {
 }
 
 export interface DebugSnapshot {
+    readonly threadCount: number;
     readonly timestamp: number;
     readonly threads: readonly ThreadSnapshot[];
     readonly mappings: readonly MemoryMapping[];
     readonly incomplete?: readonly { readonly tid?: number; readonly stage: string; readonly error: string }[];
-    readonly consistency: "thread" | "all-stopped" | "best-effort";
+    readonly consistency: "thread" | "all-stopped" | "best-effort" | "partial";
     readonly context?: {
         readonly State?: string;
         readonly TracerPid?: number;
@@ -310,6 +333,7 @@ export interface Breakpoint {
 
     callback: BreakpointCallback;
     disable(): void;
+    enable(): void;
     /** 删除该断点 */
     remove(): void;
 }
@@ -569,7 +593,7 @@ export interface Debugger {
      * 已有 scratchpad 时可仅令当前线程执行 eval 与 injectSyscall；否则需暂停所有其他线程。
      */
     prepareScratchPad(): Promise<void>;
-    snapshot(options?: number | { tid?: number; context?: boolean }): Promise<DebugSnapshot>;
+    snapshot(options?: number | { tid?: number; context?: boolean; stopTimeoutMs?: number }): Promise<DebugSnapshot>;
     backtraceAll(): Promise<Pick<DebugSnapshot, "threads" | "incomplete">>;
     /** 记录指定断点的命中并自动继续，直到退出、超时、达到命中上限或遇到其他暂停事件。 */
     traceHits(at: bigint | string, options?: { tid?: number; timeoutMs?: number; limit?: number }): Promise<{
@@ -641,6 +665,8 @@ export interface Debugger {
 
     /** 返回唯一匹配的运行时地址。无匹配或存在多个地址时返回 null。 */
     lineToAddr(file: string, line: number): bigint | null;
+    symbolAt(addr: bigint): AddressSymbol | null;
+    substitutePath(from: string, to: string): void;
     addrToLine(addr: bigint): { file: string; line: number } | null;
     /** 从调试服务端读取地址或帧对应的源码。默认前后各 5 行，找不到源码时返回 null。 */
     list(at: bigint | StackFrame, radius?: number,
@@ -776,18 +802,42 @@ export interface HexdumpOptions {
 }
 
 export interface Console {
-    /** 同步写入会话输出缓冲区，与 printf 使用相同的回包规则。 */
     log(...args: unknown[]): void;
-    /**
-     * 同步写入会话输出缓冲区，由写入后第一个收集输出的 MCP 响应携带。
-     * 当前 script_run 尚未收集输出时，该响应即可带回这条日志。
-     * 输出缓冲区上限为 1 MiB，溢出时丢弃最旧的输出并报告截断。
-     */
-    printf(fmt: string, ...args: unknown[]): void;
-    sprintf(fmt: string, ...args: unknown[]): string;
-    hexdump(data: Uint8Array, options?: HexdumpOptions): string;
-    bytesFromHex(s: string): Uint8Array;
 }
+
+export interface Format {
+    print(...values: unknown[]): void;
+    printf(format: string, ...args: unknown[]): void;
+    sprintf(format: string, ...args: unknown[]): string;
+    hexdump(data: Uint8Array, options?: HexdumpOptions): string;
+    bytesFromHex(text: string): Uint8Array;
+    pVar(...values: unknown[]): void;
+    pType(...typesOrValues: (Type.Base<unknown> | Value.Base)[]): void;
+    status(): void;
+    snapshot(options?: number | { tid?: number; context?: boolean; stopTimeoutMs?: number }): void;
+    backtrace(tid?: number): void;
+    backtraceAll(): void;
+    locals(): void;
+    args(): void;
+    frame(): void;
+    registers(): void;
+    address(at: bigint | string): void;
+    memory(at: bigint | string, length: number): void;
+    disassemble(at: bigint | string, options?: { count?: number }): void;
+    modules(): void;
+    symbols(options?: { pattern?: RegExp; limit?: number; functionsOnly?: boolean }): Promise<void>;
+    diff(before: unknown, after: unknown): void;
+    gdb(command: string): Promise<void>;
+}
+
+export interface ValueFormatOptions {
+    indent?: number;
+    maxDepth?: number;
+    maxElements?: number;
+    maxStringLength?: number;
+}
+
+export type PlainValue = number | bigint | boolean | string | null | PlainValue[] | { [key: string]: PlainValue };
 
 // ============================================================================
 // 核心类型：TypeSystem（声明式 C/内存类型系统）
@@ -889,6 +939,9 @@ export declare namespace Value {
         /** 当前 Value 绑定的线程；不修改共享 Type。 */
         $tid: number | undefined;
 
+        $asType<T extends Type.Base<unknown>>(type: T): Infer<T>;
+        $format(options?: ValueFormatOptions): string;
+        $toJS(): PlainValue;
         $toJson(): string;
         $dumpString(): string;
     }
@@ -958,6 +1011,7 @@ export declare function __assign<
 export declare namespace Type {
     export interface Base<V> {
         readonly [valueBrand]: V;
+        withFormatter(formatter: (value: V) => string): this;
         readonly $size: number | undefined;
         readonly $align: number | undefined;
 
@@ -1125,6 +1179,7 @@ export declare const dbg: Debugger;
 export declare const m: TypeSystem;
 export declare const $: GlobalScope;
 export declare const console: Console;
+export declare const fmt: Format;
 
 export declare function setTimeout(cb: () => void, ms?: number): number;
 export declare function clearTimeout(id: number): void;

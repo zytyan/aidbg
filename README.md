@@ -28,18 +28,26 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | --- | --- |
 | `connect` | 连接服务端。填写 `socket` 或 `endpoint`，可传入 `session` 复用会话。 |
 | `docs` | 返回简化的 TypeScript API、可导入模块和脚本执行规则。可在连接前调用。 |
-| `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标在 exec 后暂停。 |
-| `attach` | `pid` 是进程 ID。附加后线程暂停。 |
+| `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标默认继续运行，`pause: true` 在 exec 后暂停。结果包含当前目标状态。 |
+| `attach` | `pid` 是进程 ID。线程默认继续运行，`pause: true` 保持暂停。结果包含当前目标状态。 |
 | `core_open` | `path` 是服务端上的 ELF core 或 zstd 压缩的 core，可指定 `executable` 和 `debug_symbols`。 |
-| `script_run` | `src` 是 TypeScript 模块源码。可通过 `run: {path, arg}` 先启动目标，通过 `wait_ms` 等待完成并收集输出。仅提交源码时默认立即返回，组合启动时默认等 5 秒。 |
+| `script_run` | `src` 是 TypeScript 模块源码。可通过 `run: {path, arg, pause}` 先启动目标，通过 `wait_ms` 等待完成并收集输出。仅提交源码时默认立即返回，组合启动时默认等 5 秒。 |
 | `script_wait` | 按 `script_id` 等待已提交的脚本，默认等 5 秒。返回 `wait_timeout` 时脚本继续运行。 |
-| `snapshot` | 可传入 `tid` 获取指定线程的快照。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
+| `status` | 查看会话、目标、线程、暂停原因、断点、信号回调和正在运行的脚本。查询保留目标状态和待收集的输出。 |
+| `gdb` | 执行支持的 GDB 指令。传入 `command`，例如 `bt`、`info locals` 或 `disassemble main`。 |
+| `snapshot` | 可传入 `tid` 获取指定线程的快照。默认暂停预算为 1 秒，超时可返回部分结果，`stop_timeout_ms: 0` 仅采集已暂停线程。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
 | `send_input` | 向正在通过 `ask()` 等待回复的 `handler` 传入字符串 `data`。 |
 | `interrupt_input` | 向指定 `handler` 抛出异常，可传入消息 `msg`。 |
 | `perf` | 传入 `pid`，选择 `hotspot` 或 `stack`。可选 `tid`、`duration_ms`、`frequency_hz`。 |
 | `ps` | 返回结构化 JSON，默认省略命令行参数并隐藏内核线程。支持 `threads`、`pattern`、`fields`、`limit`、`offset`。 |
 | `syscall_table` | 列出服务端原生架构的 Linux syscall ID、名称和六个顺序固定的参数槽。可按 `id` 或 `name` 筛选。 |
 | `set_fork_policy` | 传入 `mode: "parent"` 或 `mode: "child"`，设置普通 fork 后跟踪哪一侧。 |
+
+脚本可用 `fmt.status()`、`fmt.snapshot()`、`fmt.frame()`、`fmt.registers()`、`fmt.address(addr)` 和 `fmt.disassemble(addr)` 直接输出调试信息。需要继续处理数据时，使用 `dbg.snapshot()`、`dbg.symbolAt(addr)`、`dbg.disassemble(addr, count)` 和 `value.$toJS()`。`fmt.printf`、`fmt.sprintf`、`fmt.hexdump`、`fmt.bytesFromHex` 接管原调试输出辅助方法。
+
+`value.$format()` 和模板插值使用有界输出。`Type.withFormatter()` 返回带自定义格式化函数的新类型。`$asType(type)` 创建同地址视图。`$toJS()` 保留已知视图的循环关系，把空指针转换为 `null`，将无效 UTF-8 字节替换为 U+FFFD。读取失败、缺少终止符或超出转换预算会抛出错误。`fmt.diff(before, after)` 可比较包含循环引用的普通数据。
+
+GDB 兼容指令与脚本共享目标和断点。支持 `bt`、`thread apply all bt`、`thread TID`、`frame`、`up`、`down`、常用 `info` 查询、`b`、`delete`、`disable`、`enable`、`c`、`si`、`ni`、`finish` 和 `disassemble`。`p` 和 `ptype` 接受当前帧的变量名。`x` 支持默认的十六进制字和显式 `x/16xb`。源代码重映射可通过 `set substitute-path FROM TO` 或 `dbg.substitutePath(from, to)` 注册。`list` 读取重映射后的路径。
 
 工具响应里的 `paused_stops` 提供线程暂停原因。`waiting_inputs` 和 `running_scripts` 报告脚本状态。异步断点回调可以等待输入。脚本输出缓存在服务端，随工具响应返回。`run` 启动的进程会在 `process_output` 中附带新增 stdout 和 stderr。脚本也可用 `await dbg.waitOutput(pid, timeoutMs)` 从独立游标主动读取，结果包含退出状态或超时信息。目标切换通过 `released` 报告被释放的 PID，旧目标的输出仍可按 PID 读取。live 和 core 共用 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。
 

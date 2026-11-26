@@ -196,3 +196,106 @@ fn benchmark_native_value() {
         println!("time {label}: {time:.0} ns/op");
     }
 }
+
+#[test]
+fn conversion_batches_reads_and_preserves_cycles() {
+    use std::rc::Rc;
+
+    let runtime = Runtime::new().unwrap();
+    let context = Context::full(&runtime).unwrap();
+    let reads = Rc::new(Cell::new((0usize, 0usize)));
+    context.with(|ctx| {
+        let api: Object = ctx.eval(include_str!("../runtime.js")).catch(&ctx).unwrap();
+        install(&ctx, &api).unwrap();
+        let mut memory = vec![0u8; 256 * 1024];
+        memory[..8].copy_from_slice(&0x1000u64.to_le_bytes());
+        memory[8..12].copy_from_slice(&7u32.to_le_bytes());
+        memory[0x2fff0..0x2fff8].copy_from_slice(&0x31000u64.to_le_bytes());
+        memory[0x30000..0x38000].fill(b'a');
+        let counter = reads.clone();
+        let operation = Function::new(ctx.clone(), move |op: String, args: String| {
+            assert!(matches!(op.as_str(), "read" | "readPrefix"));
+            let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+            let offset = u64::from_str_radix(&args["address"].as_str().unwrap()[2..], 16)
+                .unwrap() as usize - 0x1000;
+            let length = args["length"].as_u64().unwrap() as usize;
+            let (calls, bytes) = counter.get();
+            counter.set((calls + 1, bytes + length));
+            serde_json::to_string(&memory[offset..offset + length]).unwrap()
+        }).unwrap();
+        let generation = Function::new(ctx.clone(), || 1).unwrap();
+        api.get::<_, Function>("initialize").unwrap()
+            .call::<_, ()>((operation, crate::regs::ARCH, generation)).unwrap();
+
+        eval(&ctx,r#"
+            globalThis.large = m.array(m.u32(), 32768).at(0x1000n);
+            globalThis.records = m.array(m.struct({a:m.u32(), b:m.u32()}), 16384).at(0x1000n);
+            globalThis.pointers = m.array(m.pointer(m.void()), 16384).at(0x1000n);
+            globalThis.text = m.cStr(65536).at(0x30ff0n);
+            globalThis.formatted = Array.from({length:512},(_,i) => m.u32()
+                .withFormatter(value => "value=" + value.$read()).value(i));
+            const node = m.struct({next:m.pointer(m.self(),1), value:m.u32()}).at(0x1000n);
+            const data = node.$toJS();
+            if (data.next[0] !== data || data.value !== 7) throw Error("cycle did not preserve identity");
+            const fmt = m.u32().withFormatter(value => "[" + value.$format() + "]");
+            if (String(fmt.value(1)) !== "[1]" || fmt.value(1).$toJS() !== 1) throw Error("format recursion");
+            try { Number(fmt.value(1)); throw Error("implicit numeric conversion"); }
+            catch (err) { if (!(err instanceof TypeError)) throw err; }
+        "#);
+    });
+    for (name, source, expected) in [
+        (
+            "scalar array format",
+            "if (!large.$format({maxElements:4}).includes('32764 more')) throw Error('crop');",
+            (1, 16),
+        ),
+        (
+            "scalar array conversion",
+            "if (large.$toJS().length !== 32768) throw Error('array');",
+            (8, 131072),
+        ),
+        (
+            "record array conversion",
+            "if (records.$toJS()[1].a !== 7) throw Error('record');",
+            (8, 131072),
+        ),
+        (
+            "pointer array conversion",
+            "if (pointers.$toJS()[0] !== 0x1000n || pointers.$toJS()[2] !== null) throw Error('pointer');",
+            (16, 262144),
+        ),
+        (
+            "string conversion",
+            "if (text.$toJS().length !== 32768) throw Error('string');",
+            (10, 36872),
+        ),
+        (
+            "repeated formatting and conversion",
+            "for (let i=0; i<3; i++) { large.$format({maxElements:4}); large.$toJS(); }",
+            (27, 393264),
+        ),
+        (
+            "custom formatters",
+            "for (const value of formatted) if (!value.$format().startsWith('value=')) throw Error('formatter');",
+            (0, 0),
+        ),
+    ] {
+        reads.set((0, 0));
+        super::VALUE_ALLOCATIONS.with(|count| count.set(0));
+        runtime.run_gc();
+        let before = runtime.memory_usage().malloc_size;
+        let start = Instant::now();
+        context.with(|ctx| eval(&ctx, source));
+        let elapsed = start.elapsed();
+        let after = runtime.memory_usage().malloc_size;
+        let values = super::VALUE_ALLOCATIONS.with(Cell::get);
+        assert_eq!(reads.get(), expected, "{name}");
+        assert_eq!(values, 0, "{name}");
+        println!(
+            "{name}: {elapsed:?}, QuickJS allocation delta={} B, reads={}, bytes={}, temporary Values={values}",
+            after as i64 - before as i64,
+            expected.0,
+            expected.1
+        );
+    }
+}

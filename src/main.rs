@@ -59,11 +59,22 @@ struct RunArgs {
     path: String,
     #[serde(default)]
     arg: Vec<String>,
+    /// Keep the target paused after launch.
+    #[serde(default)]
+    pause: bool,
 }
 #[derive(Deserialize, JsonSchema)]
 struct AttachArgs {
     pid: i32,
+    /// Keep the target paused after attach.
+    #[serde(default)]
+    pause: bool,
 }
+#[derive(Deserialize, JsonSchema)]
+struct GdbArgs {
+    command: String,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct ScriptArgs {
     src: String,
@@ -97,6 +108,8 @@ struct InterruptArgs {
 #[derive(Deserialize, JsonSchema)]
 struct SnapshotArgs {
     tid: Option<i32>,
+    /// Pause budget in milliseconds, 0 through 1000. Zero samples existing stops.
+    stop_timeout_ms: Option<u32>,
     #[serde(default)]
     context: bool,
 }
@@ -409,7 +422,7 @@ impl Connection {
     }
 
     #[tool(
-        description = "Launch a program under the debugger and stop at exec. Use a shell tool for shell commands."
+        description = "Launch a program under the debugger. Set pause to true to stop at exec. Use a shell tool for shell commands."
     )]
     async fn run(&self, Parameters(args): Parameters<RunArgs>) -> CallToolResult {
         reply(
@@ -418,9 +431,28 @@ impl Connection {
                 .run(self.request(RunProcessRequest {
                     path: args.path,
                     arg: args.arg,
+                    pause: args.pause,
                 }))
                 .await,
         )
+    }
+
+    #[tool(description = "Read the current debugger session and target state without pausing it.")]
+    async fn status(&self) -> CallToolResult {
+        let response = self
+            .client
+            .clone()
+            .status(self.request(HeartbeatRequest {}))
+            .await;
+        let text = response
+            .as_ref()
+            .ok()
+            .and_then(|row| serde_json::from_slice::<String>(&row.get_ref().result_json).ok());
+        let mut result = reply(response);
+        if let Some(text) = text {
+            result.content = vec![rmcp::model::ContentBlock::text(text)];
+        }
+        result
     }
 
     #[tool(
@@ -430,7 +462,29 @@ impl Connection {
         reply(
             self.client
                 .clone()
-                .attach(self.request(AttachRequest { pid: args.pid }))
+                .attach(self.request(AttachRequest {
+                    pid: args.pid,
+                    pause: args.pause,
+                }))
+                .await,
+        )
+    }
+
+    #[tool(description = "Execute a supported GDB command against the current aidbg session.")]
+    async fn gdb(&self, Parameters(args): Parameters<GdbArgs>) -> CallToolResult {
+        if args.command.is_empty() || args.command.len() > 4096 {
+            return CallToolResult::structured_error(
+                json!({"error":"expected a GDB command of 1–4096 bytes"}),
+            );
+        }
+        reply(
+            self.client
+                .clone()
+                .script_run(self.request(RunScriptRequest {
+                    src: format!("await fmt.gdb({});", json!(args.command)),
+                    wait_ms: 5_000,
+                    run: None,
+                }))
                 .await,
         )
     }
@@ -451,6 +505,7 @@ impl Connection {
                         run: args.run.map(|run| RunProcessRequest {
                             path: run.path,
                             arg: run.arg,
+                            pause: run.pause,
                         }),
                     }),
                 )
@@ -522,6 +577,7 @@ impl Connection {
                 .clone()
                 .snapshot(self.request(SessionSnapshotRequest {
                     tid: args.tid,
+                    stop_timeout_ms: args.stop_timeout_ms,
                     context: args.context,
                 }))
                 .await,

@@ -54,12 +54,14 @@ struct Point {
     thread: Option<(i32, u64)>,
     active: bool,
     software_watch: bool,
+    hits: u64,
 }
 
 struct PendingPoint {
     name: String,
     module: Option<String>,
     site: Option<symbols::BreakpointSite>,
+    enabled: bool,
 }
 
 pub(super) struct Live {
@@ -297,12 +299,208 @@ impl Live {
         launched
     }
 
+    fn annotate_imports(
+        &self,
+        targets: &mut BTreeMap<u64, Vec<Value>>,
+        imports: &symbols::RuntimeImports,
+    ) {
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut resolved = BTreeMap::new();
+        for reference in targets.values_mut().flatten() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let Ok(target) = parse_address(&reference["address"]) else {
+                continue;
+            };
+            let slot = match reference["kind"].as_str() {
+                Some("indirect_slot" | "pc_relative" | "read") => target,
+                Some("branch_target") if imports.is_plt(target) => {
+                    let mut code = [0; 24];
+                    let Ok(size) = self.trace.read_code_prefix(target, &mut code) else {
+                        continue;
+                    };
+                    let Ok(stub) =
+                        disassembly::instruction_targets(regs::ARCH, target, &code[..size])
+                    else {
+                        continue;
+                    };
+                    let Some(slot) = stub
+                        .values()
+                        .flatten()
+                        .take(4)
+                        .find(|row| row["kind"] == "indirect_slot")
+                        .and_then(|row| parse_address(&row["address"]).ok())
+                    else {
+                        continue;
+                    };
+                    slot
+                }
+                _ => continue,
+            };
+            let Some(requested) = imports.slots.get(&slot) else {
+                continue;
+            };
+            reference["requested"] = json!(requested);
+            reference["slot"] = json!(hex(slot));
+            if !matches!(
+                reference["kind"].as_str(),
+                Some("indirect_slot" | "branch_target")
+            ) {
+                continue;
+            }
+            let binding = resolved.entry(slot).or_insert_with(|| {
+                let mut bytes = [0; 8];
+                self.trace.read_memory(slot, &mut bytes).ok()?;
+                let observed = u64::from_le_bytes(bytes);
+                let map = modules::mapping_at(&self.root, observed).ok()??;
+                if observed == 0 || imports.is_plt(observed) || !map.executable() {
+                    return None;
+                }
+                let row = symbols::symbol_at(self.pid, observed).ok()??;
+                // Lazy binding stubs and addresses outside a symbol cannot establish
+                // the name of a resolved function.
+                if row["kind"] != "text" || row["match"] != "exact" {
+                    return None;
+                }
+                Some((observed, row["name"].as_str()?.to_owned()))
+            });
+            if let Some((address, name)) = binding {
+                reference["resolvedAddress"] = json!(hex(*address));
+                reference["resolved"] = json!(name);
+            }
+        }
+    }
+
+    pub(super) fn resume_initial(&mut self) -> Result<()> {
+        for tid in self.tids() {
+            if matches!(
+                self.trace.threads[&tid].stop,
+                Some(Stop::Interrupt | Stop::ExecBoundary)
+            ) {
+                self.resume(tid)?;
+                self.paused.remove(&tid);
+            } else {
+                // Let the normal event loop apply the policy for real stops.
+                self.paused.remove(&tid);
+            }
+        }
+        self.trace.poll()?;
+        Ok(())
+    }
+
+    pub(super) fn execution_state(&self) -> &'static str {
+        if self.trace.threads.is_empty() {
+            "exited"
+        } else if self
+            .trace
+            .threads
+            .values()
+            .all(|thread| thread.stop.is_some())
+        {
+            "paused"
+        } else if self
+            .trace
+            .threads
+            .values()
+            .any(|thread| thread.stop.is_some())
+        {
+            "mixed"
+        } else {
+            "running"
+        }
+    }
+
+    pub(super) fn describe_status(&self) -> String {
+        use std::fmt::Write;
+        let mut text = String::new();
+        let executable = fs::read_link(self.root.join("exe")).ok();
+        match executable {
+            Some(path) => writeln!(text, "Target: {} (PID {})", path.display(), self.pid),
+            None => writeln!(text, "Target: PID {}", self.pid),
+        }
+        .unwrap();
+        let stopped = self
+            .trace
+            .threads
+            .values()
+            .filter(|thread| thread.stop.is_some())
+            .count();
+        writeln!(
+            text,
+            "State: {}\nAttached: {}",
+            self.execution_state(),
+            !self.trace.threads.is_empty()
+        )
+        .unwrap();
+        if !self.trace.threads.is_empty() {
+            writeln!(
+                text,
+                "Threads: {} ({stopped} stopped)",
+                self.trace.threads.len()
+            )
+            .unwrap();
+        }
+        for row in self.paused_stops() {
+            if self
+                .trace
+                .threads
+                .contains_key(&(row["tid"].as_i64().unwrap() as i32))
+            {
+                let reason = row["signalName"]
+                    .as_str()
+                    .or_else(|| row["reason"].as_str())
+                    .unwrap();
+                writeln!(text, "  Thread {}: {reason}", row["tid"]).unwrap();
+            }
+        }
+        for (label, watches) in [("Breakpoints", false), ("Watchpoints", true)] {
+            let mut heading = false;
+            for (&id, point) in &self.points {
+                if matches!(point.kind, Kind::Watch { .. }) != watches {
+                    continue;
+                }
+                if !heading {
+                    writeln!(text, "{label}:").unwrap();
+                    heading = true;
+                }
+                let state = if point.active { "enabled" } else { "disabled" };
+                let name = self
+                    .pending_points
+                    .get(&id)
+                    .map(|pending| pending.name.as_str());
+                writeln!(
+                    text,
+                    "  #{id} {state} {}{:#x} hits={} ({})",
+                    name.map(|name| format!("{name} at ")).unwrap_or_default(),
+                    point.address,
+                    point.hits,
+                    point.kind.name()
+                )
+                .unwrap();
+            }
+        }
+        for (&id, point) in &self.pending_points {
+            if !self.points.contains_key(&id) {
+                let state = if point.enabled { "pending" } else { "disabled" };
+                writeln!(text, "Breakpoint #{id}: {state} {}", point.name).unwrap();
+            }
+        }
+        text
+    }
+
     pub fn verify(&self) -> Result<()> {
         if self.trace.threads.is_empty() || procfs::start_ticks(&self.root).ok() != Some(self.start)
         {
             return Err(error("target process no longer exists"));
         }
         Ok(())
+    }
+
+    pub(super) fn record_point_hits(&mut self, id: u32, hits: u64) {
+        if let Some(point) = self.points.get_mut(&id) {
+            point.hits = hits;
+        }
     }
 
     pub(super) fn paused_stops(&self) -> Vec<Value> {
@@ -388,6 +586,11 @@ impl Live {
             .filter_map(|(&tid, thread)| thread.stop.map(|_| tid))
             .collect();
         let result = self.trace.freeze(deadline).and_then(|()| action(self));
+        let cleanup = self.restore_temporary_stops(&previous);
+        result.and_then(|value| cleanup.map(|()| value))
+    }
+
+    fn restore_temporary_stops(&mut self, previous: &BTreeSet<i32>) -> Result<()> {
         let mut cleanup = Ok(());
         for tid in self.tids() {
             if !previous.contains(&tid)
@@ -400,7 +603,7 @@ impl Live {
                 cleanup = Err(err);
             }
         }
-        result.and_then(|value| cleanup.map(|()| value))
+        cleanup
     }
 
     pub(super) fn tids(&self) -> Vec<i32> {
@@ -419,16 +622,65 @@ impl Live {
         tid.map_or_else(|| self.tids(), |tid| vec![tid])
     }
 
-    fn snapshot(&mut self, tid: Option<i32>, context: bool) -> Result<Value> {
+    fn snapshot(
+        &mut self,
+        tid: Option<i32>,
+        context: bool,
+        stop_timeout_ms: u32,
+        limit: usize,
+    ) -> Result<Value> {
+        self.verify()?;
+        if let Some(tid) = tid {
+            self.identity(tid)?;
+        }
+        let previous: BTreeSet<_> = self
+            .trace
+            .threads
+            .iter()
+            .filter_map(|(&tid, thread)| thread.stop.map(|_| tid))
+            .collect();
+        let mut threads_requested: BTreeSet<_> = match tid {
+            Some(tid) => BTreeSet::from([tid]),
+            None => procfs::task_ids(&self.root)
+                .unwrap_or_else(|_| self.tids())
+                .into_iter()
+                .collect(),
+        };
+        let stop_deadline = Instant::now() + Duration::from_millis(stop_timeout_ms.into());
+        let stop = if stop_timeout_ms == 0 {
+            if threads_requested.is_subset(&previous) {
+                Ok(())
+            } else {
+                Err(error("snapshot stop budget is zero"))
+            }
+        } else {
+            match tid {
+                Some(tid) => self.trace.stop_thread(tid, stop_deadline),
+                None => self.trace.freeze(stop_deadline),
+            }
+        };
+        if tid.is_none() {
+            threads_requested.extend(self.tids());
+        }
         let deadline = Instant::now() + DEADLINE;
-        let mut stage = "stop";
         let collect = |live: &mut Self| -> Result<_> {
-            stage = "rewind";
             live.trace.rewind_software_stops()?;
             let mut threads = Vec::new();
             let mut incomplete = Vec::new();
-            stage = "threads";
-            for tid in live.original_tids(tid) {
+            if let Err(err) = &stop {
+                incomplete.push(json!({"stage":"stop","error":err.to_string()}));
+            }
+            for &tid in &threads_requested {
+                if live
+                    .trace
+                    .threads
+                    .get(&tid)
+                    .is_none_or(|thread| thread.stop.is_none())
+                {
+                    incomplete
+                        .push(json!({"tid":tid,"stage":"stop","error":"thread did not stop"}));
+                    continue;
+                }
                 if Instant::now() >= deadline {
                     incomplete.push(
                         json!({"tid":tid,"stage":"threads","error":"snapshot deadline reached"}),
@@ -437,7 +689,7 @@ impl Live {
                 }
                 let thread = (|| -> Result<Value> {
                     let registers = regs::api_read(tid, false)?;
-                    let frames = live.frames_until(tid, 64, deadline)?;
+                    let frames = live.frames_until(tid, limit, deadline)?;
                     let locals = frames.first().map(flatten_frame_values).unwrap_or_default();
                     Ok(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}))
                 })();
@@ -464,22 +716,19 @@ impl Live {
                 incomplete.push(json!({"stage":"mappings","error":"snapshot deadline reached"}));
                 json!([])
             };
-            let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":mappings,
-                "consistency":if tid.is_some() { "thread" } else { "all-stopped" }});
+            let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":mappings, "threadCount":threads_requested.len(),
+                "consistency":if stop.is_err() { "partial" } else if tid.is_some() { "thread" } else { "all-stopped" }});
             if context && Instant::now() < deadline {
                 snapshot["context"] = live.process_context();
             }
             if !incomplete.is_empty() {
                 snapshot["incomplete"] = json!(incomplete);
             }
-            stage = "restore";
             Ok(snapshot)
         };
-        match tid {
-            Some(tid) => self.with_stopped_until(tid, deadline, collect),
-            None => self.with_frozen_until(deadline, collect),
-        }
-        .map_err(|err| error(format!("snapshot {stage}: {err}")))
+        let result = collect(self);
+        let cleanup = self.restore_temporary_stops(&previous);
+        result.and_then(|snapshot| cleanup.map(|()| snapshot))
     }
 
     fn process_context(&self) -> Value {
@@ -523,6 +772,96 @@ impl Live {
         Ok(json!(modules::map_entries(&self.root)?.into_iter().map(|(backing, map)|
             json!({"start":hex(map.start), "end":hex(map.end), "offset":hex(map.offset),
                 "prot":map.perms, "name":String::from_utf8_lossy(&backing.path)})).collect::<Vec<_>>()))
+    }
+
+    pub(super) fn stop_summary(&self, tid: i32, event: &Value) -> Option<String> {
+        use std::fmt::Write;
+        let kind = event["kind"].as_str()?;
+        if !matches!(kind, "breakpoint" | "watchpoint" | "signal") {
+            return None;
+        }
+        let mut text = format!("Stopped: {}", event["signalName"].as_str().unwrap_or(kind));
+        if event["signalName"] == "SIGSEGV"
+            && let Ok(info) = ptrace::getsiginfo(Pid::from_raw(tid))
+            && let Some(code) = match info.si_code {
+                1 => Some("SEGV_MAPERR"),
+                2 => Some("SEGV_ACCERR"),
+                _ => None,
+            }
+        {
+            write!(text, " ({code})").unwrap();
+        }
+        if let Some(id) = event["breakpointId"].as_u64() {
+            write!(text, " #{id}").unwrap();
+        }
+        if let Some(count) = event["hitCount"].as_u64() {
+            write!(text, " (hit {count})").unwrap();
+        }
+        let name = fs::read_to_string(procfs::task_path(&self.root, tid).join("comm")).ok();
+        write!(text, "\nThread: {tid}").unwrap();
+        if let Some(name) = name {
+            write!(text, " {:?}", name.trim_end()).unwrap();
+        }
+        for (label, field) in [
+            ("Fault address", "faultAddress"),
+            ("Address", "address"),
+            ("Old value", "before"),
+            ("New value", "after"),
+        ] {
+            if let Some(value) = event[field].as_str() {
+                write!(text, "\n{label}: {value}").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(40);
+        let limit = if kind == "signal" { 3 } else { 1 };
+        if let Ok(rows) = self.frames_until(tid, limit, deadline) {
+            for (index, row) in rows.iter().enumerate() {
+                let pc = row["pc"].as_str().unwrap_or_default();
+                write!(text, "\n#{index} {pc}").unwrap();
+                if let Some(name) = row["symbol"].as_str() {
+                    write!(text, " <{name}>").unwrap();
+                }
+                if let Some((file, line)) = row["file"].as_str().zip(row["line"].as_u64()) {
+                    write!(text, " {file}:{line}").unwrap();
+                }
+                if index == 0
+                    && kind == "breakpoint"
+                    && let Some(values) = row["parameters"].as_object()
+                {
+                    for (name, value) in values.iter().take(8) {
+                        if !value["value"].is_null() {
+                            let value = value["value"]
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value["value"].to_string());
+                            write!(
+                                text,
+                                "\n  {name}: {}",
+                                value.chars().take(128).collect::<String>()
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        if kind == "signal"
+            && Instant::now() < deadline
+            && let Ok(regs) = regs::read(tid)
+            && let Ok(pc) = regs.stack.get(regs::PC)
+            && let Ok(insn) = super::instruction::decode(&self.trace, pc, &regs)
+        {
+            write!(text, "\n=> {} {}", insn.mnemonic, insn.operands).unwrap();
+            let registers = insn.registers.into_iter().collect::<BTreeSet<_>>();
+            for (name, value) in registers
+                .iter()
+                .filter_map(|name| Some((name, regs.general.get(name)?)))
+                .take(6)
+            {
+                write!(text, "\n   {name} = {value}").unwrap();
+            }
+        }
+        Some(text)
     }
 
     fn frames(&self, tid: i32, limit: usize) -> Result<Vec<Value>> {
@@ -580,7 +919,8 @@ impl Live {
                     "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
                     "file":file,"line":line,"unwindMethod":frame["method"],
                     "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames,
-                    "locals":values["locals"],"parameters":values["parameters"]}))
+                    "locals":values["locals"],"parameters":values["parameters"],
+                    "unavailableLocals":values["unavailableLocals"],"unavailableParameters":values["unavailableParameters"]}))
             })
             .collect()
     }
@@ -640,7 +980,7 @@ impl Live {
         Ok(serde_json::to_value(report)?)
     }
 
-    fn pause(&mut self, tid: Option<i32>) -> Result<Vec<i32>> {
+    pub(super) fn pause(&mut self, tid: Option<i32>) -> Result<Vec<i32>> {
         self.verify()?;
         match tid {
             Some(tid) => self.trace.stop_thread(tid, Instant::now() + DEADLINE)?,
@@ -844,6 +1184,9 @@ impl Live {
     fn refresh_pending_points(&mut self) -> Result<()> {
         for id in self.pending_points.keys().copied().collect::<Vec<_>>() {
             let pending = &self.pending_points[&id];
+            if !pending.enabled {
+                continue;
+            }
             if let Some(site) = &pending.site {
                 if site.still_mapped(&self.root)? {
                     continue;
@@ -958,6 +1301,7 @@ impl Live {
             thread,
             active: true,
             software_watch,
+            hits: 0,
         };
         self.update_point(id, Some(point))?;
         if let Kind::Watch { length, .. } = kind
@@ -1552,9 +1896,20 @@ impl Target {
         }
     }
 
-    pub fn snapshot(&mut self, tid: Option<i32>, context: bool) -> Result<Value> {
+    pub fn snapshot(
+        &mut self,
+        tid: Option<i32>,
+        context: bool,
+        stop_timeout_ms: u32,
+        limit: usize,
+    ) -> Result<Value> {
+        if stop_timeout_ms > 1000 || !(1..=64).contains(&limit) {
+            return Err(error(
+                "snapshot requires a stop budget of 0..=1000 ms and a frame limit of 1..=64",
+            ));
+        }
         match self {
-            Self::Live(live) => live.snapshot(tid, context),
+            Self::Live(live) => live.snapshot(tid, context, stop_timeout_ms, limit),
             Self::Core(core) => {
                 let tids: Vec<_> = match tid {
                     Some(tid) => vec![tid],
@@ -1565,12 +1920,13 @@ impl Target {
                 };
                 let mut threads = Vec::new();
                 for tid in tids {
-                    let frames = core.session_frames(tid, 64)?;
+                    let frames = core.session_frames(tid, limit)?;
                     let locals = flatten_frame_values(&frames[0]);
                     threads.push(json!({"tid":tid,"registers":core.session_registers(tid,false)?,"frames":frames,"locals":locals}));
                 }
                 Ok(json!({"timestamp":procfs::epoch_ms(), "threads":threads,
-                    "mappings":core.session_mappings(), "consistency":"all-stopped"}))
+                    "mappings":core.session_mappings(), "threadCount":threads.len(),
+                    "consistency":if tid.is_some() { "thread" } else { "all-stopped" }}))
             }
         }
     }
@@ -1700,6 +2056,9 @@ impl Target {
                     ..Default::default()
                 })?;
                 let window = serde_json::to_value(result)?;
+                let (_, width) = disassembly::decoder(regs::ARCH)?;
+                let code = self.read_prefix(address, width as usize * count)?;
+                let targets = disassembly::instruction_targets(regs::ARCH, address, &code)?;
                 return Ok(json!(
                     window["instructions"]
                         .as_array()
@@ -1708,7 +2067,9 @@ impl Target {
                         .map(
                             |insn| json!({"address":insn["address"], "bytes":insn["bytes"],
                         "mnemonic":insn["mnemonic"].as_str().unwrap_or_default(),
-                        "opStr":insn["operands"].as_str().unwrap_or_default()})
+                        "opStr":insn["operands"].as_str().unwrap_or_default(),
+                        "references":parse_address(&insn["address"]).ok()
+                            .and_then(|address| targets.get(&address)).map_or(&[][..],Vec::as_slice)})
                         )
                         .collect::<Vec<_>>()
                 ));
@@ -1719,6 +2080,13 @@ impl Target {
         let mut bytes = vec![0; width as usize * count];
         let got = live.trace.read_code_prefix(address, &mut bytes)?;
         bytes.truncate(got);
+        let mut targets = disassembly::instruction_targets(regs::ARCH, address, &bytes)?;
+        if !targets.is_empty()
+            && let Some(imports) = symbols::runtime_imports(live.pid, address)
+            && !imports.slots.is_empty()
+        {
+            live.annotate_imports(&mut targets, &imports);
+        }
         let instructions = decoder
             .disasm_count(&bytes, address, count)
             .map_err(|e| error(e.to_string()))?;
@@ -1727,7 +2095,8 @@ impl Target {
                 .iter()
                 .map(
                     |insn| json!({"address":hex(insn.address()),"bytes":insn.bytes(),
-            "mnemonic":insn.mnemonic().unwrap_or(""),"opStr":insn.op_str().unwrap_or("")})
+            "mnemonic":insn.mnemonic().unwrap_or(""),"opStr":insn.op_str().unwrap_or(""),
+            "references": targets.get(&insn.address()).map_or(&[][..], Vec::as_slice)})
                 )
                 .collect::<Vec<_>>()
         ))
@@ -1805,9 +2174,38 @@ impl Target {
                 Self::Live(live) => live.mappings(),
                 Self::Core(core) => Ok(core.session_mappings()),
             },
+            "dataAt" => {
+                let address = parse_address(&args["address"])?;
+                let Self::Live(live) = self else {
+                    return Ok(Value::Null);
+                };
+                live.verify()?;
+                let Some(hit) = symbols::symbol_at(live.pid, address)? else {
+                    return Ok(Value::Null);
+                };
+                Ok(json!(symbols::inspect::live_data_at(
+                    &live.root,
+                    &live.trace,
+                    address,
+                    &hit,
+                    Instant::now() + Duration::from_millis(200),
+                )))
+            }
+            "symbolAt" => {
+                let address = parse_address(&args["address"])?;
+                match self {
+                    Self::Live(live) => {
+                        live.verify()?;
+                        Ok(json!(symbols::symbol_at(live.pid, address)?))
+                    }
+                    Self::Core(core) => Ok(json!(core.symbol_at(address))),
+                }
+            }
             "snapshot" => self.snapshot(
                 args["tid"].as_i64().map(i32::try_from).transpose()?,
                 args["context"] == true,
+                u32::try_from(args["stopTimeoutMs"].as_u64().unwrap_or(1000))?,
+                usize::try_from(args["frameLimit"].as_u64().unwrap_or(64))?,
             ),
             "read" => Ok(json!(self.read(
                 parse_address(&args["address"])?,
@@ -2162,12 +2560,23 @@ impl Target {
             "point" => {
                 let live = self.live()?;
                 let id = number(&args, "id")? as u32;
-                let pending = live.pending_points.contains_key(&id);
-                if pending {
-                    if live.points.contains_key(&id) {
+                let remove = args["remove"] == true;
+                let enable = args["enable"] == true;
+                if live.pending_points.contains_key(&id) {
+                    if !enable && live.points.contains_key(&id) {
                         live.update_point(id, None)?;
                     }
-                    live.pending_points.remove(&id);
+                    if remove {
+                        live.pending_points.remove(&id);
+                    } else {
+                        let pending = live.pending_points.get_mut(&id).unwrap();
+                        pending.enabled = enable;
+                        if !enable {
+                            pending.site = None;
+                        } else {
+                            live.refresh_pending_points()?;
+                        }
+                    }
                     return Ok(Value::Null);
                 }
                 let existing = live
@@ -2175,10 +2584,23 @@ impl Target {
                     .get(&id)
                     .copied()
                     .ok_or_else(|| error("breakpoint no longer exists"))?;
+                if enable
+                    && !existing.active
+                    && existing.kind == Kind::Software
+                    && live.points.values().any(|point| {
+                        point.active
+                            && point.address == existing.address
+                            && point.kind == Kind::Software
+                    })
+                {
+                    return Err(error(
+                        "a software breakpoint is already installed at this address",
+                    ));
+                }
                 live.update_point(
                     id,
-                    (args["remove"] != true).then_some(Point {
-                        active: false,
+                    (!remove).then_some(Point {
+                        active: enable,
                         ..existing
                     }),
                 )?;
@@ -2198,6 +2620,7 @@ impl Target {
                         name: name.to_owned(),
                         module,
                         site: None,
+                        enabled: true,
                     },
                 );
                 if let Err(issue) = live
@@ -2633,16 +3056,22 @@ impl Live {
         if !(1..=10_000).contains(&count) {
             return Err(error("step count must be in 1..=10000"));
         }
-        let until = (mode == "until")
+        let until = matches!(mode, "until" | "untilFrame")
             .then(|| parse_address(&args["at"]))
+            .transpose()?;
+        let caller_sp = (mode == "untilFrame")
+            .then(|| parse_address(&args["sp"]))
             .transpose()?;
         let (decoder, width) = disassembly::decoder(regs::ARCH)?;
         self.with_frozen(|live| {
             let mut remaining = count;
             let mut return_address = None;
             loop {
-                let pc = regs::read(tid)?.stack.get(regs::PC)?;
-                if until == Some(pc) {
+                let state = regs::read(tid)?.stack;
+                let pc = state.get(regs::PC)?;
+                if until == Some(pc)
+                    && caller_sp.is_none_or(|sp| state.get(regs::SP).ok() == Some(sp))
+                {
                     return Ok(());
                 }
                 let mut bytes = vec![0; width as usize];
