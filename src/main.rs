@@ -73,6 +73,12 @@ struct AttachArgs {
     pause: bool,
 }
 #[derive(Deserialize, JsonSchema)]
+struct DocsArgs {
+    /// Omit for Quick Start. Sections: debugger, types, value, format, events, breakpoints, all.
+    section: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct GdbArgs {
     command: String,
 }
@@ -202,7 +208,7 @@ impl rmcp::ServerHandler for Mcp {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(rmcp::model::ServerCapabilities::builder().enable_tools().enable_resources().build())
             .with_server_info(rmcp::model::Implementation::new("aidbg", aidbg::BUILD_VERSION))
-            .with_instructions("Call docs for the script API and connect to select a debugger server. Use run and attach to debug programs, and use a shell tool for shell commands. Use script_run for TypeScript debugging. Only top-level script code runs automatically. Inspect paused_threads, waiting_inputs and running_scripts on every tool response.")
+            .with_instructions("Call docs for the script API and connect to select a debugger server. Use run and attach to debug programs, and use a shell tool for shell commands. Use script_run for TypeScript debugging. Only top-level script code runs automatically. Tool results are plain text by default. Follow any reported script waits or debugger events and use status to inspect the current session.")
     }
 
     fn list_tools(
@@ -227,7 +233,7 @@ impl rmcp::ServerHandler for Mcp {
                         schema.get_mut("properties").unwrap().as_object_mut().unwrap().insert(
                             "output_format".into(),
                             json!({"type":"string","enum":["text","structured"],"default":"text",
-                                "description":"Select structured output explicitly for existing machine clients."}),
+                                "description":"Leave unset for human-readable text. Structured output is for programmatic consumers."}),
                         );
                         tool
                     })
@@ -307,6 +313,9 @@ impl rmcp::ServerHandler for Mcp {
         if let Some(connection) = &mut connection {
             connection.text_output = !structured;
         }
+        if name == "docs" && request.arguments.is_none() {
+            request.arguments = Some(Default::default());
+        }
         let response = if matches!(name.as_ref(), "connect" | "docs") {
             Self::tool_router()
                 .call(ToolCallContext::new(self, request, context))
@@ -349,14 +358,38 @@ impl rmcp::ServerHandler for Mcp {
 
 #[tool_router]
 impl Mcp {
-    #[tool(description = "Show script entry semantics and the full TypeScript declarations for script_run.")]
-    async fn docs(&self) -> CallToolResult {
-        mcp_text::document(json!({
-            "instructions": "script_run executes the module's top-level code. Named exports from successful scripts are available on $ to subsequent scripts in the same session. Switching targets clears these exports. The declarations describe the initial session. Types inferred from target DWARF and prior script exports are added during compilation. Use run and attach for debugging and a shell tool for shell commands. The default fork policy follows the parent.",
-            "declarations": script_types::declarations(),
-            "modules": script_types::NODE_DECLARATIONS,
-            "full_api": API_URI,
-        }))
+    #[tool(
+        description = "Read the aidbg Quick Start, one API section, or the complete script declarations."
+    )]
+    async fn docs(&self, Parameters(args): Parameters<DocsArgs>) -> CallToolResult {
+        match args.section.as_deref() {
+            None => mcp_text::document(json!({
+                "text": format!("{}\n{}", script_types::QUICK_START, script_types::section_index()),
+                "full_api": API_URI,
+            })),
+            Some("all") => {
+                let declarations = script_types::declarations();
+                mcp_text::document(json!({
+                    "text": format!("{declarations}\n\n{}\n\nFull API: {API_URI}", script_types::NODE_DECLARATIONS),
+                    "declarations": declarations,
+                    "modules": script_types::NODE_DECLARATIONS,
+                    "full_api": API_URI,
+                }))
+            }
+            Some(name) => match script_types::section(name) {
+                Some(text) => {
+                    mcp_text::document(json!({"text":text,"section":name,"full_api":API_URI}))
+                }
+                None => {
+                    let name = &name[..name.floor_char_boundary(128.min(name.len()))];
+                    let error = format!("Unknown docs section {name:?}.");
+                    mcp_text::document_error(json!({
+                        "text":format!("{error}\n\n{}", script_types::section_index()),
+                        "error":error,
+                    }))
+                }
+            },
+        }
     }
 
     #[tool(

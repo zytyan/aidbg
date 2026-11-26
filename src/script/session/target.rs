@@ -670,6 +670,7 @@ impl Live {
         context: bool,
         stop_timeout_ms: u32,
         limit: usize,
+        thread_limit: Option<usize>,
     ) -> Result<Value> {
         self.verify()?;
         if let Some(tid) = tid {
@@ -718,7 +719,10 @@ impl Live {
             }
             let registers_phase = crate::snapshot_timing::phase("registers");
             let mut captured = Vec::new();
-            for &tid in &threads_requested {
+            for &tid in threads_requested
+                .iter()
+                .take(thread_limit.unwrap_or(usize::MAX))
+            {
                 if live
                     .trace
                     .threads
@@ -810,6 +814,14 @@ impl Live {
             }
             let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":mappings, "threadCount":threads_requested.len(),
                 "consistency":if stop.is_err() { "partial" } else if tid.is_some() { "thread" } else { "all-stopped" }});
+            if thread_limit.is_some() {
+                snapshot["frameLimit"] = json!(limit);
+            }
+            if let Some(limit) = thread_limit
+                && threads_requested.len() > limit
+            {
+                snapshot["threadsOmitted"] = json!(threads_requested.len() - limit);
+            }
             if context {
                 if Instant::now() < deadline {
                     snapshot["context"] = live.process_context();
@@ -2142,6 +2154,7 @@ impl Target {
         context: bool,
         stop_timeout_ms: u32,
         limit: usize,
+        thread_limit: Option<usize>,
     ) -> Result<Value> {
         if stop_timeout_ms > 1000 || !(1..=64).contains(&limit) {
             return Err(error(
@@ -2149,7 +2162,7 @@ impl Target {
             ));
         }
         match self {
-            Self::Live(live) => live.snapshot(tid, context, stop_timeout_ms, limit),
+            Self::Live(live) => live.snapshot(tid, context, stop_timeout_ms, limit, thread_limit),
             Self::Core(core) => {
                 let tids: Vec<_> = match tid {
                     Some(tid) => vec![tid],
@@ -2159,14 +2172,24 @@ impl Target {
                         .collect(),
                 };
                 let mut threads = Vec::new();
-                for tid in tids {
+                let thread_count = tids.len();
+                for tid in tids.into_iter().take(thread_limit.unwrap_or(usize::MAX)) {
                     let frames = core.session_frames(tid, limit)?;
                     let locals = flatten_frame_values(&frames[0]);
                     threads.push(json!({"tid":tid,"registers":core.session_registers(tid,false)?,"frames":frames,"locals":locals}));
                 }
-                Ok(json!({"timestamp":procfs::epoch_ms(), "threads":threads,
-                    "mappings":core.session_mappings(), "threadCount":threads.len(),
-                    "consistency":if tid.is_some() { "thread" } else { "all-stopped" }}))
+                let mut snapshot = json!({"timestamp":procfs::epoch_ms(), "threads":threads,
+                    "mappings":core.session_mappings(), "threadCount":thread_count,
+                    "consistency":if tid.is_some() { "thread" } else { "all-stopped" }});
+                if thread_limit.is_some() {
+                    snapshot["frameLimit"] = json!(limit);
+                }
+                if let Some(limit) = thread_limit
+                    && thread_count > limit
+                {
+                    snapshot["threadsOmitted"] = json!(thread_count - limit);
+                }
+                Ok(snapshot)
             }
         }
     }
@@ -2446,19 +2469,41 @@ impl Target {
                 args["context"] == true,
                 u32::try_from(args["stopTimeoutMs"].as_u64().unwrap_or(1000))?,
                 usize::try_from(args["frameLimit"].as_u64().unwrap_or(64))?,
+                (args["presentation"] == true).then_some(32),
             ),
-            "read" => Ok(json!(self.read(
-                parse_address(&args["address"])?,
-                number(&args, "length")? as usize
-            )?)),
-            "readPrefix" => {
+            "read" | "readPrefix" => {
                 let length = usize::try_from(number(&args, "length")?)?;
-                if length > MAX_MEMORY {
+                let address = parse_address(&args["address"])?;
+                if length > MAX_MEMORY || address.checked_add(length as u64).is_none() {
                     return Err(error("memory read exceeds the maximum range"));
                 }
-                Ok(json!(
-                    self.read_prefix(parse_address(&args["address"])?, length)?
-                ))
+                let result = if op == "read" {
+                    self.read(address, length)
+                } else {
+                    self.read_prefix(address, length)
+                };
+                match result {
+                    Ok(bytes) => Ok(json!(bytes)),
+                    Err(err) if args["format"] == true => {
+                        if let Self::Live(live) = self {
+                            live.verify()?;
+                        }
+                        let local = err.is::<crate::unwind::MissingMemory>()
+                            || err.downcast_ref::<nix::errno::Errno>().is_some_and(|code| {
+                                matches!(*code, nix::errno::Errno::EFAULT | nix::errno::Errno::EIO)
+                            })
+                            || err
+                                .downcast_ref::<crate::Diagnostic>()
+                                .is_some_and(|diagnostic| diagnostic.code == "CORE_MEMORY_MISSING");
+                        let message = err.to_string();
+                        if local || message.starts_with("short remote read:") {
+                            Ok(json!({"unreadable":message}))
+                        } else {
+                            Err(err)
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
             }
             "xref" => {
                 let address = |key: &str| args.get(key).map(parse_address).transpose();
@@ -2571,16 +2616,17 @@ impl Target {
                                 return Ok(Some(graph));
                             }
                         }
-                        let Ok((dwarf, frame)) =
-                            symbols::inspect::stopped_dwarf(&live.root, &live.trace, registers)
-                        else {
-                            return Ok(None);
-                        };
-                        dwarf.variable_type_graph(name, frame.link, deadline)
-                    })?,
-                    Self::Core(core) => core.session_variable_type(tid, name, deadline)?,
+                        symbols::inspect::variable_type_at_pc(&live.root, pc, name, deadline)
+                    }),
+                    Self::Core(core) => core.session_variable_type(tid, name, deadline),
                 };
-                Ok(json!(graph))
+                match graph {
+                    Ok(graph) => Ok(json!({"graph":graph})),
+                    Err(err) if symbols::inspect::variable_query_limited(err.as_ref()) => {
+                        Ok(json!({"diagnostic": format!("typeOfVar({name}): {err}")}))
+                    }
+                    Err(err) => Err(err),
+                }
             }
             "pause" => Ok(json!(self.live()?.pause(selector()?)?)),
             "continue" => {

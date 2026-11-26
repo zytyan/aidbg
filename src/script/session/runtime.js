@@ -13,12 +13,25 @@
     const stringify = JSON.stringify;
     const parse = JSON.parse;
 
-    const rpc = (name, args = {}) => parse(host(name, stringify(args)));
+    const hostErrors = new WeakSet();
+    const rpc = (name, args = {}) => {
+        try { return parse(host(name, stringify(args))); }
+        catch (error) {
+            if (error instanceof Error) hostErrors.add(error);
+            throw error;
+        }
+    };
+    const maxAddress = 0xffffffffffffffffn;
     const word = value => {
-        if (typeof value !== "bigint" || value < 0n || value > 0xffffffffffffffffn) {
+        if (typeof value !== "bigint" || value < 0n || value > maxAddress) {
             throw new RangeError("expected an unsigned 64-bit bigint");
         }
         return "0x" + value.toString(16);
+    };
+    const symbolLabel = row => {
+        if (!row || row.match === "nearest") return "";
+        const name = row.match === "module" ? row.module.path.split("/").pop() : row.name;
+        return " <" + name + (row.offset ? "+" + word(row.offset) : "") + ">";
     };
     const bits = value => word(BigInt.asUintN(64, BigInt(value)));
     const checkedAddress = at => typeof at === "string" ? at : word(at);
@@ -200,6 +213,22 @@
         });
     }
 
+    function boundedText(text) {
+        const limit = 14 * 1024;
+        if (text.length <= limit / 3) return text;
+        let bytes = 0, end = 0;
+        for (const char of text) {
+            const code = char.codePointAt(0);
+            bytes += code < 128 ? 1 : code < 2048 ? 2 : code < 65536 ? 3 : 4;
+            if (bytes > limit) {
+                const line = text.lastIndexOf("\n", end - 1);
+                return text.slice(0,line > 0 ? line : end) + "\n* Output truncated for display.";
+            }
+            end += char.length;
+        }
+        return text;
+    }
+
     function consoleText(values) {
         // A standalone string is already formatted by the script.
         if (values.length === 1 && typeof values[0] === "string") return values[0];
@@ -267,7 +296,7 @@
             log(...values) {
                 check();
                 if (textOutput) {
-                    rpc("log", {id, value:{kind:"console", text:consoleText(values)}});
+                    rpc("log", {id, value:{kind:"console", text:boundedText(consoleText(values))}});
                 } else {
                     rpc("log", {id, value:{kind:"console", values:parse(jsonText(values))}});
                 }
@@ -282,9 +311,22 @@
     function makeFormat(id, generation) {
         const write = (kind,text) => {
             if (generation !== targetGeneration()) throw new Error("debugger target changed");
-            rpc("log", {id, value:{kind,text}});
+            rpc("log", {id, value:{kind,text:boundedText(text)}});
         };
-        const print = (...items) => write("fmt",items.map(display).join(" "));
+        const print = (...items) => {
+            const parts = [];
+            let size = 0;
+            for (const item of items) {
+                if (size >= 14 * 1024) {
+                    parts.push("\n* Output truncated for display.");
+                    break;
+                }
+                const text = display(item);
+                parts.push(text);
+                size += text.length + 1;
+            }
+            write("fmt",parts.join(" "));
+        };
         const resolveAddress = at => typeof at === "bigint" ? at : /^\d+$/.test(at) ? BigInt(at) :
             BigInt(rpc("address", {at:checkedAddress(at)}));
         const currentTid = () => callbackTid ?? selectedTid ?? dbg.pid;
@@ -295,7 +337,7 @@
             const inline = (row.inlineFrames ?? []).slice(0,8).map(item =>
                 "    [inline] " + item.symbol + (item.callFile ? " at " + item.callFile.split("/").pop() + ":" + item.callLine : ""));
             return [...inline, "#" + i + " " + (row.symbol ?? word(row.pc)) + "(" + args + ")" + source];
-        }).concat(rows.length > 24 ? ["… " + (rows.length - 24) + " more frames"] : []);
+        }).concat(rows.length > 24 ? ["… more frames (capture limit)"] : []);
         const shownVariable = item => item.value == null ? ({
             optimized_out:"<optimized out>", read_failed:"<unreadable>", missing_page:"<unreadable>",
         }[item.availability] ?? "<not available>") : display(item.value);
@@ -312,17 +354,28 @@
         const snapshotText = options => {
             const request = typeof options === "object" ? {...options} : {tid:options};
             request.frameLimit = 25;
-            const row = snapshot(rpc("snapshot", request));
+            request.presentation = true;
+            const raw = rpc("snapshot", request);
+            const row = snapshot(raw);
             const lines = [row.incomplete?.length ? "Snapshot: partial" : "Snapshot",
                 "Captured threads: " + row.threads.length + "/" + (row.threadCount ?? row.threads.length)];
-            for (const thread of row.threads) lines.push("Thread " + thread.tid, ...frames(thread.frames));
+            let size = 0, shown = 0;
+            for (const thread of row.threads) {
+                const group = ["Thread " + thread.tid, ...frames(thread.frames)];
+                size += group.reduce((total,line) => total + line.length + 1,0);
+                if (shown > 0 && size > 9 * 1024) break;
+                lines.push(...group);
+                shown++;
+            }
+            const remaining = row.threads.length - shown + (raw.threadsOmitted ?? 0);
+            if (remaining > 0) lines.push("* Output truncated: " + remaining + " more threads.");
             for (const item of row.incomplete ?? []) {
                 lines.push((item.tid ? "Thread " + item.tid + ": " : "") + item.stage + ": " + item.error);
             }
             print(lines.join("\n"));
         };
         const location = (address, row = dbg.symbolAt(address)) => {
-            return word(address) + (row && row.match !== "nearest" ? " <" + row.name + (row.offset ? "+" + word(row.offset) : "") + ">" : "");
+            return word(address) + symbolLabel(row);
         };
         const fmt = {
             print,
@@ -372,11 +425,15 @@
                     ...(length > count ? ["… " + (length - count) + " more bytes"] : [])].join("\n"));
             },
             disassemble(at, {count = 16} = {}) {
-                print(dbg.disassemble(at, count).map(row => word(row.address) + "  " + row.mnemonic + " " + row.opStr +
+                const instructions = dbg.disassemble(at, count);
+                const start = instructions[0]?.address;
+                const row = start === undefined ? null : dbg.symbolAt(start);
+                const heading = row?.match === "module" ? [location(start,row)] : [];
+                print(heading.concat(instructions.map(row => word(row.address) + "  " + row.mnemonic + " " + row.opStr +
                     (row.references?.length ? "  ; " + row.references.map(ref => ref.requested ?
                         ref.kind + " " + location(ref.address) + " requested: " + ref.requested +
                             (ref.resolved ? ", resolved: " + ref.resolved : "") :
-                        ref.kind + " " + location(ref.address)).join(", ") : "")).join("\n"));
+                        ref.kind + " " + location(ref.address)).join(", ") : ""))).join("\n"));
             },
             modules() {
                 const paths = new Map();
@@ -427,7 +484,7 @@
                     if (sub === "symbol" && rest.length === 1) {
                         const row = dbg.symbolAt(resolveAddress(rest[0]));
                         return print(row?.match === "nearest" ? "Nearest preceding symbol: " + row.name + "+" + word(row.offset) :
-                            row ? location(row.address + row.offset,row) : "No matching symbol");
+                            row ? location(row.match === "module" ? row.address : row.address + row.offset,row) : "No matching symbol");
                     }
                     if (sub === "address" && rest.length === 1) return fmt.address(rest[0]);
                     if (sub === "functions" && rest.length <= 1) {
@@ -579,7 +636,7 @@
     }
 
     function readBytes(address, length) {
-        return Uint8Array.from(rpc("read", {address:word(address), length:integer(length, "invalid read length")}));
+        return Uint8Array.from(presentationRead("read", address, integer(length, "invalid read length")));
     }
     function writeBytes(address, bytes) {
         if (!(bytes instanceof Uint8Array)) throw new TypeError("expected Uint8Array");
@@ -1009,7 +1066,7 @@
         },
         symbolAt(address) {
             const row = rpc("symbolAt", {address:word(address)});
-            return row == null ? null : Object.freeze({...row,address:BigInt(row.address),offset:BigInt(row.offset)});
+            return row == null ? null : Object.freeze({...row,address:BigInt(row.address),offset:row.offset == null ? undefined : BigInt(row.offset)});
         },
         substitutePath(from,to) {
             if (typeof from !== "string" || typeof to !== "string" || !from || !to) {
@@ -1533,9 +1590,10 @@
         members.push(displayName,type,offset);
     }
 
-    function promoteMembers(fields, members, info, offset, duplicatePrefix) {
+    function promoteMembers(fields, members, overlaps, info, offset, duplicatePrefix) {
         for (const name of Object.keys(info.fields)) {
             const index = info.fields[name];
+            if (info.kind === "union" || info.overlaps?.has(name)) overlaps.add(name);
             addMember(fields,members,name,info.members[index + memberType],
                 offset + info.members[index + memberOffset],lookupOnlyMember,duplicatePrefix);
         }
@@ -1547,6 +1605,7 @@
         const entries = Reflect.ownKeys(fields).filter(key => Object.prototype.propertyIsEnumerable.call(fields,key));
         const layout = Object.create(null);
         const members = [];
+        const overlaps = new Set();
         let occupiedBits = 0, natural = 1, tail;
         for (const [index,name] of entries.entries()) {
             const type = fields[name];
@@ -1584,7 +1643,7 @@
             const offset = kind === "struct" ? rounded(Math.ceil(occupiedBits / 8),align) : 0;
             if (anonymous) {
                 if (!info.fields || info.tail !== undefined) throw new TypeError("expected an anonymous fixed aggregate");
-                promoteMembers(layout,members,info,offset);
+                promoteMembers(layout,members,overlaps,info,offset);
             }
             addMember(layout,members,anonymous ? undefined : name,member,offset);
             if (info.size === undefined) {
@@ -1605,7 +1664,7 @@
             Object.hasOwn(layout,name) && members[layout[name] + memberType] === type)
             ? repackFromMembers : Object.fromEntries(originalEntries);
         return descriptor({kind, fields:layout, tail, size, align, explicitAlign,
-            pack:packOption, members, entries:packEntries});
+            pack:packOption, members, overlaps, entries:packEntries});
     }
 
     function refine(type, fields) {
@@ -1681,7 +1740,11 @@
 
     function bound(store) {
         const root = store[valueKeys.root];
-        if (root !== undefined && root !== targetGeneration()) throw new Error("value belongs to a previous target");
+        if (root !== undefined && root !== targetGeneration()) {
+            const error = new Error("value belongs to a previous target");
+            hostErrors.add(error);
+            throw error;
+        }
     }
 
     function dynamicLength(info, store) {
@@ -1769,12 +1832,19 @@
         return address;
     }
 
+    function valueOffset(base, offset) {
+        if (activeFormat && base + BigInt(offset) > maxAddress) {
+            throw new UnreadableValue(base, "address range overflow");
+        }
+        return addr(base,offset);
+    }
+
     function valueField(store, name) {
         const info = store[valueKeys.info];
         bound(store);
         const field = info.fields[name];
         const type = info.members[field + memberType], offset = info.members[field + memberOffset];
-        return makeValue(type,{[valueKeys.address]:addr(store[valueKeys.address],offset), [valueKeys.parent]:store[valueKeys.value],
+        return makeValue(type,{[valueKeys.address]:valueOffset(store[valueKeys.address],offset), [valueKeys.parent]:store[valueKeys.value],
             [valueKeys.inheritTid]:true, [valueKeys.self]:store[valueKeys.type], [valueKeys.root]:store[valueKeys.root]});
     }
 
@@ -1784,12 +1854,17 @@
         index = integer(index,"array index must be a nonnegative safe integer");
         const count = checked ? dynamicLength(info,store) : undefined;
         if (count !== undefined && index >= count) throw new RangeError("index exceeds the length");
-        const element = resolve(info.element,store[valueKeys.self]), size = element.$size;
+        const element = resolve(info.element,store[valueKeys.self]);
         if (checked && info.kind === "array" && count === undefined) throw new TypeError("use $atUnchecked for an unsized array");
-        if (size === undefined && index !== 0) throw new TypeError("element size is unknown");
         const base = info.kind === "ptr" ? readScalar(store) : store[valueKeys.address];
         if (info.kind === "ptr" && base === 0n) throw new RangeError("null pointer");
-        return makeValue(element,{[valueKeys.address]:addr(base,BigInt(index) * BigInt(size ?? 0)), [valueKeys.parent]:store[valueKeys.value],
+        return elementAt(store,element,base,index);
+    }
+
+    function elementAt(store, element, base, index) {
+        const size = element.$size;
+        if (size === undefined && index !== 0) throw new TypeError("element size is unknown");
+        return makeValue(element,{[valueKeys.address]:valueOffset(base,BigInt(index) * BigInt(size ?? 0)), [valueKeys.parent]:store[valueKeys.value],
             [valueKeys.inheritTid]:true, [valueKeys.self]:store[valueKeys.self], [valueKeys.root]:store[valueKeys.root] ?? targetGeneration()});
     }
 
@@ -1834,14 +1909,225 @@
     const missingValueProperty = Symbol();
 
     function valueFormatOptions(options) {
-        const defaults = {indent:2, maxDepth:4, maxElements:32, maxStringLength:256};
+        if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw new TypeError("expected Value format options");
+        }
+        const defaults = {indent:2, maxDepth:4, maxElements:32, maxFields:32, maxStringLength:256, maxNodes:200, deref:2};
         return Object.fromEntries(Object.entries(defaults).map(([key, fallback]) => {
-            const n = integer(options?.[key] ?? fallback, "invalid " + key);
-            if (n > (key === "maxElements" || key === "maxStringLength" ? 4096 : 32)) {
-                throw new RangeError(key + " exceeds the format limit");
-            }
+            const n = integer(options?.[key] === undefined ? fallback : options[key], "invalid " + key);
+            const max = ["maxElements", "maxFields", "maxStringLength", "maxNodes"].includes(key) ? 4096 : 32;
+            if (n > max) throw new RangeError(key + " exceeds the format limit");
             return [key,n];
         }));
+    }
+
+    class UnreadableValue extends Error {
+        constructor(address, reason) {
+            super(reason);
+            this.address = address;
+        }
+    }
+
+    let activeFormat;
+    function presentationRead(operation, address, length) {
+        if (activeFormat && address + BigInt(length) > maxAddress) {
+            throw new UnreadableValue(address, "address range overflow");
+        }
+        const result = rpc(operation, {address:word(address), length, format:activeFormat !== undefined});
+        if (result?.unreadable !== undefined) throw new UnreadableValue(address,result.unreadable);
+        return result;
+    }
+
+    function formatScalar(value, info) {
+        const name = info.enumerators && Object.entries(info.enumerators).find(([, n]) => BigInt(n) === BigInt(value))?.[0];
+        return name ?? (info.kind === "ptr" || info.kind === "fn" ? word(value) : String(value));
+    }
+
+    function formatValue(store, requestedOptions) {
+        let checked;
+        try { checked = valueFormatOptions(requestedOptions); }
+        catch (error) {
+            if (error instanceof Error) hostErrors.add(error);
+            throw error;
+        }
+        if (activeFormat) return activeFormat.nested(store, checked, requestedOptions !== undefined);
+        const path = [];
+        let remaining = checked.maxNodes, exhausted = false;
+        const unreadable = (error, pointer) => {
+            if (!(error instanceof UnreadableValue)) throw error;
+            return "<unreadable: " + error.message.slice(0,120) +
+                (error.address === pointer ? "" : " @ " + word(error.address)) + ">";
+        };
+        const crop = (count, unit) => "… " + count + " more " + unit;
+        const noBudget = () => {
+            if (remaining > 0) return false;
+            exhausted = true;
+            return true;
+        };
+        const onPath = (type,self,base,length) => path.some(view =>
+            view.type === type && view.self === self && view.base === base && view.length === length);
+        const walk = (item, options, depth, hops, inUnion, child = false, sourcePointer = false) => {
+            bound(item);
+            if (noBudget()) return "<max nodes>";
+            remaining--;
+            const type = item[valueKeys.type], info = item[valueKeys.info], {kind} = info;
+            const value = item[valueKeys.value], address = item[valueKeys.address];
+            const self = info.fields ? undefined : item[valueKeys.self];
+            const printer = info.formatter ?? prettyPrinters.get(type);
+            if (printer && !activePrinters.has(type)) {
+                const nested = activeFormat.nested;
+                activeFormat.nested = (target, explicit, override) =>
+                    walk(target, override ? explicit : options, depth + Number(target !== item), hops, inUnion, true);
+                activePrinters.add(type);
+                try {
+                    const result = printer(value);
+                    if (result !== undefined) {
+                        if (typeof result !== "string") throw new TypeError("formatter must return a string");
+                        return result;
+                    }
+                } catch (error) {
+                    if (error instanceof UnreadableValue) return unreadable(error);
+                    if (hostErrors.has(error)) throw error;
+                    return "<formatter error: " + String(error?.message ?? error).slice(0,120) + ">";
+                } finally {
+                    activePrinters.delete(type);
+                    activeFormat.nested = nested;
+                }
+            }
+            if (kind === "scalar" || kind === "bitfield" || kind === "fn") {
+                const scalar = kind === "scalar" ? readScalar(item) : kind === "bitfield" ? readBitfield(item) : valueAddress(item);
+                return formatScalar(info.boolean ? Boolean(scalar) : scalar,info);
+            }
+            const base = kind === "ptr" ? readScalar(item) : address;
+            const element = info.element === undefined ? undefined : resolve(info.element,item[valueKeys.self]);
+            const scalar = element === undefined ? undefined : typeInfo(element);
+            let annotate;
+            if (kind === "ptr") {
+                if (base === 0n) return "NULL";
+                annotate = () => {
+                    const row = rpc("symbolAt", {address:word(base)});
+                    return word(base) + symbolLabel(row && {...row,offset:row.offset == null ? undefined : BigInt(row.offset)});
+                };
+                if (inUnion) return annotate();
+                if (scalar?.char && info.length === undefined) {
+                    if (depth >= options.maxDepth) return annotate() + " <max depth>";
+                    const limit = info.terminated ?? 4096;
+                    const count = Math.min(limit, options.maxStringLength + 1);
+                    const data = presentationRead("readPrefix",base,count);
+                    const end = data.indexOf(0);
+                    const text = JSON.stringify(fromUtf8(data.slice(0,end < 0 ? options.maxStringLength : end)));
+                    if (end >= 0) return text;
+                    if (data.length < count) return text + " <unreadable @ " + word(addr(base,data.length)) + ">";
+                    return text + (count > options.maxStringLength ? " … (truncated)" : " <unterminated string>");
+                }
+            }
+            const length = kind === "opaque" ? info.size :
+                (kind === "array" || kind === "ptr") ? dynamicLength(info,item) : undefined;
+            if (kind === "ptr" && length === undefined && info.terminated === undefined) {
+                const label = annotate();
+                if (hops >= options.deref || !scalar?.size || scalar.kind === "fn") return label;
+                if (onPath(type,self,address,length)) return label + " <cycle>";
+                if (depth >= options.maxDepth) return label + " <max depth>";
+                if (noBudget()) return label + " <max nodes>";
+                path.push({type,self,base:address,length});
+                try {
+                    const target = valueStore(elementAt(item,element,base,0));
+                    const result = walk(target,options,depth + Number(scalar.kind === "ptr"),hops+1,false,true,true);
+                    return label + (result === "<cycle>" ? " " : " -> ") + result;
+                } catch (error) {
+                    return label + " " + unreadable(error,base);
+                } finally {
+                    path.pop();
+                }
+            }
+            if (depth >= options.maxDepth) return (annotate ? annotate() + " " : "") + "<max depth>";
+            if (kind === "array" && length === undefined) throw new TypeError("array length is unknown");
+            if (onPath(type,self,base,length)) {
+                return "<cycle>";
+            }
+            path.push({type,self,base,length});
+            const descend = get => {
+                try { return walk(valueStore(get()), options, depth+1, hops, inUnion || kind === "union", true); }
+                catch (error) { return unreadable(error); }
+            };
+            try {
+                if (info.fields) {
+                    const names = Object.keys(info.fields);
+                    const lines = [];
+                    let firstError, successes = 0;
+                    for (const name of names.slice(0,options.maxFields)) {
+                        if (noBudget()) break;
+                        const overlapping = info.overlaps?.has(name);
+                        const label = name + ": " + (overlapping ? "<union member> " : "");
+                        try {
+                            lines.push(label + walk(valueStore(value[name]), options, depth+1, hops,
+                                inUnion || kind === "union" || overlapping, true));
+                            successes++;
+                        } catch (error) {
+                            lines.push(label + unreadable(error));
+                            firstError ??= error;
+                        }
+                    }
+                    if (firstError && !successes && sourcePointer) throw firstError;
+                    if (lines.length < names.length) lines.push(crop(names.length-lines.length,"fields"));
+                    const indent = " ".repeat(options.indent * (depth+1));
+                    let heading = kind === "union" ? "union" + (info.name ? " " + info.name : "") : info.name ?? kind;
+                    if (!child && address !== undefined && options.deref > 0) heading += " @" + word(address);
+                    return heading + " {" + (lines.length ? "\n" + lines.map(line => indent + line).join("\n") +
+                        "\n" + " ".repeat(options.indent * depth) : "") + "}";
+                }
+                const output = [];
+                const max = Math.min(length ?? info.terminated ?? 0, options.maxElements);
+                const count = Math.min(max,remaining);
+                if (count < max) exhausted = true;
+                if (length !== undefined && scalar?.kind === "scalar" && !scalar.formatter && !prettyPrinters.has(element)) {
+                    try {
+                        for (const n of scalarRange(scalar,base,count)) output.push(formatScalar(scalar.boolean ? Boolean(n) : n,scalar));
+                        remaining -= count;
+                    } catch (error) {
+                        if (!(error instanceof UnreadableValue)) throw error;
+                    }
+                }
+                let terminated = false;
+                for (let i = output.length; i < count && !noBudget(); i++) {
+                    if (kind === "opaque" || length === undefined) {
+                        try {
+                            const at = valueOffset(base,i * (scalar?.size ?? 1));
+                            const bytes = readBytes(at,scalar?.size ?? 1);
+                            if (length === undefined && bytes.every(byte => byte === 0)) {
+                                terminated = true;
+                                break;
+                            }
+                            if (kind === "opaque") {
+                                remaining--;
+                                output.push(String(bytes[0]));
+                                continue;
+                            }
+                        } catch (error) {
+                            remaining--;
+                            output.push(unreadable(error));
+                            if (length === undefined) { terminated = true; break; }
+                            continue;
+                        }
+                    }
+                    output.push(descend(() => elementAt(item,element,base,i)));
+                }
+                if (length !== undefined && output.length < length) output.push(crop(length-output.length,"elements"));
+                if (length === undefined && !terminated) output.push("… <truncated sequence>");
+                return "[" + output.join(", ") + "]";
+            } finally {
+                path.pop();
+            }
+        };
+        activeFormat = {nested:walk};
+        try {
+            let text;
+            try { text = walk(store,checked,0,0,false); }
+            catch (error) { text = unreadable(error); }
+            return text + (exhausted ? "\n* Formatting truncated: node budget exhausted." : "");
+        } finally {
+            activeFormat = undefined;
+        }
     }
 
     // Decode a contiguous leaf range in one target read. Aggregate and dynamic
@@ -1853,7 +2139,7 @@
         const perChunk = Math.floor(16384 / element.size);
         for (let i = 0; i < count; i += perChunk) {
             const length = Math.min(count - i, perChunk);
-            const data = view(readBytes(addr(base,i * element.size), length * element.size));
+            const data = view(readBytes(valueOffset(base,i * element.size), length * element.size));
             for (let j = 0; j < length; j++) {
                 result[i+j] = data["get" + spec[0]](j * element.size, element.littleEndian ?? true);
             }
@@ -1864,10 +2150,6 @@
     function plainPointer(info, self) {
         return info.kind === "ptr" && info.length === undefined && info.terminated === undefined
             && !typeInfo(resolve(info.element,self)).char;
-    }
-
-    function convertScalar(value, info) {
-        return info.boolean ? Boolean(value) : info.kind === "ptr" && value === 0n ? null : value;
     }
 
     function recordPlan(type, depth = 0) {
@@ -1892,12 +2174,23 @@
 
     function presentValue(store, options) {
         bound(store);
-        const formatting = options !== undefined;
+        if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw new TypeError("expected Value conversion options");
+        }
+        const pointer = options?.pointer === undefined ? "bigint" : options.pointer;
+        if (pointer !== "bigint" && pointer !== "string") throw new TypeError("invalid pointer conversion option");
         const seen = new Map();
         let budget = 1000000;
-        const formatScalar = (value, info) => {
-            const name = info.enumerators && Object.entries(info.enumerators).find(([, n]) => BigInt(n) === BigInt(value))?.[0];
-            return name ?? (info.kind === "ptr" || info.kind === "fn" ? word(value) : String(value));
+        const convert = (value, info) => {
+            if (info.kind === "ptr") return value === 0n ? null : pointer === "string" ? word(value) : value;
+            return info.boolean ? Boolean(value) : value;
+        };
+        const convertTerminated = (items, element) => {
+            if (!Array.isArray(items)) return items;
+            const info = typeInfo(element);
+            if (info.kind !== "ptr") return items;
+            return items.map(item => typeof item === "bigint" ? convert(item,info) :
+                convertTerminated(item,resolve(info.element)));
         };
         const conversionViews = (type, self) => {
             let entries = seen.get(type);
@@ -1916,7 +2209,7 @@
                 if (--budget < 0) throw new RangeError("Value conversion resource limit reached");
                 const at = offset + field;
                 const value = nested ? record(nested,data,at,base) :
-                    convertScalar(data["get" + scalarSpec[descriptor.scalar][0]](at,descriptor.littleEndian ?? true),descriptor);
+                    convert(data["get" + scalarSpec[descriptor.scalar][0]](at,descriptor.littleEndian ?? true),descriptor);
                 Object.defineProperty(output,name,{value,enumerable:true, writable:true, configurable:true});
             }
             return output;
@@ -1925,133 +2218,71 @@
             if (--budget < 0 || depth > 64) throw new RangeError("Value conversion resource limit reached");
             const type = item[valueKeys.type], info = item[valueKeys.info], kind = info.kind;
             const value = item[valueKeys.value];
-            if (formatting) {
-                const printer = info.formatter ?? prettyPrinters.get(type);
-                if (printer && !activePrinters.has(type)) {
-                    activePrinters.add(type);
-                    try {
-                        const text = printer(value);
-                        if (text !== undefined) {
-                            if (typeof text !== "string") throw new TypeError("formatter must return a string");
-                            return text;
-                        }
-                    } finally {
-                        activePrinters.delete(type);
-                    }
-                }
-            }
             if (kind === "scalar" || kind === "bitfield" || kind === "fn") {
                 const scalar = kind === "scalar" ? readScalar(item) : kind === "bitfield" ? readBitfield(item) : valueAddress(item);
-                const converted = info.boolean ? Boolean(scalar) : scalar;
-                return formatting ? formatScalar(converted,info) : converted;
+                return info.boolean ? Boolean(scalar) : scalar;
             }
-            if (formatting && depth >= options.maxDepth) return "…";
             const base = kind === "ptr" ? readScalar(item) : item[valueKeys.address];
             const element = info.element === undefined ? undefined : resolve(info.element,item[valueKeys.self]);
             const scalar = element === undefined ? undefined : typeInfo(element);
-            if (kind === "ptr" && base === 0n) return formatting ? "NULL" : null;
+            if (kind === "ptr" && base === 0n) return null;
             if (kind === "ptr" && scalar?.char && info.length === undefined) {
                 const limit = info.terminated ?? 4096;
-                if (!formatting) {
-                    if (limit > budget) throw new RangeError("string conversion budget exceeded");
-                    return fromUtf8(terminatedBytes(base,scalar,limit));
-                }
-                const count = Math.min(limit, options.maxStringLength + 1);
-                const data = rpc("readPrefix", {address:word(base),length:count});
-                const end = data.indexOf(0);
-                if (end < 0 && data.length < count) return "<unreadable string>";
-                if (end < 0 && count === limit && count <= options.maxStringLength) return "<unterminated string>";
-                return JSON.stringify(fromUtf8(data.slice(0,end < 0 ? options.maxStringLength : end))) +
-                    (end < 0 ? " … (truncated)" : "");
+                if (limit > budget) throw new RangeError("string conversion budget exceeded");
+                return fromUtf8(terminatedBytes(base,scalar,limit));
             }
             const length = kind === "opaque" ? info.size :
                 (kind === "array" || kind === "ptr") ? dynamicLength(info,item) : undefined;
-            if (kind === "ptr" && length === undefined && info.terminated === undefined) {
-                if (!formatting) return base;
-                let hit;
-                try { hit = rpc("symbolAt", {address:word(base)}); } catch (_) {}
-                const label = hit && hit.match !== "nearest"
-                    ? " <" + hit.name + (hit.offset === "0x0" ? "" : "+" + hit.offset) + ">" : "";
-                return word(base) + label;
-            }
+            if (kind === "ptr" && length === undefined && info.terminated === undefined) return convert(base,info);
             if (kind === "array" && length === undefined) throw new TypeError("array length is unknown");
-            // Pointer and array views can share an address while describing
-            // different lengths. Aggregate self resolution can also change a view.
             const self = info.fields ? undefined : item[valueKeys.self];
             const views = conversionViews(type,self);
             const key = base === undefined ? value : String(base) + ":" + length;
-            if (views.has(key)) return formatting ? "<cycle>" : views.get(key);
-            const plan = !formatting && scalar?.fields ? recordPlan(element) : undefined;
-            const ownPlan = !formatting && info.fields ? recordPlan(type) : undefined;
+            if (views.has(key)) return views.get(key);
+            const plan = scalar?.fields ? recordPlan(element) : undefined;
+            const ownPlan = info.fields ? recordPlan(type) : undefined;
             if (ownPlan && ownPlan.size <= 16384) {
                 return record(ownPlan,view(readBytes(base,ownPlan.size)),0,base);
             }
             const output = info.fields ? {} : [];
             views.set(key,output);
-            const child = (get, fallback) => {
-                if (!formatting) return walk(valueStore(get()),depth+1);
-                try { return walk(valueStore(get()),depth+1); }
-                catch (error) {
-                    return "<" + fallback + ": " + String(error.message ?? error).slice(0,160) + ">";
-                }
-            };
-            let rendered;
+            const child = value => walk(valueStore(value),depth+1);
             if (info.fields) {
-                const names = Object.keys(info.fields);
-                const shown = formatting ? names.slice(0,options.maxElements) : names;
-                for (const name of shown) {
-                    Object.defineProperty(output,name,{value:child(() => value[name],"unavailable"),
+                for (const name of Object.keys(info.fields)) {
+                    Object.defineProperty(output,name,{value:child(value[name]),
                         enumerable:true, writable:true, configurable:true});
                 }
-                if (formatting) {
-                    const indent = " ".repeat(options.indent * (depth + 1));
-                    const lines = shown.map(name => indent + name + ": " + output[name]);
-                    if (shown.length < names.length) lines.push(indent + "… " + (names.length - shown.length) + " more fields");
-                    rendered = (info.name ?? kind) + " {" + (lines.length ?
-                        "\n" + lines.join("\n") + "\n" + " ".repeat(options.indent * depth) : "") + "}";
-                }
             } else if (length === undefined) {
-                if (formatting) rendered = word(base) + " <terminated sequence>";
-                else {
-                    if (info.terminated > budget) throw new RangeError("terminated sequence conversion budget exceeded");
-                    const result = value.$deref();
-                    budget -= result.length;
-                    views.set(key,result);
-                    return result;
-                }
+                if (info.terminated > budget) throw new RangeError("terminated sequence conversion budget exceeded");
+                const items = value.$deref();
+                budget -= items.length;
+                const result = pointer === "string" ? convertTerminated(items,element) : items;
+                views.set(key,result);
+                return result;
             } else {
-                const count = formatting ? Math.min(length,options.maxElements) : length;
-                if (count > budget) throw new RangeError("Value conversion element limit reached");
+                if (length > budget) throw new RangeError("Value conversion element limit reached");
                 if (kind === "opaque") {
-                    for (let i = 0; i < count; i += 16384) {
-                        output.push(...readBytes(addr(base,i),Math.min(16384,count-i)));
+                    for (let i = 0; i < length; i += 16384) {
+                        output.push(...readBytes(addr(base,i),Math.min(16384,length-i)));
                     }
-                    budget -= count;
-                } else if (scalar && ((scalar.kind === "scalar" && !(formatting && (scalar.formatter || prettyPrinters.has(element)))) ||
-                    (!formatting && plainPointer(scalar,item[valueKeys.self])))) {
-                    const data = scalarRange(scalar,base,count);
-                    for (const n of data) {
-                        const converted = convertScalar(n,scalar);
-                        output.push(formatting ? formatScalar(converted,scalar) : converted);
-                    }
-                    budget -= count;
+                    budget -= length;
+                } else if (scalar && (scalar.kind === "scalar" || plainPointer(scalar,item[valueKeys.self]))) {
+                    for (const n of scalarRange(scalar,base,length)) output.push(convert(n,scalar));
+                    budget -= length;
                 } else if (plan && plan.size <= 16384) {
                     const stride = Math.floor(16384 / plan.size);
-                    for (let i = 0; i < count; i += stride) {
-                        const length = Math.min(count-i,stride);
+                    for (let i = 0; i < length; i += stride) {
+                        const count = Math.min(length-i,stride);
                         const baseAddress = addr(base,i * plan.size);
-                        const data = view(readBytes(baseAddress,length * plan.size));
-                        for (let j = 0; j < length; j++) output.push(record(plan,data,j * plan.size,baseAddress));
+                        const data = view(readBytes(baseAddress,count * plan.size));
+                        for (let j = 0; j < count; j++) output.push(record(plan,data,j * plan.size,baseAddress));
                     }
-                    budget -= count;
+                    budget -= length;
                 } else {
-                    for (let i = 0; i < count; i++) output.push(child(() => value[i],"unreadable"));
+                    for (let i = 0; i < length; i++) output.push(child(value[i]));
                 }
-                if (formatting) rendered = "[" + output.join(", ") +
-                    (count < length ? (count ? ", " : "") + "… " + (length - count) + " more elements" : "") + "]";
             }
-            if (formatting) views.delete(key);
-            return formatting ? rendered : output;
+            return output;
         };
         return walk(store,0);
     }
@@ -2062,11 +2293,11 @@
         switch (key) {
         case "$type": return store[valueKeys.type];
         case "$asType": return type => type.at(valueAddress(store),store[valueKeys.value].$tid);
-        case "$toJS": return () => presentValue(store);
-        case "$format": return options => presentValue(store,valueFormatOptions(options));
+        case "$toJS": return options => presentValue(store,options);
+        case "$format": return options => formatValue(store,options);
         case Symbol.toPrimitive: return hint => {
             if (hint !== "string") throw new TypeError("Value requires an explicit numeric read");
-            return presentValue(store,valueFormatOptions());
+            return formatValue(store);
         };
         case "$size": return valueSize(info,store);
         case "$parent": return store[valueKeys.parent];
@@ -2280,6 +2511,7 @@
             case "aggregate": {
                 const fields = Object.create(null);
                 const members = [];
+                const overlaps = new Set();
                 const duplicatePrefix = "duplicate DWARF member ";
                 for (const {name,offset,ty,bit} of info.fields) {
                     const member = node(ty);
@@ -2287,10 +2519,10 @@
                     const type = bit ? descriptor({kind:"bitfield",scalar:underlying.scalar,bit}) : member;
                     addMember(fields,members,name,type,offset,name,duplicatePrefix);
                     if (name == null && underlying.fields) {
-                        promoteMembers(fields,members,underlying,offset,duplicatePrefix);
+                        promoteMembers(fields,members,overlaps,underlying,offset,duplicatePrefix);
                     }
                 }
-                type = descriptor({kind:info.union ? "union" : "struct",name:info.name,size:info.size,align:info.align,fields,members});
+                type = descriptor({kind:info.union ? "union" : "struct",name:info.name,size:info.size,align:info.align,fields,members,overlaps});
                 break;
             }
             case "function":

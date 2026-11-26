@@ -299,3 +299,111 @@ fn conversion_batches_reads_and_preserves_cycles() {
         );
     }
 }
+
+#[test]
+fn bounded_formatting_keeps_siblings_and_strict_conversion() {
+    use std::rc::Rc;
+
+    let runtime = Runtime::new().unwrap();
+    let context = Context::full(&runtime).unwrap();
+    let reads = Rc::new(Cell::new(0usize));
+    context.with(|ctx| {
+        let api: Object = ctx.eval(include_str!("../runtime.js")).catch(&ctx).unwrap();
+        install(&ctx, &api).unwrap();
+        let mut memory = vec![0u8; 128];
+        for (index, next, alias, data) in [(0, 0x1018u64, 0x1018u64, 1u32),
+                                          (24, 0x1030, 0, 2),
+                                          (48, 0x1048, 0, 3),
+                                          (72, 0x1000, 0, 4)] {
+            memory[index..index+8].copy_from_slice(&next.to_le_bytes());
+            memory[index+8..index+16].copy_from_slice(&alias.to_le_bytes());
+            memory[index+16..index+20].copy_from_slice(&data.to_le_bytes());
+        }
+        memory[96..104].copy_from_slice(&0xdeadbeefu64.to_le_bytes());
+        memory[104..112].copy_from_slice(&0x1078u64.to_le_bytes());
+        memory[120..128].copy_from_slice(b"partial!");
+        let calls = reads.clone();
+        let operation = Function::new(ctx.clone(), move |ctx: Ctx<'_>, op: String, args: String| {
+            let args: serde_json::Value = serde_json::from_str(&args).unwrap();
+            let address = u64::from_str_radix(&args["address"].as_str().unwrap()[2..], 16).unwrap();
+            if op == "symbolAt" {
+                return Ok("null".to_owned());
+            }
+            calls.set(calls.get() + 1);
+            let start = address.checked_sub(0x1000).unwrap() as usize;
+            let len = args["length"].as_u64().unwrap() as usize;
+            assert!(matches!(op.as_str(), "read" | "readPrefix"));
+            let end = match op.as_str() {
+                "readPrefix" => (start + len).min(memory.len()),
+                _ => start + len,
+            };
+            if let Some(bytes) = memory.get(start..end).filter(|_| !((start..end).contains(&112))) {
+                return Ok(serde_json::to_string(bytes).unwrap());
+            }
+            if args["format"] == true {
+                return Ok(r#"{"unreadable":"EFAULT"}"#.into());
+            }
+            Err(rquickjs::Exception::throw_message(&ctx, "EFAULT"))
+        }).unwrap();
+        let generation = Function::new(ctx.clone(), || 1).unwrap();
+        api.get::<_, Function>("initialize").unwrap()
+            .call::<_, ()>((operation, crate::regs::ARCH, generation)).unwrap();
+
+        eval(&ctx, r#"
+            const check = (condition, text) => { if (!condition) throw Error(text); };
+            const Node = m.struct({next:m.pointer(m.self()), alias:m.pointer(m.self()), data:m.u32()});
+            const node = Node.at(0x1000n);
+            const plain = node.$format({deref:0});
+            check(!plain.includes("->"), plain);
+            const shallow = node.$format({maxDepth:1,deref:4});
+            check(shallow.includes("max depth") && !shallow.includes("data: 2"), shallow);
+            const formatted = node.$format();
+            check(formatted.includes("data: 3") && !formatted.includes("data: 4"),formatted);
+            check(formatted.split("data: 2").length === 3, formatted);
+            const deep = node.$format({deref:4,maxDepth:8});
+            check(deep.includes("0x1000 <cycle>") && deep.includes("data: 4"),deep);
+            const limited = node.$format({maxNodes:3});
+            check(limited.includes("node budget exhausted") && limited.includes("more fields"), limited);
+            const fields = node.$format({maxFields:1,deref:0,maxElements:16});
+            check(fields.includes("2 more fields"), fields);
+            const array = m.array(m.u32(),5).at(0x1000n).$format({maxFields:0,maxElements:1});
+            check(array.includes("4 more elements"),array);
+            const Bad = m.struct({pointer:m.pointer(Node), str:m.cStr(64), gap:m.u32(), tail:m.u32()});
+            const bad = Bad.at(0x1060n);
+            const partial = bad.$format();
+            check(partial.includes("0xdeadbeef <unreadable: EFAULT>") &&
+                partial.includes('"partial!" <unreadable @ 0x1080>') &&
+                partial.includes("gap: <unreadable: EFAULT @ 0x1070>") &&
+                partial.includes("tail:"),partial);
+            let strict = false;
+            try { m.u32().at(0x1070n).$toJS(); } catch (error) { strict = error.message === "EFAULT"; }
+            check(strict, "strict conversion");
+            const U = m.union({nested:m.struct({p:m.pointer(Node)}), bytes:m.u64()});
+            const union = U.at(0x1060n).$format({deref:5});
+            check(union.includes("union") && union.includes("p: 0xdeadbeef") && !union.includes("unreadable"),union);
+            const anonymous = m.struct({...m.anonymous(U)}).at(0x1060n).$format();
+            check(anonymous.includes("<union member>") && anonymous.includes("p: 0xdeadbeef") &&
+                !anonymous.includes("unreadable"),anonymous);
+            const overflow = m.pointer(m.u32()).value(0xffffffffffffffffn).$format();
+            check(overflow.includes("0xffffffffffffffff <unreadable: address range overflow>"), overflow);
+            const printer = m.u32().withFormatter(() => { throw Error("custom"); });
+            const formattedFields = m.struct({custom:printer,data:m.u32()}).at(0x100cn).$format();
+            check(formattedFields.includes("formatter error: custom") && formattedFields.includes("data: 1"),formattedFields);
+            const Known = m.struct({next:m.pointer(m.self(),1), alias:m.pointer(m.void()), count:m.u64()});
+            const normal = Known.at(0x1048n).$toJS();
+            const strings = Known.at(0x1048n).$toJS({pointer:"string"});
+            check(normal.alias === null && strings.alias === null && typeof strings.count === "bigint", "scalar types");
+            check(strings.next[0].alias === "0x1018", "recursive pointer policy");
+            const terminated = m.pointer(m.pointer(m.void())).nullTerminate(2).at(0x1000n);
+            check(terminated.$toJS()[0] === 0x1030n &&
+                terminated.$toJS({pointer:"string"})[0] === "0x1030", "terminated pointers");
+            check(node.$toJS().next === 0x1018n && node.$toJS({pointer:"bigint"}).next === 0x1018n, "default");
+        "#);
+        reads.set(0);
+        eval(&ctx, r#"
+            const large = m.array(m.u32(),32).at(0x1000n);
+            if (!large.$format({maxNodes:2}).includes("31 more elements")) throw Error("node count");
+        "#);
+        assert_eq!(reads.get(), 1, "only the allowed element is read");
+    });
+}

@@ -3,6 +3,75 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write;
 
+const TEXT_BUDGET: usize = 32 * 1024;
+const STRUCTURED_BUDGET: usize = 2 * 1024 * 1024;
+
+fn clip(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let end = text.floor_char_boundary(limit);
+    text[..end]
+        .rsplit_once('\n')
+        .map_or(&text[..end], |(lines, _)| lines)
+}
+
+fn limited_blocks(blocks: Vec<String>, limit: usize) -> (String, bool) {
+    let mut text = String::new();
+    for block in blocks {
+        let separator = usize::from(!text.is_empty() && !text.ends_with('\n'));
+        let left = limit.saturating_sub(text.len() + separator);
+        if block.len() > left {
+            let fragment = clip(&block, left);
+            if !fragment.is_empty() {
+                if separator > 0 {
+                    text.push('\n');
+                }
+                text.push_str(fragment);
+            }
+            return (text, true);
+        }
+        if separator > 0 && !block.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&block);
+    }
+    (text, false)
+}
+
+fn limited_text(ordinary: Vec<String>, critical: Vec<String>) -> String {
+    const NOTICE: &str = "* Output truncated for display.";
+    let budget = TEXT_BUDGET - NOTICE.len() - 4;
+    let (important, important_clipped) = limited_blocks(critical, budget);
+    let (text, clipped) = limited_blocks(ordinary, budget.saturating_sub(important.len() + 2));
+    let mut parts = vec![text.as_str(), important.as_str()];
+    if clipped || important_clipped {
+        parts.push(NOTICE);
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn structured_fits(value: &Value) -> bool {
+    struct Limit(usize);
+    impl std::io::Write for Limit {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("structured output limit reached"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Limit(STRUCTURED_BUDGET), value).is_ok()
+}
+
 pub fn document(data: Value) -> CallToolResult {
     let mut reply = CallToolResult::success(Vec::new());
     reply.structured_content = Some(data);
@@ -16,7 +85,10 @@ pub fn document_error(data: Value) -> CallToolResult {
 }
 
 pub fn error(text: &str) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(text)])
+    CallToolResult::error(vec![ContentBlock::text(limited_text(
+        vec![text.into()],
+        vec![],
+    ))])
 }
 
 #[derive(Default)]
@@ -39,6 +111,24 @@ impl Presentation {
         let Some(data) = reply.structured_content.take() else {
             return reply;
         };
+        if tool == "docs" {
+            if structured {
+                return if reply.is_error == Some(true) {
+                    document_error(data)
+                } else {
+                    document(data)
+                };
+            }
+            let content = vec![ContentBlock::text(
+                data["text"].as_str().unwrap_or_default(),
+            )];
+            return if reply.is_error == Some(true) {
+                CallToolResult::error(content)
+            } else {
+                CallToolResult::success(content)
+            };
+        }
+        let structured_overflow = structured && !structured_fits(&data);
         let mut failed = reply.is_error.unwrap_or(false);
         let result = &data["result"];
         let id = result["script_id"].as_u64();
@@ -51,7 +141,7 @@ impl Presentation {
         {
             failed = true;
         }
-        if structured {
+        if structured && !structured_overflow {
             return if failed {
                 document_error(data)
             } else {
@@ -68,6 +158,13 @@ impl Presentation {
             .unwrap_or(&Value::Null);
         let full = tool == "status";
         let mut blocks = Vec::new();
+        let mut ordinary = Vec::new();
+        if structured_overflow {
+            failed = true;
+            blocks.push(
+                "* Structured output exceeded 2 MiB. Request a smaller scope or page.".into(),
+            );
+        }
 
         if let Some(message) = data["error"].as_str() {
             blocks.push(message.to_owned());
@@ -125,13 +222,6 @@ impl Presentation {
                     scalar(&data["session"])
                 ));
             }
-            "docs" => blocks.push(format!(
-                "{}\n\n{}\n\n{}\n\nFull API: {}",
-                scalar(&data["instructions"]),
-                scalar(&data["declarations"]),
-                scalar(&data["modules"]),
-                scalar(&data["full_api"])
-            )),
             "script_run" | "script_wait" | "gdb" => {}
             "run" | "attach" => {}
             "send_input" | "interrupt_input" if result["handler"].is_string() => {
@@ -143,9 +233,10 @@ impl Presentation {
                 blocks.push(format!("{verb} {}.", scalar(&result["handler"])));
             }
             "ps" | "syscall_table" if !result.is_null() => {
-                blocks.push(table(result, tool));
+                ordinary.push(table(result, tool));
             }
-            _ if !result.is_null() => blocks.push(readable(result, true)),
+            "snapshot" => ordinary.push(snapshot_text(result)),
+            _ if !result.is_null() => ordinary.push(readable(result, true)),
             _ => {}
         }
 
@@ -179,15 +270,15 @@ impl Presentation {
             let kind = value["kind"].as_str().unwrap_or_default();
             match kind {
                 "session_presentation" => continue,
-                "console" | "fmt" | "operation_result" => {
+                "console" | "fmt" => {
                     if participants.len() > 1 && group != Some(script) {
-                        blocks.push(format!("[Script #{script}]"));
+                        ordinary.push(format!("[Script #{script}]"));
                         group = Some(script);
                     }
                     if let Some(text) = value["text"].as_str() {
-                        blocks.push(text.to_owned());
+                        ordinary.push(text.to_owned());
                     } else {
-                        blocks.push(
+                        ordinary.push(
                             rows(&value["values"])
                                 .iter()
                                 .map(|value| readable(value, false))
@@ -196,6 +287,11 @@ impl Presentation {
                         );
                     }
                     continue;
+                }
+                "operation_result" => {
+                    if let Some(text) = value["text"].as_str() {
+                        blocks.push(text.to_owned());
+                    }
                 }
                 "script_complete" | "script_cancelled" | "script_error" => {
                     terminal.insert(script);
@@ -271,9 +367,15 @@ impl Presentation {
             let heading = script
                 .map(|id| format!("Script #{id} awaiting input"))
                 .unwrap_or_else(|| "Awaiting input".into());
+            let payload = readable(&input["payload"], false);
+            let excerpt = clip(&payload, 1536);
+            let note = if excerpt.len() < payload.len() {
+                " <request preview truncated>"
+            } else {
+                ""
+            };
             blocks.push(format!(
-                "* {heading}\n  Request {handler}: {}\n  Reply with send_input.",
-                readable(&input["payload"], false)
+                "* {heading}\n  Request {handler}: {excerpt}{note}\n  Reply with send_input."
             ));
         }
         for wait in rows(&data["waiting_events"]) {
@@ -400,7 +502,7 @@ impl Presentation {
             .iter()
             .chain(std::iter::once(process))
         {
-            append_process_output(process, &mut blocks);
+            append_process_output(process, &mut ordinary, &mut blocks);
         }
         if data["output_dropped"] == true || full && session["outputDropped"] == true {
             blocks.push("* Script output was dropped from its buffer.".into());
@@ -418,10 +520,10 @@ impl Presentation {
         if let Some(message) = data["target_error"].as_str() {
             blocks.push(format!("* Target error: {message}"));
         }
-        let text = if blocks.is_empty() {
+        let text = if blocks.is_empty() && ordinary.is_empty() {
             String::from("OK")
         } else {
-            join_blocks(blocks)
+            limited_text(ordinary, blocks)
         };
         let content = vec![ContentBlock::text(text)];
         if failed {
@@ -432,18 +534,22 @@ impl Presentation {
     }
 }
 
-fn append_process_output(process: &Value, blocks: &mut Vec<String>) {
+fn append_process_output(process: &Value, ordinary: &mut Vec<String>, blocks: &mut Vec<String>) {
     if process["pid"].is_null() {
         return;
     }
     let pid = scalar(&process["pid"]);
     if process["truncated"] == true {
-        blocks.push(format!(
-            "* Process {pid} output was dropped from its buffer."
-        ));
+        let bytes = process["dropped_bytes"].as_u64().filter(|&bytes| bytes > 0);
+        blocks.push(match bytes {
+            Some(bytes) => {
+                format!("* Process {pid} output was dropped from its buffer ({bytes} bytes).")
+            }
+            None => format!("* Process {pid} output was dropped from its buffer."),
+        });
     }
     for chunk in rows(&process["chunks"]) {
-        blocks.push(format!(
+        ordinary.push(format!(
             "Process {pid} {}\n{}",
             scalar(&chunk[0]),
             scalar(&chunk[1])
@@ -452,12 +558,16 @@ fn append_process_output(process: &Value, blocks: &mut Vec<String>) {
     // Earlier servers send one string per stream.
     for stream in ["stdout", "stderr"] {
         if let Some(text) = process[stream].as_str().filter(|s| !s.is_empty()) {
-            blocks.push(format!("Process {pid} {stream}\n{text}"));
+            ordinary.push(format!("Process {pid} {stream}\n{text}"));
         }
     }
     if process["more"] == true {
+        let bytes = process["more_bytes"]
+            .as_u64()
+            .map(|n| format!(" ({n} bytes)"))
+            .unwrap_or_default();
         blocks.push(format!(
-            "* More output is buffered for process {pid}. Use another collecting call to read it."
+            "* More output is buffered for process {pid}{bytes}. Use another collecting call to read it."
         ));
     }
 }
@@ -478,17 +588,6 @@ fn state<'a>(target: &'a Value, result: &'a Value) -> &'a str {
         .as_str()
         .or(result["state"].as_str())
         .unwrap_or("unknown")
-}
-
-fn join_blocks(blocks: Vec<String>) -> String {
-    let mut out = String::new();
-    for (index, block) in blocks.into_iter().enumerate() {
-        if index > 0 && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&block);
-    }
-    out
 }
 
 fn runtime_error(heading: &str, value: &Value) -> String {
@@ -639,7 +738,19 @@ fn event_text(event: &Value, full: bool) -> String {
 }
 
 fn readable(value: &Value, management: bool) -> String {
-    fn render(value: &Value, management: bool, depth: usize, out: &mut String) {
+    struct Text(String);
+    impl Write for Text {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            let left = (TEXT_BUDGET / 2).saturating_sub(self.0.len());
+            self.0.push_str(clip(text, left));
+            if text.len() > left {
+                Err(std::fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn render(value: &Value, management: bool, depth: usize, out: &mut Text) -> std::fmt::Result {
         match value {
             Value::Object(map) => {
                 let indent = "  ".repeat(depth);
@@ -659,51 +770,100 @@ fn readable(value: &Value, management: bool) -> String {
                     {
                         continue;
                     }
-                    write!(out, "{indent}{key}:").unwrap();
+                    write!(out, "{indent}{key}:")?;
                     if value.is_object()
                         || value.is_array() && rows(value).iter().any(Value::is_object)
                     {
-                        out.push('\n');
-                        render(value, management, depth + 1, out);
+                        out.write_char('\n')?;
+                        render(value, management, depth + 1, out)?;
                     } else {
-                        out.push(' ');
-                        render(value, management, depth + 1, out);
-                        out.push('\n');
+                        out.write_char(' ')?;
+                        render(value, management, depth + 1, out)?;
+                        out.write_char('\n')?;
                     }
                 }
                 if map.is_empty() && !management {
-                    out.push_str("{}");
+                    out.write_str("{}")?;
                 }
             }
             Value::Array(values) if values.iter().any(|v| v.is_object() || v.is_array()) => {
                 let indent = "  ".repeat(depth);
                 for value in values {
-                    writeln!(out, "{indent}-").unwrap();
-                    render(value, management, depth + 1, out);
-                    if !out.ends_with('\n') {
-                        out.push('\n');
+                    writeln!(out, "{indent}-")?;
+                    render(value, management, depth + 1, out)?;
+                    if !out.0.ends_with('\n') {
+                        out.write_char('\n')?;
                     }
                 }
             }
             Value::Array(values) => {
-                out.push('[');
+                out.write_char('[')?;
                 for (index, value) in values.iter().enumerate() {
                     if index > 0 {
-                        out.push_str(", ");
+                        out.write_str(", ")?;
                     }
-                    out.push_str(&scalar(value));
+                    render(value, management, depth + 1, out)?;
                 }
-                out.push(']');
+                out.write_char(']')?;
             }
-            _ => out.push_str(&scalar(value)),
+            Value::String(text) => out.write_str(text)?,
+            _ => out.write_str(&scalar(value))?,
+        }
+        Ok(())
+    }
+    let mut text = Text(String::new());
+    let clipped = render(value, management, 0, &mut text).is_err();
+    let mut text = text.0;
+    text.truncate(text.trim_end_matches('\n').len());
+    if clipped {
+        text.push_str("\n* Output truncated for display.");
+    }
+    text
+}
+
+fn snapshot_text(result: &Value) -> String {
+    let threads = rows(&result["threads"]);
+    if !result["threads"].is_array() {
+        return readable(result, true);
+    }
+    let total = result["threadCount"]
+        .as_u64()
+        .unwrap_or(threads.len() as u64);
+    let mut text = format!(
+        "Snapshot ({})\nThreads: {total}",
+        scalar(&result["consistency"])
+    );
+    let mut shown = 0;
+    for thread in threads {
+        let mut line = readable(thread, true);
+        if result["frameLimit"].as_u64() == Some(rows(&thread["frames"]).len() as u64) {
+            line.push_str("\n* Frame capture limit reached for this thread.");
+        }
+        if text.len() + line.len() + 2 > TEXT_BUDGET / 2 {
+            if shown == 0 {
+                write!(text, "\n{}", clip(&line, TEXT_BUDGET / 3)).unwrap();
+                text.push_str("\n* First thread details truncated.");
+                shown += 1;
+            }
+            break;
+        }
+        write!(text, "\n{line}").unwrap();
+        shown += 1;
+    }
+    let omitted =
+        threads.len() as u64 - shown + result["threadsOmitted"].as_u64().unwrap_or_default();
+    if omitted > 0 {
+        write!(text, "\n* Output truncated: {omitted} more threads.").unwrap();
+    }
+    for key in ["incomplete", "context", "mappings"] {
+        if let Some(value) = result.get(key) {
+            let section = readable(value, true);
+            write!(text, "\n{key}: {}", clip(&section, 2048)).unwrap();
+            if section.len() > 2048 {
+                text.push_str("\n* Section truncated for display.");
+            }
         }
     }
-    if let Some(text) = value.as_str() {
-        return text.to_owned();
-    }
-    let mut text = String::new();
-    render(value, management, 0, &mut text);
-    text.truncate(text.trim_end_matches('\n').len());
     text
 }
 
@@ -740,7 +900,7 @@ fn table(result: &Value, tool: &str) -> String {
         return readable(result, true);
     }
     let mut text = fields.join("  ").to_uppercase();
-    for row in rows {
+    for (index, row) in rows.iter().enumerate() {
         let cells: Vec<_> = fields
             .iter()
             .map(|field| {
@@ -762,7 +922,37 @@ fn table(result: &Value, tool: &str) -> String {
                 readable(value, false)
             })
             .collect();
-        write!(text, "\n{}", cells.join("  ")).unwrap();
+        let line = cells.join("  ");
+        if text.len() + line.len() + 1 > TEXT_BUDGET / 2 {
+            let next = result["offset"].as_u64().unwrap_or_default() + index as u64;
+            if index == 0 {
+                write!(
+                    text,
+                    "\n{}\n* Row truncated for display.",
+                    clip(&line, 2048)
+                )
+                .unwrap();
+            }
+            write!(
+                text,
+                "\n* Output truncated: {} more rows.",
+                result["total"]
+                    .as_u64()
+                    .map(|total| total.saturating_sub(next + u64::from(index == 0)))
+                    .unwrap_or((rows.len() - index - usize::from(index == 0)) as u64)
+            )
+            .unwrap();
+            if tool == "ps" {
+                write!(
+                    text,
+                    "\nMore results at offset {}.",
+                    next + u64::from(index == 0)
+                )
+                .unwrap();
+            }
+            return text;
+        }
+        write!(text, "\n{line}").unwrap();
     }
     if let Some(next) = result["next_offset"].as_u64() {
         write!(text, "\nMore results at offset {next}.").unwrap();
@@ -774,6 +964,55 @@ fn table(result: &Value, tool: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn global_budget_preserves_stop_and_reports_utf8_clipping() {
+        let reply = document(json!({
+            "output": [
+                {"value":{"kind":"console", "text":"火".repeat(TEXT_BUDGET)}},
+                {"value":{"kind":"session_presentation","moreOutput":true,
+                    "events":[{"sequence":1,"kind":"signal","tid":10,"paused":true,
+                        "name":"SIGSEGV","faultAddress":"0x18"}]}}
+            ],
+            "process_output":{"pid":10,"chunks":[["stdout","more"]],"more":true,"truncated":true}
+        }));
+        let result = Presentation::default().render(reply, "script_run", None, None, false);
+        let text = &result.content[0].as_text().unwrap().text;
+        assert!(text.len() <= TEXT_BUDGET);
+        assert!(text.contains("Output truncated for display"));
+        assert!(text.contains("Fault address: 0x18"));
+        assert!(text.contains("output is buffered") && text.contains("dropped from its buffer"));
+        assert!(result.structured_content.is_none());
+    }
+
+    #[test]
+    fn structured_output_has_a_resource_limit() {
+        let reply = document(json!({
+            "result":"x".repeat(STRUCTURED_BUDGET),
+            "paused_stops":[{"tid":9,"reason":"signal","signalName":"SIGSEGV"}],
+        }));
+        let result = Presentation::default().render(reply, "script_run", None, None, true);
+        let text = &result.content[0].as_text().unwrap().text;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert!(text.contains("Structured output exceeded 2 MiB"));
+        assert!(text.contains("SIGSEGV"));
+        assert!(text.len() <= TEXT_BUDGET);
+    }
+
+    #[test]
+    fn snapshot_reports_omitted_threads_and_frame_limits() {
+        let frame = json!({"pc":"0x1000","symbol":"f"});
+        let thread = json!({"tid":1, "frames": vec![frame; 13]});
+        let snapshot = json!({
+            "threadCount":256,"threadsOmitted":224,
+            "frameLimit":13,"threads":vec![thread; 32], "consistency":"all-stopped"
+        });
+        let output = snapshot_text(&snapshot);
+        assert!(output.contains("Threads: 256") && output.contains("more threads"));
+        assert!(output.contains("Frame capture limit reached"));
+        assert!(output.len() < TEXT_BUDGET);
+    }
 
     #[test]
     fn full_queue_warning_preserves_all_pending_events_and_status_can_show_them_again() {

@@ -185,49 +185,90 @@ pub(crate) fn live_variable_image(
         }))
 }
 
+struct MappedDwarf {
+    dwarf: offline::DwarfImage,
+    cached: std::sync::Arc<cache::LiveImage>,
+    module: modules::Module,
+    link: u64,
+}
+
+fn mapped_dwarf(root: &Path, pc: u64) -> Result<Option<MappedDwarf>> {
+    let _context = crate::snapshot_timing::phase("variable_context");
+    let exe = fs::metadata(root.join("exe")).ok();
+    let Some(module) = modules::read(root)?
+        .into_iter()
+        .find(|module| module.executable_at(pc).is_some())
+    else {
+        return Ok(None);
+    };
+    let cached = cache::live_image(root, &module, exe.as_ref())?;
+    let Some(data) = cached.separate.as_ref().or(cached.primary.as_ref()) else {
+        return Ok(None);
+    };
+    let image = object::File::parse(cached.bytes.as_slice())?;
+    let layout = Layout::new(&image, &module)?;
+    let Some((instance, link)) = module
+        .executable_at(pc)
+        .and_then(|mapping| layout.for_address(mapping, pc))
+    else {
+        return Ok(None);
+    };
+    let dwarf = offline::DwarfImage {
+        bias: u64::try_from(instance.bias)?,
+        path: module.path(),
+        data: data.clone(),
+    };
+    Ok(Some(MappedDwarf {
+        dwarf,
+        cached,
+        module,
+        link,
+    }))
+}
+
+pub(crate) fn variable_type_at_pc(
+    root: &Path,
+    pc: u64,
+    name: &str,
+    deadline: Instant,
+) -> Result<Option<type_graph::Graph>> {
+    match mapped_dwarf(root, pc)? {
+        Some(frame) => frame
+            .dwarf
+            .variable_type_graph(name, Some(frame.link), deadline),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn variable_query_limited(err: &(dyn std::error::Error + 'static)) -> bool {
+    err.downcast_ref::<Failure>()
+        .is_some_and(|err| err.0 == "limit_reached")
+}
+
 pub(crate) fn stopped_dwarf(
     root: &Path,
     memory: &dyn crate::unwind::UnwindMemory,
     registers: Registers,
 ) -> Result<(offline::DwarfImage, crate::unwind::OfflineFrame)> {
     let pc = registers.get(PC)?;
-    let exe = fs::metadata(root.join("exe")).ok();
-    let no_dwarf = || {
+    let MappedDwarf {
+        dwarf,
+        cached,
+        module,
+        link,
+    } = mapped_dwarf(root, pc)?.ok_or_else(|| {
         crate::Diagnostic::new(
             "NO_DWARF",
             "No verified DWARF image for the current frame",
             Some("Stop in a module with matching debug information."),
         )
-    };
-    let _context = crate::snapshot_timing::phase("variable_context");
-    let module = modules::read(root)?
-        .into_iter()
-        .find(|module| module.executable_at(pc).is_some())
-        .ok_or_else(no_dwarf)?;
-    let cached = cache::live_image(root, &module, exe.as_ref())?;
-    let image = object::File::parse(cached.bytes.as_slice())?;
-    let layout = Layout::new(&image, &module)?;
-    let (instance, link) = module
-        .executable_at(pc)
-        .and_then(|mapping| layout.for_address(mapping, pc))
-        .ok_or_else(no_dwarf)?;
-    let bias = u64::try_from(instance.bias)?;
-    let dwarf = offline::DwarfImage {
-        bias,
-        path: module.path(),
-        data: cached
-            .separate
-            .as_ref()
-            .or(cached.primary.as_ref())
-            .cloned()
-            .ok_or_else(no_dwarf)?,
-    };
+    })?;
     let cfa = crate::snapshot_timing::measure("variable_cfa", || {
         crate::unwind::canonical_frame_address(
             cached.bytes.clone(),
             &module,
             link,
-            bias,
+            dwarf.bias,
             memory,
             registers,
         )
@@ -1763,11 +1804,8 @@ fn find_variable<'a>(
     let mut declarations = BTreeMap::new();
     let mut best: Option<Candidate<'a>> = None;
     let mut ambiguous = false;
-    let prune = visit.is_some()
-        && shadow.is_none()
-        && !all_locals
-        && link_pc.is_some()
-        && !crate::snapshot_timing::baseline();
+    let prune =
+        shadow.is_none() && !all_locals && link_pc.is_some() && !crate::snapshot_timing::baseline();
     let mut at_sibling = false;
     loop {
         let entry = if std::mem::take(&mut at_sibling) {

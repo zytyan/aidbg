@@ -29,7 +29,7 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | 工具 | 参数和用法 |
 | --- | --- |
 | `connect` | 连接服务端。填写 `socket` 或 `endpoint`，可传入 `session` 复用会话。 |
-| `docs` | 返回 `script_run` 的完整 TypeScript 声明、可导入模块和脚本执行规则。可在连接前调用。 |
+| `docs` | 默认返回 Quick Start。用 `section` 查询章节，或用 `section: "all"` 读取完整 TypeScript 声明。可在连接前调用。 |
 | `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标默认继续运行，`pause: true` 在 exec 后暂停。结果包含当前目标状态。 |
 | `attach` | `pid` 是进程 ID。线程默认继续运行，`pause: true` 保持暂停。结果包含当前目标状态。 |
 | `core_open` | `path` 是服务端上的 ELF core 或 zstd 压缩的 core，可指定 `executable` 和 `debug_symbols`。 |
@@ -45,9 +45,11 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | `syscall_table` | 列出服务端原生架构的 Linux syscall ID、名称和六个顺序固定的参数槽。可按 `id` 或 `name` 筛选。 |
 | `set_fork_policy` | 传入 `mode: "parent"` 或 `mode: "child"`，设置普通 fork 后跟踪哪一侧。 |
 
+MCP 普通文本响应上限为 32 KiB。响应会标明展示截断、还有缓冲数据或已发生缓冲区丢失。显式结构化响应的上限为 2 MiB。完整声明可用 `docs({section: "all"})` 或 MCP resource 获取。
+
 脚本可用 `fmt.status()`、`fmt.snapshot()`、`fmt.frame()`、`fmt.registers()`、`fmt.address(addr)` 和 `fmt.disassemble(addr)` 直接输出调试信息。需要继续处理数据时，使用 `dbg.snapshot()`、`dbg.symbolAt(addr)`、`dbg.disassemble(addr, count)` 和 `value.$toJS()`。`fmt.printf`、`fmt.sprintf`、`fmt.hexdump`、`fmt.bytesFromHex` 接管原调试输出辅助方法。
 
-`value.$format()` 和模板插值使用有界输出。`Type.withFormatter()` 返回带自定义格式化函数的新类型。`$asType(type)` 创建同地址视图。`$toJS()` 保留已知视图的循环关系，把空指针转换为 `null`，将无效 UTF-8 字节替换为 U+FFFD。读取失败、缺少终止符或超出转换预算会抛出错误。`fmt.diff(before, after)` 可比较包含循环引用的普通数据。
+`value.$format()` 和模板插值使用有界输出，默认沿普通指针解引用两层，并标记循环和局部读失败。`Type.withFormatter()` 返回带自定义格式化函数的新类型。`$asType(type)` 创建同地址视图。`$toJS()` 保留已知视图的循环关系，把空指针转换为 `null`，将无效 UTF-8 字节替换为 U+FFFD。传入 `{pointer: "string"}` 可将地址值转换为十六进制字符串，64 位整数仍是 `bigint`。读取失败、缺少终止符或超出转换预算会抛出错误。`fmt.diff(before, after)` 可比较包含循环引用的普通数据。
 
 栈回溯复用已验证调试镜像的 DWARF 数据。源码行号和内联帧按镜像内地址缓存，可在后续回溯中复用。
 

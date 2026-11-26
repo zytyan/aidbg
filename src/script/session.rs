@@ -35,11 +35,20 @@ use std::{
 use tokio::sync::oneshot;
 
 const MAX_OUTPUT: usize = 1024 * 1024;
-const TEXT_OUTPUT_BATCH: usize = 64 * 1024;
+const TEXT_OUTPUT_BATCH: usize = 16 * 1024;
 const MAX_GLOBALS: usize = 1024 * 1024;
 const MAX_PENDING: usize = 64;
 const SCRIPT_SLICE: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(5);
+
+fn process_output_size(value: &Value) -> usize {
+    value["chunks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|chunk| chunk[1].as_str().map_or(0, str::len))
+        .sum()
+}
 
 fn append_exit_status(output: &mut Value, exit: Option<crate::trace::LaunchExit>) {
     match exit {
@@ -624,6 +633,21 @@ impl State {
                 );
                 Ok(Value::Null)
             }
+            "typeOfVar" => {
+                let result = self.target.as_mut().ok_or_else(no_target)?.operation(
+                    op,
+                    args,
+                    &self.state_dir,
+                    &self.cancelled,
+                )?;
+                if let Some(text) = result["diagnostic"].as_str() {
+                    self.log(
+                        0,
+                        json!({"kind":"diagnostic","code":"DWARF_LOOKUP_LIMIT","text":text}),
+                    );
+                }
+                Ok(result["graph"].clone())
+            }
             _ => self.target.as_mut().ok_or_else(no_target)?.operation(
                 op,
                 args,
@@ -654,9 +678,11 @@ impl State {
                 crate::snapshot_timing::measure("reply_encoding", || {
                     self.tool_reply(result, pending, true, text_output)
                 });
+            let mut stream_budget = if text_output { 8 * 1024 } else { 64 * 1024 };
             let output_cursor = match self.target.as_ref() {
                 Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
-                    let (mut value, cursor) = stdio.mcp_output(text_output);
+                    let (mut value, cursor) = stdio.mcp_output(text_output, stream_budget);
+                    stream_budget = stream_budget.saturating_sub(process_output_size(&value));
                     value["pid"] = json!(live.pid);
                     append_exit_status(&mut value, live.trace.exit);
                     message.process_output_json = value.to_string().into_bytes();
@@ -668,10 +694,12 @@ impl State {
             if text_output {
                 let mut released = Vec::new();
                 for (index, (pid, stdio, _)) in self.released_output.iter().enumerate() {
-                    let (mut value, cursor) = stdio.mcp_output(true);
-                    if value["chunks"]
-                        .as_array()
-                        .is_some_and(|chunks| !chunks.is_empty())
+                    let (mut value, cursor) = stdio.mcp_output(true, stream_budget);
+                    stream_budget = stream_budget.saturating_sub(process_output_size(&value));
+                    if value["more"] == true
+                        || value["chunks"]
+                            .as_array()
+                            .is_some_and(|chunks| !chunks.is_empty())
                         || value["truncated"] == true
                     {
                         value["pid"] = json!(pid);
@@ -985,7 +1013,11 @@ fn run(
         timers: BTreeMap::new(),
         next_timer: 0,
     }));
-    let declarations = format!("{}\n{}", script_types::declarations(), script_types::NODE_DECLARATIONS);
+    let declarations = format!(
+        "{}\n{}",
+        script_types::declarations(),
+        script_types::NODE_DECLARATIONS
+    );
     let mut compiler = Compiler::with_session_api(&declarations, true);
     let result = context.with(|ctx| {
         ctx.store_userdata(files::Jobs::default()).map_err(|_| error("cannot initialize filesystem jobs"))?;
@@ -1103,7 +1135,7 @@ fn run(
                     }
                     Command::Snapshot(tid, context, stop_timeout_ms) => {
                         let mut state = state.borrow_mut();
-                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid, context, stop_timeout_ms, 64)
+                        state.target.as_mut().ok_or_else(no_target)?.snapshot(tid, context, stop_timeout_ms, if text_output { 13 } else { 64 }, text_output.then_some(32))
                     }
                     Command::Input(handler, result) => {
                         if state.borrow_mut().waiting.remove(&handler).is_none() { return Err(error("input handler is not waiting")); }
@@ -1163,7 +1195,10 @@ fn run(
                         };
                         Ok(json!({"script_id":id,"status":status}))
                     }
-                    Command::Processes(args) => processes(args),
+                    Command::Processes(mut args) => {
+                        if text_output { args.limit = Some(args.limit.unwrap_or(128).min(128)); }
+                        processes(args)
+                    },
                     Command::SyscallTable(id, name) => Ok(syscalls::query(id, name.as_deref())),
                     Command::SetForkPolicy(mode) => state.borrow_mut().operation("setForkPolicy", json!({"mode":mode})),
                     Command::Result(result) => result,
@@ -1620,6 +1655,7 @@ fn processes(args: crate::rpc::ProcessListRequest) -> Result<Value> {
             };
             row.insert((*field).into(), value);
         }
+        let row = Arc::new(row);
         if args.threads {
             let Ok(tasks) = fs::read_dir(path.join("task")) else {
                 continue;
@@ -1632,11 +1668,7 @@ fn processes(args: crate::rpc::ProcessListRequest) -> Result<Value> {
                 else {
                     continue;
                 };
-                let mut thread = row.clone();
-                if fields.contains(&"tid") {
-                    thread.insert("tid".into(), json!(tid));
-                }
-                rows.push((pid, tid, thread));
+                rows.push((pid, tid, row.clone()));
             }
         } else {
             rows.push((pid, pid, row));
@@ -1646,12 +1678,19 @@ fn processes(args: crate::rpc::ProcessListRequest) -> Result<Value> {
     let offset = args.offset as usize;
     let limit = args.limit.map_or(usize::MAX, |limit| limit as usize);
     let next = offset.saturating_add(limit);
-    let next_offset = (next < rows.len()).then_some(next);
+    let total = rows.len();
+    let next_offset = (next < total).then_some(next);
     let items: Vec<_> = rows
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|(_, _, row)| row)
+        .map(|(_, tid, row)| {
+            let mut row = (*row).clone();
+            if fields.contains(&"tid") {
+                row.insert("tid".into(), json!(tid));
+            }
+            row
+        })
         .collect();
-    Ok(json!({"items":items,"next_offset":next_offset}))
+    Ok(json!({"items":items,"total":total,"offset":offset,"next_offset":next_offset}))
 }

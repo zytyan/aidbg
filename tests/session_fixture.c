@@ -27,6 +27,15 @@ struct Packet {
     unsigned flag : 3;
 };
 
+struct Header {
+    uint32_t type;
+    uint32_t length;
+    void *data;
+};
+
+static uint32_t context_data[2] = {1, 2};
+struct Header global_context = {42, 2, context_data};
+
 struct Node nodes[] = {{&nodes[1], 12}, {NULL, 29}};
 struct Packet packet = {3, {.word = 0x12345678}, nodes, {4, 9, 15}, 5};
 volatile uint32_t watched = 33;

@@ -74,8 +74,9 @@ export interface SymbolInfo {
     readonly module?: string;
 }
 
-export interface AddressSymbol {
+export interface SymbolMatch {
     readonly name: string;
+    /** Start address of the matched symbol. */
     readonly address: bigint;
     readonly offset: bigint;
     readonly module?: { readonly path: string } | null;
@@ -83,6 +84,20 @@ export interface AddressSymbol {
     readonly section?: string | null;
     readonly match: "exact" | "within" | "nearest";
 }
+
+export interface ModuleAddressMatch {
+    /** The address passed to symbolAt. */
+    readonly address: bigint;
+    readonly module: { readonly path: string };
+    /** Relative to the ELF load instance base when the layout is known. */
+    readonly offset?: bigint;
+    readonly name?: never;
+    readonly kind?: never;
+    readonly section?: never;
+    readonly match: "module";
+}
+
+export type AddressSymbol = SymbolMatch | ModuleAddressMatch;
 
 export interface Instruction {
     readonly address: bigint;
@@ -668,6 +683,7 @@ export interface Debugger {
 
     /** 返回唯一匹配的运行时地址。无匹配或存在多个地址时返回 null。 */
     lineToAddr(file: string, line: number): bigint | null;
+    /** Resolve a symbol or its containing module. Returns null when neither can be identified. */
     symbolAt(addr: bigint): AddressSymbol | null;
     substitutePath(from: string, to: string): void;
     addrToLine(addr: bigint): { file: string; line: number } | null;
@@ -834,11 +850,41 @@ export interface Format {
     gdb(command: string): Promise<void>;
 }
 
+/**
+ * Bounded, best-effort presentation. Limits mark truncation inline. Unreadable
+ * memory and cycles are marked at the affected branch. Invalid options and
+ * invalid debugger sessions throw. Unions show overlapping members without
+ * automatically following pointers anywhere in their members.
+ */
 export interface ValueFormatOptions {
+    /** Spaces per level. Default 2, integer 0–32. */
     indent?: number;
+    /** Aggregate nesting limit independent of pointer hops. Default 4, integer 0–32. */
     maxDepth?: number;
+    /** Elements per array or pointer sequence. Default 32, integer 0–4096. */
     maxElements?: number;
+    /** Fields per structure or union. Default 32, integer 0–4096. */
+    maxFields?: number;
+    /** UTF-8 bytes displayed per string. Default 256, integer 0–4096. */
     maxStringLength?: number;
+    /** Global node budget, shared across branches. Default 200, integer 0–4096. */
+    maxNodes?: number;
+    /**
+     * Ordinary pointer dereferences per path. Default 2, integer 0–32.
+     * Zero leaves ordinary pointer addresses as-is and retains string and
+     * known-length sequence formatting. maxDepth still limits expansion.
+     */
+    deref?: number;
+}
+
+export interface ValueToJSOptions {
+    /**
+     * Address-valued pointers use bigint by default or hexadecimal strings
+     * with "string". Applies recursively. Null pointers remain null, and
+     * string and known-length pointers retain their existing conversions.
+     * Bigint integers and cycles may still prevent JSON.stringify.
+     */
+    pointer?: "bigint" | "string";
 }
 
 export type PlainValue = number | bigint | boolean | string | null | PlainValue[] | { [key: string]: PlainValue };
@@ -944,8 +990,11 @@ export declare namespace Value {
         $tid: number | undefined;
 
         $asType<T extends Type.Base<unknown>>(type: T): Infer<T>;
+        /** Bounded, best-effort presentation for reading. */
         $format(options?: ValueFormatOptions): string;
-        $toJS(): PlainValue;
+        /** Strict conversion to ordinary JavaScript data for computation. */
+        $toJS(options?: ValueToJSOptions): PlainValue;
+        /** Serialize the Value to JSON text. */
         $toJson(): string;
         $dumpString(): string;
     }
@@ -1149,7 +1198,11 @@ export interface TypeSystem {
     /** 为同一类型描述符注册结构化日志和调试值的格式化函数。 */
     setPrettyPrinter<V>(type: Type.Base<V>, printer: ((value: V) => string | undefined) | null): void;
     findTypes(query: string, options?: { exact?: boolean; module?: string }): readonly { readonly name: string; readonly module: string; readonly size: number | null }[];
-    /** 查询当前回调线程（或进程主线程）顶层栈帧中变量的 DWARF 类型。找不到时返回 undefined。 */
+    /**
+     * Get a variable type in the callback thread or main thread’s top frame.
+     * Missing DWARF, no match, and exhausted lookups return undefined. An
+     * exhausted lookup also emits a diagnostic to the debugger output.
+     */
     typeOfVar<const S extends string>(name: S & LiteralString<S>): Type.Base<unknown> | undefined;
     typeOfVar(name: string): Type.Base<unknown> | undefined;
 }

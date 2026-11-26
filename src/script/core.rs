@@ -1313,16 +1313,38 @@ impl Target {
     }
 
     pub(super) fn symbol_at(&self, address: u64) -> Option<Value> {
-        let row = self.address_symbol(address)?;
-        let offset = row["offset"].as_u64()?;
-        let module = self
-            .mapped_file(address)
-            .map(|(module, _)| module.identity(None));
-        Some(json!({
-            "name": row["name"], "address": hex(address.checked_sub(offset)?),
-            "offset": hex(offset), "module": module,
-            "match": if offset == 0 { "exact" } else { "within" },
-        }))
+        let mapped = self.mapped_file(address);
+        let mut module = mapped.map(|(module, _)| json!(module.identity(None)));
+        let mut offset = None;
+        if let Some(image) = self.image_at(address)
+            && let Some(link) = image.link(address)
+            && let Ok(primary) = object::File::parse(image.bytes())
+        {
+            if module.is_none() {
+                module = self.executable.as_ref().map(|exe| json!(exe));
+            }
+            let debug = image
+                .debug(self)
+                .and_then(|debug| object::File::parse(&*debug.bytes).ok());
+            if let Some(row) = crate::symbols::image_symbol_match(
+                &primary,
+                debug.as_ref(),
+                link,
+                address,
+                module.as_ref(),
+            ) {
+                return Some(row);
+            }
+            let base = crate::modules::load_segments(&primary)
+                .map(|segment| segment.address & !(self.file_page - 1))
+                .min();
+            offset = base.and_then(|base| link.checked_sub(base)).map(hex);
+        }
+        Some(crate::symbols::module_symbol_match(
+            &hex(address),
+            module.as_ref()?,
+            offset.as_deref(),
+        ))
     }
 
     fn address_symbol(&self, address: u64) -> Option<Value> {

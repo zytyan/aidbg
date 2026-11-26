@@ -121,55 +121,43 @@ impl offline::DwarfImage {
         link_pc: Option<u64>,
         deadline: Instant,
     ) -> Result<Option<Graph>> {
-        let dwarf = self.data.borrow();
-        let mut units = dwarf.units();
-        let mut budget = ScanBudget::foreground(deadline);
-        let mut best = None;
-        while let Some(header) = units.next()? {
-            let unit = dwarf.unit(header)?;
-            let Some(candidate) = find_variable(
-                &dwarf,
-                &unit,
-                target,
-                link_pc,
-                &mut budget,
-                None,
-                None,
-                false,
-                None,
-            )?
-            else {
-                continue;
-            };
-            if best
-                .as_ref()
-                .is_some_and(|(priority, _)| *priority > candidate.priority)
-            {
-                continue;
-            }
-            let entry = unit.entry(candidate.offset)?;
-            let Ok(offset) = typedef_target(&unit, &entry) else {
-                continue;
-            };
-            let mut builder = Builder {
-                dwarf: &dwarf,
-                unit: &unit,
-                nodes: vec![Node::Void],
-                seen: BTreeMap::new(),
-                deadline,
-            };
-            let root = builder.entry(offset, 0)?;
-            best = Some((
-                candidate.priority,
-                Graph {
-                    root,
-                    identity: graph_identity(self.data.id(), &builder, root),
-                    nodes: builder.nodes,
-                    module: self.path.clone(),
-                },
+        if Instant::now() >= deadline {
+            return Err(failure(
+                "limit_reached",
+                "DWARF variable lookup exceeded its capture budget",
             ));
         }
-        Ok(best.map(|(_, graph)| graph))
+        self.data.schedule();
+        let dwarf = self.data.borrow();
+        self.data
+            .lookup(
+                &dwarf,
+                target,
+                link_pc,
+                None,
+                deadline,
+                |dwarf, unit, candidate| {
+                    let entry = unit.entry(candidate.offset)?;
+                    let Ok(offset) = typedef_target(unit, &entry) else {
+                        return Ok(None);
+                    };
+                    let mut builder = Builder {
+                        dwarf,
+                        unit,
+                        nodes: vec![Node::Void],
+                        seen: BTreeMap::new(),
+                        deadline,
+                    };
+                    let root = builder.entry(offset, 0)?;
+                    Ok(Some(Graph {
+                        root,
+                        identity: graph_identity(self.data.id(), &builder, root),
+                        nodes: builder.nodes,
+                        module: self.path.clone(),
+                    }))
+                },
+            )?
+            .map_or(Ok(None), |(_, result)| result)
     }
 
     pub(crate) fn type_graphs(
@@ -284,7 +272,10 @@ struct Builder<'a, 'b> {
 impl Builder<'_, '_> {
     fn entry(&mut self, offset: Offset, depth: usize) -> Result<usize> {
         if depth > 32 || self.nodes.len() >= 512 || Instant::now() >= self.deadline {
-            return Err(error("DWARF type graph is too large"));
+            return Err(failure(
+                "limit_reached",
+                "DWARF type graph exceeded its capture budget",
+            ));
         }
         let entry = underlying(self.unit, offset)?;
         let offset = entry.offset();

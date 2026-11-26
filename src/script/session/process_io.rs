@@ -24,6 +24,7 @@ struct Chunk {
 struct Cursor {
     next: u64,
     truncated: bool,
+    dropped_bytes: usize,
 }
 
 struct Reader {
@@ -118,7 +119,18 @@ impl ProcessIo {
                     Err(err) => return Err(err.into()),
                 };
                 if !text.is_empty() {
-                    self.push(stream, text);
+                    let mut remaining = text.as_str();
+                    while !remaining.is_empty() {
+                        let end = remaining.floor_char_boundary(4096.min(remaining.len()));
+                        let end = if end < remaining.len() {
+                            remaining[..end].rfind('\n').map_or(end, |last| last + 1)
+                        } else {
+                            end
+                        };
+                        let (chunk, tail) = remaining.split_at(end);
+                        self.push(stream, chunk.to_owned());
+                        remaining = tail;
+                    }
                 }
             }
             if !progress {
@@ -136,7 +148,10 @@ impl ProcessIo {
             self.size -= old.text.len();
             for (index, cursor) in self.cursors.iter_mut().enumerate() {
                 if cursor.next <= old.sequence {
-                    cursor.truncated |= index >= 2 || index == old.stream;
+                    if index >= 2 || index == old.stream {
+                        cursor.truncated = true;
+                        cursor.dropped_bytes += old.text.len();
+                    }
                     cursor.next = old.sequence + 1;
                 }
             }
@@ -196,6 +211,7 @@ impl ProcessIo {
             }
         }
         cursor.next = self.next;
+        cursor.dropped_bytes = 0;
         let eof = if index < 2 {
             self.readers[index].file.is_none()
         } else {
@@ -204,20 +220,21 @@ impl ProcessIo {
         json!({"text":text,"eof":eof,"truncated":std::mem::take(&mut cursor.truncated)})
     }
 
-    pub fn mcp_output(&self, ordered: bool) -> (Value, u64) {
-        self.output_at(3, ordered)
+    pub fn mcp_output(&self, ordered: bool, budget: usize) -> (Value, u64) {
+        self.output_at(3, ordered, budget)
     }
 
     pub(super) fn wait_output(&mut self) -> (Value, bool) {
-        let (mut result, next) = self.output_at(4, false);
+        let (mut result, next) = self.output_at(4, false, TICK_LIMIT);
         self.cursors[4].next = next;
         self.cursors[4].truncated = false;
+        self.cursors[4].dropped_bytes = 0;
         result["eof"] =
             json!(next == self.next && self.readers.iter().all(|reader| reader.file.is_none()));
         (result, next == self.next)
     }
 
-    fn output_at(&self, index: usize, ordered: bool) -> (Value, u64) {
+    fn output_at(&self, index: usize, ordered: bool, budget: usize) -> (Value, u64) {
         let cursor = &self.cursors[index];
         let mut parts = [String::new(), String::new()];
         let mut groups: Vec<(&str, String)> = Vec::new();
@@ -228,7 +245,7 @@ impl ProcessIo {
             .iter()
             .filter(|chunk| chunk.sequence >= cursor.next)
         {
-            if size + chunk.text.len() > TICK_LIMIT {
+            if size + chunk.text.len() > budget {
                 break;
             }
             if ordered {
@@ -245,7 +262,14 @@ impl ProcessIo {
             next = chunk.sequence + 1;
         }
         let result = if ordered {
-            json!({"chunks":groups,"truncated":cursor.truncated,"more":next < self.next})
+            let more_bytes: usize = self
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.sequence >= next)
+                .map(|chunk| chunk.text.len())
+                .sum();
+            json!({"chunks":groups,"truncated":cursor.truncated,"dropped_bytes":cursor.dropped_bytes,
+                "more":next < self.next,"more_bytes":more_bytes})
         } else {
             json!({"stdout":parts[0],"stderr":parts[1],"truncated":cursor.truncated})
         };
@@ -256,6 +280,39 @@ impl ProcessIo {
         self.cursors[3] = Cursor {
             next,
             truncated: false,
+            dropped_bytes: 0,
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_batches_distinguish_buffered_and_evicted_output() {
+        let mut process = ProcessIo {
+            stdin: None,
+            readers: std::array::from_fn(|_| Reader {
+                file: None,
+                incomplete: Vec::new(),
+            }),
+            chunks: VecDeque::new(),
+            cursors: std::array::from_fn(|_| Cursor::default()),
+            next: 0,
+            size: 0,
+        };
+        for i in 0..=LIMIT / 4096 {
+            process.push(i % 2, "é".repeat(2048));
+        }
+        let (batch, next) = process.mcp_output(true, 8192);
+        assert_eq!(batch["chunks"][0][0], "stderr");
+        assert_eq!(batch["chunks"][1][0], "stdout");
+        assert_eq!(batch["dropped_bytes"], 4096);
+        assert_eq!(batch["more_bytes"], LIMIT - 8192);
+        process.acknowledge(next);
+        let (batch, _) = process.mcp_output(true, 8192);
+        assert_eq!(batch["dropped_bytes"], 0);
+        assert_eq!(batch["more_bytes"], LIMIT - 16384);
     }
 }

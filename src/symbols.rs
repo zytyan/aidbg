@@ -1223,7 +1223,13 @@ impl ResolvedAddress {
     }
 
     pub(crate) fn symbol_at(&self) -> Option<serde_json::Value> {
-        let symbol = self.symbol.as_ref().or(self.preceding_symbol.as_ref())?;
+        let Some(symbol) = self.symbol.as_ref().or(self.preceding_symbol.as_ref()) else {
+            return Some(module_symbol_match(
+                &self.runtime_address,
+                self.module.as_ref()?,
+                self.module_offset.as_deref(),
+            ));
+        };
         let parse = |address: &str| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok();
         let offset =
             parse(self.elf_address.as_deref()?)?.checked_sub(parse(&symbol.elf_address)?)?;
@@ -1251,6 +1257,80 @@ impl ResolvedAddress {
 
 pub fn resolve(pid: i32, address: u64, overrides: &[OverrideRule]) -> Result<ResolvedAddress> {
     resolve_address(pid, address, overrides, false)
+}
+
+fn address_section<'data, 'file>(
+    image: &'file object::File<'data>,
+    address: u64,
+) -> Option<object::Section<'data, 'file>> {
+    image.sections().find(|section| {
+        section.kind() != object::SectionKind::Metadata
+            && section.address() != 0
+            && address
+                .checked_sub(section.address())
+                .is_some_and(|delta| delta < section.size())
+    })
+}
+
+pub(crate) fn image_symbol_match(
+    image: &object::File<'_>,
+    debug: Option<&object::File<'_>>,
+    link: u64,
+    address: u64,
+    module: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let section = address_section(image, link);
+    let mut best = None;
+    for (symbol, _, _) in symbol_entries(image, debug) {
+        if !has_elf_address(&symbol) {
+            continue;
+        }
+        let Ok(name) = symbol.name() else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let Some(offset) = link.checked_sub(symbol.address()) else {
+            continue;
+        };
+        let kind = symbol.kind();
+        if section
+            .as_ref()
+            .is_some_and(|section| section.kind() == object::SectionKind::Text)
+            && kind != SymbolKind::Text
+        {
+            continue;
+        }
+        let within = offset < symbol.size().max(1);
+        if !within
+            && !(matches!(kind, SymbolKind::Text | SymbolKind::Data | SymbolKind::Tls)
+                && section
+                    .as_ref()
+                    .is_some_and(|section| symbol.address() >= section.address()))
+        {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(score, _, _)| (!within, offset) < *score)
+        {
+            best = Some(((!within, offset), name, kind));
+        }
+    }
+    let ((nearest, offset), name, kind) = best?;
+    Some(serde_json::json!({
+        "name":name,"address":hex(address.checked_sub(offset)?),"offset":hex(offset),
+        "module":module,"kind":format!("{kind:?}").to_lowercase(),
+        "section":section.and_then(|section| section.name().ok()),
+        "match":if nearest { "nearest" } else if offset == 0 { "exact" } else { "within" }
+    }))
+}
+
+pub(crate) fn module_symbol_match(
+    address: &str,
+    module: &impl serde::Serialize,
+    offset: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({"address":address,"module":module,"offset":offset,"match":"module"})
 }
 
 pub(crate) fn symbol_at(pid: i32, address: u64) -> Result<Option<serde_json::Value>> {
@@ -1349,17 +1429,7 @@ fn resolve_address(
             .into_iter()
             .map(stripped_issue),
     );
-    let section = lookup_only
-        .then(|| {
-            image.sections().find(|section| {
-                section.kind() != object::SectionKind::Metadata
-                    && section.address() != 0
-                    && link
-                        .checked_sub(section.address())
-                        .is_some_and(|delta| delta < section.size())
-            })
-        })
-        .flatten();
+    let section = lookup_only.then(|| address_section(&image, link)).flatten();
     result.section = section
         .as_ref()
         .and_then(|section| section.name().ok())

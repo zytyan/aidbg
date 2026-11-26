@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 import select
 import signal
+import struct
 import subprocess
 import tempfile
 import time
@@ -24,7 +25,7 @@ class Client:
         self.rpc("initialize", protocolVersion="2024-11-05", capabilities={},
                  clientInfo={"name": "aidbg integration test", "version": "1"})
         self.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        docs = self.rpc("tools/call", name="docs", arguments={"output_format": "structured"})["structuredContent"]
+        docs = self.rpc("tools/call", name="docs", arguments={"section": "all", "output_format": "structured"})["structuredContent"]
         debugger_types = self.rpc("resources/read", uri=docs["full_api"])["contents"][0]["text"]
         node_types = self.rpc("resources/read", uri="aidbg://node.d.ts")["contents"][0]["text"]
         assert debugger_types.replace("export declare ", "export ") in docs["declarations"]
@@ -32,7 +33,19 @@ class Client:
         assert 'declare const AbortController: typeof import("aidbg").AbortController;' in docs["declarations"]
         assert node_types == docs["modules"]
         text = self.rpc("tools/call", name="docs", arguments={})["content"][0]["text"]
-        assert docs["declarations"].strip() in text and node_types.strip() in text
+        assert "Quick Start" in text and len(text) * 4 < len(docs["declarations"]), text
+        self.quick_start = text
+        full = self.rpc("tools/call", name="docs", arguments={"section": "all"})["content"][0]["text"]
+        assert docs["declarations"].strip() in full and node_types.strip() in full
+        for section, declaration in {
+            "debugger": "interface Debugger", "types": "interface TypeSystem",
+            "value": "namespace Value", "format": "interface Format",
+            "events": "type StopEvent", "breakpoints": "interface BreakpointOptions",
+        }.items():
+            docs_section = self.rpc("tools/call", name="docs", arguments={"section": section})
+            assert declaration in docs_section["content"][0]["text"], docs_section
+        unknown = self.rpc("tools/call", name="docs", arguments={"section": "invalid"})
+        assert unknown["isError"] and "Unknown docs section" in unknown["content"][0]["text"], unknown
         disconnected = self.rpc("tools/call", name="ps", arguments={"output_format": "structured"})
         assert disconnected["isError"] and "connect" in disconnected["structuredContent"]["error"], disconnected
         connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token, "output_format": "structured"})
@@ -211,7 +224,9 @@ def validate_text_output(client, fixture, owned):
     assert "68 more elements" in limited and "truncated string" in limited, limited
     deep = script('let row: unknown = 0; for (let i=0; i<10; i++) row = {child:row}; console.log(row);')
     assert "truncated at depth limit" in deep, deep
-    assert script('console.log("x".repeat(1100000));') == "* Script output was dropped from its buffer."
+    huge = script('console.log("é".repeat(1100000));')
+    assert "Output truncated for display" in huge and "dropped" not in huge, huge[-200:]
+    assert len(huge.encode()) <= 32768
 
     batch = script('console.log("first chunk " + "x".repeat(40000)); console.log("second chunk " + "y".repeat(40000));')
     assert "first chunk" in batch and "More script output is buffered" in batch, batch[:200]
@@ -265,13 +280,16 @@ def validate_text_output(client, fixture, owned):
     running = tool("run", path=fixture, arg=["fault"], pause=True)
     pid = int(running.split("Started process ", 1)[1].split(":", 1)[0])
     owned.add(pid)
-    waiting = script("const event = await dbg.continueForStop(dbg.pid, {timeoutMs: 5000}); if (event.kind !== 'signal') throw new Error(event.kind);", wait_ms=0)
-    deadline = time.monotonic() + 3
-    stopped = waiting
-    while "SIGSEGV" not in stopped:
-        assert time.monotonic() < deadline, stopped
-        stopped += tool("syscall_table", name="read")
-    assert "Fault address:" in stopped and "Target PID" in stopped, stopped
+    stopped = script("""
+        fmt.print("火".repeat(40000));
+        console.log("é".repeat(40000));
+        const event = await dbg.continueForStop(dbg.pid, {timeoutMs: 5000});
+        if (event.kind !== "signal") throw new Error(event.kind);
+    """, wait_ms=3000)
+    assert len(stopped.encode()) <= 32768 and "Output truncated for display" in stopped, stopped[-200:]
+    assert "SIGSEGV" in stopped and "Fault address:" in stopped, stopped[-500:]
+    remainder = tool("syscall_table", name="read")
+    assert "é" in remainder and "dropped" not in remainder, remainder[-200:]
     assert "SIGSEGV" in tool("status")
     assert script("await dbg.kill();") == f"Killed process {pid}."
     owned.remove(pid)
@@ -294,6 +312,33 @@ def validate_text_output(client, fixture, owned):
     assert "[event " in status and "breakpoint #" in tool("status"), status
     killed = script("await dbg.kill();")
     assert f"Killed process {pid}." in killed, killed
+    owned.remove(pid)
+
+
+def validate_quick_start(client, fixture, owned):
+    launched = client.tool("run", pause=True, path=fixture, arg=["child"])
+    pid = launched["result"]["pid"]
+    owned.add(pid)
+    for i, snippet in enumerate(re.findall(r"```ts\n(.*?)```", client.quick_start, re.S)):
+        reply = client.tool("script_run", src=snippet, wait_ms=6000)
+        assert reply["result"]["status"] == "completed", (snippet, reply)
+        if i == 2:
+            assert logs(reply)[0][0]["kind"] == "breakpoint", reply
+    for command in ("bt", "thread apply all bt", "info registers", "info locals", "info args",
+                    "info symbol main", "x/16xb main", "disassemble main"):
+        reply = client.tool("gdb", command=command)
+        assert reply["result"]["status"] == "completed", (command, reply)
+    inline = re.findall(r"`(await dbg\.\w+\([^`]*?\))`", client.quick_start)
+    trace, detach, kill = inline
+    client.script(kill + ";")
+    owned.remove(pid)
+
+    pid = client.tool("run", pause=True, path=fixture, arg=["child"])["result"]["pid"]
+    owned.add(pid)
+    reply = client.tool("script_run", src="console.log(" + trace + ");", wait_ms=6000)
+    assert reply["result"]["status"] == "completed" and logs(reply)[0][0]["limitReached"], reply
+    reply = client.tool("script_run", src=detach + ";", wait_ms=6000)
+    assert reply["result"]["status"] == "completed", reply
     owned.remove(pid)
 
 
@@ -580,13 +625,23 @@ def validate_stripped_cfi(client, binary, debug_image, owned):
         assert not any(row["value"]["kind"] == "script_error" for row in final["output"]), final
         output += logs(final)
     assert output == [[True, "cfi", True, True]], (result, output)
+    no_dwarf = client.script("""
+        const address = (await dbg.getSymbol("fixture_stop"))!.address;
+        const moduleStart = dbg.mappings().find(row => row.offset === 0n &&
+            row.name.endsWith("/stripped-fixture"))!.start;
+        const hit = dbg.symbolAt(moduleStart);
+        console.log(m.typeOfVar("spec03_packet") === undefined,
+                    hit?.match, hit?.offset, hit?.name, dbg.symbolAt(address)?.match);
+    """)
+    assert logs(no_dwarf) == [[True, "module", "0", None, "exact"]], no_dwarf
     attached = client.script(f"""
         const address = (await dbg.getSymbol("fixture_stop"))!.address;
         dbg.attachDwarf({json.dumps(debug_image)});
         console.log(dbg.addrToLine(address)?.file.endsWith("session_fixture.c"),
-            m.findTypes("Spec03Packet").some(row => row.module.endsWith("manual.debug")));
+            m.findTypes("Spec03Packet").some(row => row.module.endsWith("manual.debug")),
+            m.typeOfVar("spec03_packet") !== undefined);
     """)
-    assert logs(attached) == [[True, True]], attached
+    assert logs(attached) == [[True, True, True]], attached
     dwarf = client.script("""
         const Packet = m.fromDwarf("struct Spec03Packet");
         const packet = Packet.at((await dbg.getSymbol("spec03_packet"))!.address);
@@ -610,6 +665,55 @@ def validate_stripped_cfi(client, binary, debug_image, owned):
     client.script("await dbg.kill();")
     owned.remove(pid)
 
+
+def validate_automatic_dwarf(client, binaries, debug_image, directory, owned):
+    with_symtab = directory / "symtab-only"
+    with_debuglink = directory / "linked-debug-fixture"
+    subprocess.run(["objcopy", "--strip-debug", binaries[0], with_symtab], check=True)
+    companion = directory / "companion.debug"
+    companion.write_bytes(Path(debug_image).read_bytes())
+    subprocess.run(["objcopy", f"--add-gnu-debuglink={companion}", binaries[1], with_debuglink], check=True)
+    for path, expected in [(with_symtab, False), (with_debuglink, True)]:
+        pid = client.tool("run", pause=True, path=str(path), arg=["child"])["result"]["pid"]
+        owned.add(pid)
+        result = client.tool("script_run", wait_ms=6000, src="""
+            dbg.softwareBreakpoint("fixture_stop");
+            const stop = await dbg.continueForStop();
+            if (stop.kind !== "breakpoint") throw Error(stop.kind);
+            console.log(m.typeOfVar("spec03_packet") !== undefined);
+        """)
+        assert result["result"]["status"] == "completed" and logs(result) == [[expected]], result
+        assert not any(row["value"]["kind"] == "diagnostic" for row in result["output"]), result
+        client.script("await dbg.kill();")
+        owned.remove(pid)
+
+def validate_variable_query_budget(client, binary, directory, owned):
+    # Both the foreground scan and the background index have DIE budgets.
+    # This DWARF4 unit contains more DIEs than either permits.
+    abbrev = directory / "lookup-abbrev"
+    info = directory / "lookup-info"
+    large = directory / "lookup-budget-fixture"
+    abbrev.write_bytes(bytes([1, 0x11, 1, 0, 0, 2, 0x24, 0, 0, 0, 0]))
+    unit = struct.pack("<HIB", 4, 0, struct.calcsize("P")) + b"\x01" + b"\x02" * 2_000_001 + b"\0"
+    info.write_bytes(struct.pack("<I", len(unit)) + unit)
+    subprocess.run(["objcopy", "--add-section", f".debug_info={info}",
+                    "--add-section", f".debug_abbrev={abbrev}", binary, large], check=True)
+    pid = client.tool("run", pause=True, path=str(large), arg=["child"])["result"]["pid"]
+    owned.add(pid)
+    result = client.tool("script_run", wait_ms=6000, src="""
+        dbg.softwareBreakpoint("fixture_stop");
+        const stop = await dbg.continueForStop();
+        if (stop.kind !== "breakpoint") throw Error(stop.kind);
+        const start = Date.now();
+        console.log(m.typeOfVar("absent") === undefined, Date.now() - start, "continued");
+    """)
+    assert result["result"]["status"] == "completed", result
+    assert logs(result)[0][0] is True and logs(result)[0][2] == "continued", result
+    assert any(row["value"]["kind"] == "diagnostic" and "budget" in row["value"]["text"]
+               for row in result["output"]), result
+    print(f"typeOfVar foreground budget path: {logs(result)[0][1]} ms", flush=True)
+    client.script("await dbg.kill();")
+    owned.remove(pid)
 
 def validate_xref(client):
     reply = client.script("""
@@ -1207,12 +1311,16 @@ def main():
                 client = Client(client_exe, socket, token)
                 validate_text_output(client, fixtures[0], owned)
                 validate_types_and_input(client)
+                validate_quick_start(client, fixtures[0], owned)
                 validate_presentation(client, fixtures[0], owned)
                 validate_session_extensions(client, fixtures[0], owned)
                 validate_inline_frames(client, fixtures[0], owned)
                 validate_spec03(client, fixtures[0], owned)
                 if args.stripped and args.debug_image:
+                    validate_automatic_dwarf(client, (fixtures[0], os.path.abspath(args.stripped)),
+                                             os.path.abspath(args.debug_image), directory, owned)
                     validate_stripped_cfi(client, os.path.abspath(args.stripped), os.path.abspath(args.debug_image), owned)
+                    validate_variable_query_budget(client, os.path.abspath(args.stripped), directory, owned)
                 validate_event_queue(client, fixtures[0], owned)
                 validate_next_hit(client, fixtures[0], owned)
                 validate_fault_and_kill(client, fixtures[0], owned)

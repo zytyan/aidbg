@@ -489,6 +489,89 @@ pub(super) fn live_image(
 mod tests {
     use super::*;
 
+    fn variable_fixture(padding: usize) -> Result<offline::DwarfImage> {
+        // DWARF4 unit containing optional type DIEs, one global and its type.
+        const ABBREV: &[u8] = &[
+            1, 0x11, 1, 0, 0, // compile unit with children
+            2, 0x24, 0, 0, 0, // padding DIE
+            3, 0x34, 0, 0x03, 0x08, 0x49, 0x13, 0, 0, // variable: name and type
+            4, 0x24, 0, 0x3e, 0x0b, 0x0b, 0x0b, 0, 0, // base type: encoding and size
+            0,
+        ];
+        let mut info = vec![0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1];
+        info.resize(info.len() + padding, 2);
+        info.extend_from_slice(b"\x03global_context\0");
+        let type_offset = (info.len() + 4) as u32;
+        info.extend(type_offset.to_le_bytes());
+        info.extend([4, 7, 4, 0]);
+        let unit_size = (info.len() - 4) as u32;
+        info[..4].copy_from_slice(&unit_size.to_le_bytes());
+        let sections = DwarfSections::load(|section| -> Result<_> {
+            Ok(match section {
+                gimli::SectionId::DebugInfo => info.clone(),
+                gimli::SectionId::DebugAbbrev => ABBREV.to_vec(),
+                _ => vec![],
+            })
+        })?;
+        Ok(offline::DwarfImage {
+            bias: 0,
+            path: PathBuf::from("variable-fixture"),
+            data: Arc::new(Data {
+                id: OnceLock::new(),
+                sections,
+                index: OnceLock::new(),
+                index_queued: AtomicBool::new(true),
+                sources: source_cache::Sources::default(),
+                lines: Mutex::default(),
+                inline: Mutex::default(),
+                visible: Mutex::default(),
+                section_bytes: info.len() + ABBREV.len(),
+            }),
+        })
+    }
+
+    #[test]
+    fn variable_type_lookup_uses_the_index_and_distinguishes_limits_from_misses() -> Result<()> {
+        let fixture = variable_fixture(120_000)?;
+        let start = Instant::now();
+        let cold =
+            fixture.variable_type_graph("global_context", None, start + Duration::from_secs(2))?;
+        let cold_elapsed = start.elapsed();
+        assert!(cold.is_some());
+
+        let index = Index::build(&fixture.data.borrow())?;
+        assert!(fixture.data.index.set(Some(index)).is_ok());
+        let start = Instant::now();
+        for _ in 0..100 {
+            assert!(
+                fixture.variable_type_graph(
+                    "global_context",
+                    None,
+                    start + Duration::from_secs(2)
+                )? == cold
+            );
+        }
+        eprintln!(
+            "typeOfVar on a synthetic 120k-DIE image: unindexed {cold_elapsed:?}, indexed mean {:?}",
+            start.elapsed() / 100
+        );
+        assert!(
+            fixture
+                .variable_type_graph("absent", None, start + Duration::from_secs(2))?
+                .is_none()
+        );
+
+        let large = variable_fixture(MAX_DIES)?;
+        let stopped =
+            large.variable_type_graph("absent", None, Instant::now() + Duration::from_secs(2));
+        assert!(
+            stopped
+                .err()
+                .is_some_and(|err| variable_query_limited(err.as_ref()))
+        );
+        Ok(())
+    }
+
     #[test]
     fn source_cache_preserves_hits_and_does_not_store_failed_lookups() -> Result<()> {
         let counters = ["test_hit", "test_miss"];
