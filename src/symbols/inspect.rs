@@ -102,6 +102,24 @@ pub(crate) fn discover_stopped(
     })
 }
 
+pub(crate) fn live_source_images(
+    root: &Path,
+    module: &modules::Module,
+    executable: Option<&fs::Metadata>,
+) -> Result<Vec<offline::DwarfImage>> {
+    let image = cache::live_image(root, module, executable)?;
+    Ok(image
+        .separate
+        .iter()
+        .chain(&image.primary)
+        .map(|data| offline::DwarfImage {
+            data: data.clone(),
+            bias: 0,
+            path: module.path(),
+        })
+        .collect())
+}
+
 pub(crate) fn live_data_at(
     root: &Path,
     memory: &dyn crate::unwind::UnwindMemory,

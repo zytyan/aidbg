@@ -956,7 +956,13 @@ impl Live {
             |_, registers| frame_registers.push(registers),
         );
         stack.frames.truncate(limit);
-        loaded.images.symbolize_until(&mut stack, deadline);
+        loaded.images.symbolize_until(
+            &mut stack,
+            deadline,
+            &self.root,
+            &loaded.modules,
+            loaded.executable.as_ref(),
+        );
         stack
             .frames
             .into_iter()

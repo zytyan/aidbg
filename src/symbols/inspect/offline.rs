@@ -62,13 +62,11 @@ impl DwarfImage {
     }
 
     pub fn line(&self, pc: u64) -> Result<Option<super::super::Line>> {
-        let dwarf = self.data.borrow();
-        super::super::line_for_pc(&dwarf, pc)
+        self.data.line(pc)
     }
 
     pub(crate) fn inline_frames(&self, pc: u64, deadline: Instant) -> Result<Vec<InlineFrame>> {
-        let dwarf = self.data.borrow();
-        super::inline_frames(&dwarf, pc, deadline)
+        self.data.inline_frames(pc, deadline)
     }
 
     pub(crate) fn line_addresses(&self, file: &std::path::Path, line: u64) -> Result<Vec<u64>> {

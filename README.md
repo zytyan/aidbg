@@ -47,6 +47,8 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 
 `value.$format()` 和模板插值使用有界输出。`Type.withFormatter()` 返回带自定义格式化函数的新类型。`$asType(type)` 创建同地址视图。`$toJS()` 保留已知视图的循环关系，把空指针转换为 `null`，将无效 UTF-8 字节替换为 U+FFFD。读取失败、缺少终止符或超出转换预算会抛出错误。`fmt.diff(before, after)` 可比较包含循环引用的普通数据。
 
+栈回溯复用已验证调试镜像的 DWARF 数据。源码行号和内联帧按镜像内地址缓存，可在后续回溯中复用。
+
 GDB 兼容指令与脚本共享目标和断点。支持 `bt`、`thread apply all bt`、`thread TID`、`frame`、`up`、`down`、常用 `info` 查询、`b`、`delete`、`disable`、`enable`、`c`、`si`、`ni`、`finish` 和 `disassemble`。`p` 和 `ptype` 接受当前帧的变量名。`x` 支持默认的十六进制字和显式 `x/16xb`。源代码重映射可通过 `set substitute-path FROM TO` 或 `dbg.substitutePath(from, to)` 注册。`list` 读取重映射后的路径。
 
 工具响应里的 `paused_stops` 提供线程暂停原因。`waiting_inputs` 和 `running_scripts` 报告脚本状态。异步断点回调可以等待输入。脚本输出缓存在服务端，随工具响应返回。`run` 启动的进程会在 `process_output` 中附带新增 stdout 和 stderr。脚本也可用 `await dbg.waitOutput(pid, timeoutMs)` 从独立游标主动读取，结果包含退出状态或超时信息。目标切换通过 `released` 报告被释放的 PID，旧目标的输出仍可按 PID 读取。live 和 core 共用 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。

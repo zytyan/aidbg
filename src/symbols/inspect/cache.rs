@@ -152,7 +152,32 @@ pub(super) struct Data {
     sections: DwarfSections<Vec<u8>>,
     index: OnceLock<Option<Index>>,
     index_queued: AtomicBool,
+    lines: Mutex<BTreeMap<u64, Option<Line>>>,
+    inline: Mutex<BTreeMap<u64, Vec<InlineFrame>>>,
     section_bytes: usize,
+}
+
+// Cache only successful lookups, including a definite absence of metadata.
+fn cached_address<T: Clone>(
+    cache: &Mutex<BTreeMap<u64, T>>,
+    pc: u64,
+    lookup: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(value) = cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&pc)
+        .cloned()
+    {
+        return Ok(value);
+    }
+    let value = lookup()?;
+    let mut cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    if cache.len() >= 1024 {
+        cache.pop_first();
+    }
+    cache.insert(pc, value.clone());
+    Ok(value)
 }
 
 impl Data {
@@ -167,6 +192,8 @@ impl Data {
             sections,
             index: OnceLock::new(),
             index_queued: AtomicBool::new(false),
+            lines: Mutex::new(BTreeMap::new()),
+            inline: Mutex::new(BTreeMap::new()),
             section_bytes: section_bytes.get(),
         });
         data.schedule();
@@ -183,6 +210,18 @@ impl Data {
                 EndianSlice::new(bytes, LittleEndian)
             });
             crate::modules::id_hex(&digest.finalize())
+        })
+    }
+
+    pub(super) fn line(&self, pc: u64) -> Result<Option<Line>> {
+        cached_address(&self.lines, pc, || {
+            super::super::line_for_pc(&self.borrow(), pc)
+        })
+    }
+
+    pub(super) fn inline_frames(&self, pc: u64, deadline: Instant) -> Result<Vec<InlineFrame>> {
+        cached_address(&self.inline, pc, || {
+            super::inline_frames(&self.borrow(), pc, deadline)
         })
     }
 
@@ -425,4 +464,38 @@ pub(super) fn live_image(
         });
     }
     Ok(image)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_cache_preserves_hits_and_does_not_store_failed_lookups() -> Result<()> {
+        let cache = Mutex::new(BTreeMap::new());
+        assert!(
+            cached_address(&cache, 1, || -> Result<Option<u64>> {
+                Err(error("deadline expired"))
+            })
+            .is_err()
+        );
+        assert_eq!(cached_address(&cache, 1, || Ok(Some(7)))?, Some(7));
+        assert_eq!(
+            cached_address(&cache, 1, || panic!("cached source was reparsed"))?,
+            Some(7)
+        );
+        assert_eq!(cached_address(&cache, 2, || Ok(None))?, None);
+        assert_eq!(
+            cached_address(&cache, 2, || panic!("cached miss was reparsed"))?,
+            None
+        );
+        for address in 3..=1025 {
+            assert_eq!(
+                cached_address(&cache, address, || Ok(Some(address)))?,
+                Some(address)
+            );
+        }
+        assert_eq!(cache.lock().unwrap().len(), 1024);
+        Ok(())
+    }
 }

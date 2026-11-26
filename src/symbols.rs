@@ -780,7 +780,7 @@ pub(crate) fn breakpoint_site_matching(
     found.ok_or_else(|| error("executable symbol not found in a loaded module instance"))
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Line {
     pub(crate) file: PathBuf,
     pub(crate) line: Option<u64>,

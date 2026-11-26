@@ -519,11 +519,18 @@ impl Images {
     }
 
     pub fn symbolize(&self, stack: &mut Stack) {
-        self.symbolize_frames(stack, None);
+        self.symbolize_frames(stack, None, None);
     }
 
-    pub(crate) fn symbolize_until(&self, stack: &mut Stack, deadline: Instant) {
-        self.symbolize_frames(stack, Some(deadline));
+    pub(crate) fn symbolize_until(
+        &self,
+        stack: &mut Stack,
+        deadline: Instant,
+        root: &Path,
+        modules: &[Module],
+        executable: Option<&Metadata>,
+    ) {
+        self.symbolize_frames(stack, Some(deadline), Some((root, modules, executable)));
     }
 
     fn symbol_objects(
@@ -540,7 +547,12 @@ impl Images {
         Some((pc, object, debug))
     }
 
-    fn symbolize_frames(&self, stack: &mut Stack, deadline: Option<Instant>) {
+    fn symbolize_frames(
+        &self,
+        stack: &mut Stack,
+        deadline: Option<Instant>,
+        live: Option<(&Path, &[Module], Option<&Metadata>)>,
+    ) {
         // A large DWARF line table must not consume the time available for
         // naming callers whose ELF symbols are already loaded.
         for frame in &mut stack.frames {
@@ -564,9 +576,37 @@ impl Images {
                     .clone()
             });
         }
+        let mut loaded = BTreeMap::new();
         for frame in &mut stack.frames {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 break;
+            }
+            if let Some((root, modules, executable)) = live
+                && let Some((id, pc)) = frame.module_id.zip(frame.link_pc)
+                && let Some(module) = modules.get(id)
+                && let Ok(images) = loaded.entry(id).or_insert_with(|| {
+                    crate::symbols::inspect::live_source_images(root, module, executable)
+                })
+            {
+                if let Some(source) = images
+                    .iter()
+                    .find_map(|dwarf| dwarf.line(pc).ok().flatten())
+                {
+                    frame.file = Some(source.file);
+                    frame.line = source.line;
+                }
+                if let Some(deadline) = deadline
+                    && Instant::now() < deadline
+                {
+                    frame.inline_frames = images
+                        .iter()
+                        .find_map(|dwarf| {
+                            let frames = dwarf.inline_frames(pc, deadline).ok()?;
+                            (!frames.is_empty()).then_some(frames)
+                        })
+                        .unwrap_or_default();
+                }
+                continue;
             }
             let Some((pc, object, debug)) = self.symbol_objects(frame) else {
                 continue;
