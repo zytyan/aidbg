@@ -919,10 +919,11 @@ impl Target {
     pub(super) fn session_variable_type(
         &self,
         tid: i32,
+        index: usize,
         name: &str,
         deadline: Instant,
     ) -> Result<Option<crate::symbols::inspect::type_graph::Graph>> {
-        let Some(frame) = self.frames_for(tid).and_then(|frames| frames.first()) else {
+        let Some(frame) = self.frames_for(tid).and_then(|frames| frames.get(index)) else {
             return Ok(None);
         };
         if let Some((dwarf, link)) = self.attached_frame(frame.lookup_pc)

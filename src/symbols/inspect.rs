@@ -1975,6 +1975,7 @@ enum LiveModules<'a> {
         instance: Option<u64>,
     },
     FrameFirst,
+    FrameOnly,
 }
 
 struct Query<'a> {
@@ -2048,11 +2049,14 @@ impl Query<'_> {
     fn read_process(&mut self, root: &Path, selection: LiveModules<'_>) -> Result<Datum> {
         let (filter, selected_instance) = match selection {
             LiveModules::Filter { module, instance } => (module, instance),
-            LiveModules::FrameFirst => (None, None),
+            LiveModules::FrameFirst | LiveModules::FrameOnly => (None, None),
         };
         let pc = self.registers.get(PC)?;
         let exe = fs::metadata(root.join("exe")).ok();
         let mut modules = modules::read(root)?;
+        if matches!(selection, LiveModules::FrameOnly) {
+            modules.retain(|module| module.executable_at(pc).is_some());
+        }
         modules.sort_by_key(|module| module.executable_at(pc).is_none());
         let mut global = None;
         let mut eligible_debug = false;
@@ -2087,7 +2091,10 @@ impl Query<'_> {
             }
             eligible_debug = true;
             for instance in layout.instances {
-                if selected_instance.is_some_and(|base| base != instance.base) {
+                if selected_instance.is_some_and(|base| base != instance.base)
+                    || (matches!(selection, LiveModules::FrameOnly)
+                        && current.is_none_or(|(active, _)| active.base != instance.base))
+                {
                     continue;
                 }
                 let link_pc = current
@@ -2401,7 +2408,7 @@ pub(crate) fn inspect_stopped(
         evaluate_live(
             parse_live(text, None)?,
             root,
-            LiveModules::FrameFirst,
+            LiveModules::FrameOnly,
             memory,
             registers,
             deadline,

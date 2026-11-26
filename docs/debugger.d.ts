@@ -1199,7 +1199,9 @@ export interface TypeSystem {
     setPrettyPrinter<V>(type: Type.Base<V>, printer: ((value: V) => string | undefined) | null): void;
     findTypes(query: string, options?: { exact?: boolean; module?: string }): readonly { readonly name: string; readonly module: string; readonly size: number | null }[];
     /**
-     * Get a variable type in the callback thread or main thread’s top frame.
+     * Get a variable type in the selected frame, or the callback thread’s top
+     * frame inside a callback. The default is the main thread’s top frame.
+     * Lookup is limited to the frame’s module.
      * Missing DWARF, no match, and exhausted lookups return undefined. An
      * exhausted lookup also emits a diagnostic to the debugger output.
      */

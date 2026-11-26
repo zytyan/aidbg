@@ -1201,6 +1201,34 @@ impl Live {
         Ok(None)
     }
 
+    fn variable_lookup_pc(&self, tid: i32, index: usize, deadline: Instant) -> Result<Option<u64>> {
+        let mut registers = regs::read(tid)?.stack;
+        if let Some(Stop::Software { address, .. }) =
+            self.trace.threads.get(&tid).and_then(|thread| thread.stop)
+        {
+            registers.set(regs::PC, Some(address));
+        }
+        if index == 0 {
+            return Ok(Some(registers.get(regs::PC)?));
+        }
+        let mut images = self.frame_images()?;
+        let mut selected = None;
+        images.images.walk_registers(
+            &self.trace,
+            registers,
+            &images.modules,
+            &self.root,
+            images.executable.as_ref(),
+            deadline,
+            |frame, registers| {
+                if frame == index {
+                    selected = registers.get(regs::PC).ok();
+                }
+            },
+        );
+        Ok(selected)
+    }
+
     fn evaluate(&self, tid: i32, expression: String) -> Result<Value> {
         let registers = regs::read(tid)?.stack;
         let report = symbols::inspect::inspect_stopped(
@@ -2600,11 +2628,13 @@ impl Target {
                 } else {
                     tid()?
                 };
+                let index = args["frame"].as_u64().unwrap_or_default() as usize;
                 let deadline = Instant::now() + DEADLINE;
                 let graph = match self {
                     Self::Live(live) => live.with_stopped(tid, |live| {
-                        let registers = regs::read(tid)?.stack;
-                        let pc = registers.get(regs::PC)?;
+                        let Some(pc) = live.variable_lookup_pc(tid, index, deadline)? else {
+                            return Ok(None);
+                        };
                         for attached in live.dwarf.iter().rev() {
                             if let Some(link) = attached.link_address(pc)
                                 && let Some(graph) = attached.image.variable_type_graph(
@@ -2618,7 +2648,7 @@ impl Target {
                         }
                         symbols::inspect::variable_type_at_pc(&live.root, pc, name, deadline)
                     }),
-                    Self::Core(core) => core.session_variable_type(tid, name, deadline),
+                    Self::Core(core) => core.session_variable_type(tid, index, name, deadline),
                 };
                 match graph {
                     Ok(graph) => Ok(json!({"graph":graph})),

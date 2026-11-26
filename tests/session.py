@@ -1130,6 +1130,19 @@ def validate_process_lifecycle(client, fixture, library, owned):
             const hit = await dbg.continueForStop(dbg.pid, {timeoutMs:3000});
             if (hit.kind !== "breakpoint") throw new Error(hit.kind);
             console.log(hit.breakpointId === point.id && hit.address === point.address, hit.hitCount);
+            if (i === 1) {
+                if (m.typeOfVar("input")?.$size !== 4 || m.typeOfVar("global_context") !== undefined) {
+                    throw Error("incorrect lookup in the shared-library frame");
+                }
+                let crossModule = false;
+                try { dbg.thread(hit.tid).eval("global_context.type"); crossModule = true; } catch {}
+                if (crossModule) throw Error("a local miss searched the executable's global DWARF");
+                await fmt.gdb("up");
+                if (m.typeOfVar("library")?.$size !== 8 || m.typeOfVar("input") !== undefined) {
+                    throw Error("typeOfVar ignored the selected caller frame");
+                }
+                await fmt.gdb("down");
+            }
         }
         dbg.resumeAll();
         const exit = await dbg.waitExit(3000);

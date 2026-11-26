@@ -1707,7 +1707,8 @@
         lazy(getter) { return descriptor({kind:"lazy",getter}); },
         self() { return selfType; },
         typeOfVar(name) {
-            const graph = rpc("typeOfVar", {name, tid:callbackTid});
+            const graph = rpc("typeOfVar", {name, tid:callbackTid ?? selectedTid,
+                frame:callbackTid === undefined ? selectedFrame : 0});
             return graph == null ? undefined : dwarfType({graph});
         },
         fromDwarf(name) {

@@ -48,8 +48,8 @@ and `disassemble main`. Replace the sample address with a mapped target address.
 ## Inspect typed memory
 
 The example looks up a global with this layout. Use a symbol and field layout
-from your target. `typeOfVar` can use matched DWARF for the current stopped
-frame, and returns `undefined` when the type is unavailable.
+from your target. `typeOfVar` can use matched DWARF for the selected stopped
+frame’s module, and returns `undefined` when the type is unavailable.
 
 ```ts
 const Header = m.struct({type: m.u32(), length: m.u32(), data: m.pointer(m.void())});
