@@ -1,4 +1,4 @@
-use aidbg::{Result, rpc::*};
+use aidbg::{Result, rpc::*, script::session};
 use clap::{Parser, Subcommand};
 use rmcp::{
     ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
@@ -255,8 +255,8 @@ impl rmcp::ServerHandler for Mcp {
         _: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
         let text = match request.uri.as_str() {
-            API_URI => include_str!("../docs/debugger.d.ts"),
-            NODE_API_URI => include_str!("script/session/node.d.ts"),
+            API_URI => session::DEBUGGER_DECLARATIONS,
+            NODE_API_URI => session::NODE_DECLARATIONS,
             _ => return Err(rmcp::ErrorData::invalid_params("unknown resource", None)),
         };
         Ok(
@@ -349,12 +349,12 @@ impl rmcp::ServerHandler for Mcp {
 
 #[tool_router]
 impl Mcp {
-    #[tool(description = "Show script entry semantics and a TypeScript API summary.")]
+    #[tool(description = "Show script entry semantics and the full TypeScript declarations for script_run.")]
     async fn docs(&self) -> CallToolResult {
         mcp_text::document(json!({
-            "instructions": "script_run executes the module's top-level code. Exports are available on $ to subsequent scripts. Use run and attach for debugging and a shell tool for shell commands. The default fork policy follows the parent.",
-            "declarations": include_str!("script/session/summary.d.ts"),
-            "modules": include_str!("script/session/node.d.ts"),
+            "instructions": "script_run executes the module's top-level code. Named exports from successful scripts are available on $ to subsequent scripts in the same session. Switching targets clears these exports. The declarations describe the initial session. Types inferred from target DWARF and prior script exports are added during compilation. Use run and attach for debugging and a shell tool for shell commands. The default fork policy follows the parent.",
+            "declarations": session::declarations(),
+            "modules": session::NODE_DECLARATIONS,
             "full_api": API_URI,
         }))
     }

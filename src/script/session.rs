@@ -941,14 +941,16 @@ impl Exports {
     }
 }
 
-fn declarations() -> String {
-    let api = include_str!("../../docs/debugger.d.ts").replace("export declare ", "export ");
-    let node = include_str!("session/node.d.ts");
+pub const DEBUGGER_DECLARATIONS: &str = include_str!("../../docs/debugger.d.ts");
+pub const NODE_DECLARATIONS: &str = include_str!("session/node.d.ts");
+
+/// The aidbg module and globals available at the start of a script session.
+pub fn declarations() -> String {
+    let api = DEBUGGER_DECLARATIONS.replace("export declare ", "export ");
     format!(
         r#"declare module "aidbg" {{
 {api}
 }}
-{node}
 interface AidbgGlobals {{}}
 declare const dbg: import("aidbg").Debugger;
 declare const m: import("aidbg").TypeSystem;
@@ -1009,7 +1011,8 @@ fn run(
         timers: BTreeMap::new(),
         next_timer: 0,
     }));
-    let mut compiler = Compiler::with_session_api(&declarations(), true);
+    let declarations = format!("{}\n{NODE_DECLARATIONS}", declarations());
+    let mut compiler = Compiler::with_session_api(&declarations, true);
     let result = context.with(|ctx| {
         ctx.store_userdata(files::Jobs::default()).map_err(|_| error("cannot initialize filesystem jobs"))?;
         let mut pending = Vec::new();

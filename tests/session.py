@@ -24,8 +24,15 @@ class Client:
         self.rpc("initialize", protocolVersion="2024-11-05", capabilities={},
                  clientInfo={"name": "aidbg integration test", "version": "1"})
         self.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        summary = self.rpc("tools/call", name="docs", arguments={"output_format": "structured"})["structuredContent"]
-        assert "interface TypeSystem" in summary["declarations"], summary
+        docs = self.rpc("tools/call", name="docs", arguments={"output_format": "structured"})["structuredContent"]
+        debugger_types = self.rpc("resources/read", uri=docs["full_api"])["contents"][0]["text"]
+        node_types = self.rpc("resources/read", uri="aidbg://node.d.ts")["contents"][0]["text"]
+        assert debugger_types.replace("export declare ", "export ") in docs["declarations"]
+        assert 'declare const $: AidbgGlobals & import("aidbg").GlobalScope;' in docs["declarations"]
+        assert 'declare const AbortController: typeof import("aidbg").AbortController;' in docs["declarations"]
+        assert node_types == docs["modules"]
+        text = self.rpc("tools/call", name="docs", arguments={})["content"][0]["text"]
+        assert docs["declarations"].strip() in text and node_types.strip() in text
         disconnected = self.rpc("tools/call", name="ps", arguments={"output_format": "structured"})
         assert disconnected["isError"] and "connect" in disconnected["structuredContent"]["error"], disconnected
         connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token, "output_format": "structured"})
