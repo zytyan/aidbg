@@ -1,3 +1,5 @@
+// 文件与路径 API 在 aidbg 服务端运行。相对路径以服务端工作目录为准。
+// 脚本可使用此处声明的 Node 兼容子集。
 declare module "node:fs" {
     type Utf8 = "utf8" | "utf-8";
     export interface Stats {
@@ -5,7 +7,9 @@ declare module "node:fs" {
         isFile(): boolean;
         isDirectory(): boolean;
     }
+    /** 以 UTF-8 解码文件。单次读取最多 16 MiB。 */
     export function readFileSync(path: string, options: Utf8 | {encoding: Utf8}): string;
+    /** 省略编码时读取原始字节。单次读取最多 16 MiB。 */
     export function readFileSync(path: string, options?: null | {encoding?: null}): Uint8Array;
     export function readdirSync(path: string): string[];
     export function statSync(path: string): Stats;
@@ -24,7 +28,9 @@ declare module "node:fs" {
 
 declare module "node:fs/promises" {
     type Utf8 = "utf8" | "utf-8";
+    /** 以 UTF-8 解码文件。单次读取最多 16 MiB。 */
     export function readFile(path: string, options: Utf8 | {encoding: Utf8}): Promise<string>;
+    /** 省略编码时读取原始字节。单次读取最多 16 MiB。 */
     export function readFile(path: string, options?: null | {encoding?: null}): Promise<Uint8Array>;
     export function readdir(path: string): Promise<string[]>;
     export function stat(path: string): Promise<import("node:fs").Stats>;
@@ -47,6 +53,7 @@ declare module "node:path" {
     }
     export const sep: "/";
     export function join(...parts: string[]): string;
+    /** 按 POSIX 路径规则解析，必要时补上服务端工作目录。 */
     export function resolve(...parts: string[]): string;
     export function normalize(path: string): string;
     export function relative(from: string, to: string): string;

@@ -317,6 +317,7 @@ export interface WaitOutputResult {
     readonly exitSignal?: number;
 }
 
+/** 回调可使用 await；通过 hit.pause() 或 hit.continue() 指定回调结束后的线程状态。 */
 export type BreakpointCallback = (hit: BreakpointHit) => void | Promise<void>;
 
 export interface BreakpointOptions {
@@ -492,6 +493,7 @@ export interface InstructionXrefResult extends XrefScanResult {
     }[];
 }
 
+/** 地址使用 bigint，块读取长度以字节计。对 core 写入会抛出 NotSupport。 */
 export interface MemoryView {
     // 1. 标量读取（同步操作，底层直调 process_vm_readv）
     readInt8(address: bigint): number;
@@ -553,7 +555,6 @@ export interface MemoryView {
     xref(address: bigint, options: InstructionXrefOptions): InstructionXrefResult;
     xref(address: bigint, options: PointerXrefOptions | InstructionXrefOptions): PointerXrefResult | InstructionXrefResult;
 }
-/**  */
 interface WatchpointOptions {
     length: number;
     access: "read" | "write" | "read_write";
@@ -564,6 +565,7 @@ interface WatchpointOptions {
 // 核心类型：Debugger
 // ============================================================================
 
+/** live 和 core 共用此接口。core 中的目标写入和执行控制会抛出 NotSupport。 */
 export interface Debugger {
     detach(): Promise<void>;
     /** 普通 fork 默认跟踪父进程。child 模式切换至子进程并暂停在 fork 边界。both 需要多实例支持。 */
@@ -593,6 +595,7 @@ export interface Debugger {
      * 已有 scratchpad 时可仅令当前线程执行 eval 与 injectSyscall；否则需暂停所有其他线程。
      */
     prepareScratchPad(): Promise<void>;
+    /** 可在 live 目标运行时采集。检查 incomplete 了解未完成阶段；stopTimeoutMs 为 0 时仅采样已暂停线程。 */
     snapshot(options?: number | { tid?: number; context?: boolean; stopTimeoutMs?: number }): Promise<DebugSnapshot>;
     backtraceAll(): Promise<Pick<DebugSnapshot, "threads" | "incomplete">>;
     /** 记录指定断点的命中并自动继续，直到退出、超时、达到命中上限或遇到其他暂停事件。 */
@@ -601,6 +604,7 @@ export interface Debugger {
         readonly hits: readonly { readonly tid: number; readonly hitCount: number }[];
         readonly limitReached: boolean;
     }>;
+    /** 从脚本专用游标读取进程输出，可传进程 PID。默认等 180 秒，通过 timedOut 判断超时。 */
     waitOutput(tid: number, timeoutMs?: number): Promise<WaitOutputResult>;
     mappings(): readonly MemoryMapping[];
     prepare(): Promise<void>;
@@ -612,7 +616,6 @@ export interface Debugger {
     getSymbol(name: string): Promise<SymbolInfo | null>;
     /** 流式遍历符号（模糊搜索、全量扫描） */
     iterSymbols(pattern: RegExp): AsyncIterableIterator<SymbolInfo>;
-    /** 暂停预算暂时有意不加 */
     /** 按原始 ELF 符号持续绑定软件断点。映像或共享库尚未加载时 address 为 null。 */
     pendingBreakpoint(name: string, callback: BreakpointCallback | null, options?: { module?: string }): PendingBreakpoint;
     hardwareBreakpoint(
@@ -675,6 +678,7 @@ export interface Debugger {
     stringify(value: unknown): string | undefined;
 }
 
+/** 按 kind 区分事件、超时及等待结束；目标退出也可作为 exit 事件返回。 */
 export type WaitResult<T> = T | { readonly kind: "timeout" } | { readonly kind: "ended" };
 
 export interface ContinueOptions {
@@ -779,8 +783,8 @@ export interface Process {
 
 /**
  * 全局跨脚本持久化命名空间。
- * 每次 `script_run` 通过 `export` 导出的符号都会挂载到 `$` 下，
- * 服务端通过增量 `.d.ts` 声明合并为其提供强类型检查。
+ * 成功完成的脚本将具名导出挂到 `$` 下，供同一会话的后续脚本使用。
+ * 服务端增量合并这些导出的类型声明，切换目标时清空。
  */
 export interface GlobalScope {
     // 由历次 script_run 导出的声明增量合并填充
@@ -1181,9 +1185,11 @@ export declare const $: GlobalScope;
 export declare const console: Console;
 export declare const fmt: Format;
 
+/** 默认延时 0 毫秒。延时须介于 0 和 86400000 毫秒之间，向上取整。返回值可交给 clearTimeout。 */
 export declare function setTimeout(cb: () => void, ms?: number): number;
 export declare function clearTimeout(id: number): void;
 export declare function queueMicrotask(cb: () => void): void;
+/** 等待指定毫秒数。signal 由 aidbg 的 AbortController 创建，取消时以 signal.reason 拒绝。 */
 export declare function sleep(ms: number, signal?: AbortSignal): Promise<void>;
 
 
@@ -1194,5 +1200,6 @@ export interface AbortSignal {
 
 export declare class AbortController {
     readonly signal: AbortSignal;
+    /** 取消信号；省略原因时使用 Error，后续调用保留首次取消的原因。 */
     abort(reason?: unknown): void;
 }
