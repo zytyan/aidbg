@@ -404,6 +404,24 @@ impl Live {
         Ok(())
     }
 
+    pub(super) fn resume_attach_stops(&mut self) -> Result<()> {
+        for tid in self.tids() {
+            if self.paused.contains(&tid)
+                && !self.callbacks.contains(&tid)
+                && !self.stop_sequences.contains_key(&tid)
+                && matches!(
+                    self.trace.threads[&tid].stop,
+                    Some(Stop::Interrupt | Stop::ExecBoundary)
+                )
+            {
+                self.resume(tid)?;
+                self.paused.remove(&tid);
+            }
+        }
+        self.trace.poll()?;
+        Ok(())
+    }
+
     pub(super) fn execution_state(&self) -> &'static str {
         if self.trace.threads.is_empty() {
             "exited"
@@ -455,6 +473,15 @@ impl Live {
                 self.trace.threads.len()
             )
             .unwrap();
+        }
+        if !self.trace.threads.is_empty() {
+            let tids = self
+                .trace
+                .threads
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            writeln!(text, "Thread IDs: {}", tids.join(", ")).unwrap();
         }
         for row in self.paused_stops() {
             if self
@@ -1995,7 +2022,7 @@ impl Live {
         self.close_with_signal_delivery(true)
     }
 
-    pub(super) fn kill_and_detach(&mut self, signal: i32) -> Result<()> {
+    pub(super) fn kill_and_detach(&mut self, signal: i32) -> Result<bool> {
         self.verify()?;
         let fd = Errno::result(unsafe { libc::syscall(libc::SYS_pidfd_open, self.pid, 0) })?;
         let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
@@ -2011,7 +2038,19 @@ impl Live {
             )
         });
         match delivery {
-            Ok(_) | Err(Errno::ESRCH) => cleanup,
+            Err(Errno::ESRCH) => cleanup.map(|()| true),
+            Ok(_) => {
+                cleanup?;
+                let mut poll = libc::pollfd {
+                    fd: pidfd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // The process descriptor becomes readable once termination is confirmed.
+                let timeout = if signal == libc::SIGKILL { 100 } else { 0 };
+                Ok(unsafe { libc::poll(&mut poll, 1, timeout) } > 0
+                    && poll.revents & libc::POLLIN != 0)
+            }
             Err(issue) => Err(issue.into()),
         }
     }
@@ -2023,6 +2062,10 @@ impl Live {
             let pid = Pid::from_raw(self.pid);
             if self.trace.exit.is_none() {
                 let mut stdio = self.stdio.take();
+                if let Some(io) = &mut stdio {
+                    let _ = io.drain();
+                    self.stdio = Some(io.archive_output());
+                }
                 let _ = thread::Builder::new()
                     .name("aidbg-reap".into())
                     .spawn(move || {

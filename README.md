@@ -24,6 +24,8 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 
 ## MCP 工具
 
+工具默认在 MCP `content` 中返回可读文本。需要兼容原有的结构化 MCP 客户端时，可传入 `output_format: "structured"`。脚本内继续使用结构化的 `dbg` 和 `Value` API 处理数据。
+
 | 工具 | 参数和用法 |
 | --- | --- |
 | `connect` | 连接服务端。填写 `socket` 或 `endpoint`，可传入 `session` 复用会话。 |
@@ -31,15 +33,15 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | `run` | `path` 是服务端程序的绝对路径，`arg` 是可选字符串数组。目标默认继续运行，`pause: true` 在 exec 后暂停。结果包含当前目标状态。 |
 | `attach` | `pid` 是进程 ID。线程默认继续运行，`pause: true` 保持暂停。结果包含当前目标状态。 |
 | `core_open` | `path` 是服务端上的 ELF core 或 zstd 压缩的 core，可指定 `executable` 和 `debug_symbols`。 |
-| `script_run` | `src` 是 TypeScript 模块源码。可通过 `run: {path, arg, pause}` 先启动目标，通过 `wait_ms` 等待完成并收集输出。仅提交源码时默认立即返回，组合启动时默认等 5 秒。 |
-| `script_wait` | 按 `script_id` 等待已提交的脚本，默认等 5 秒。返回 `wait_timeout` 时脚本继续运行。 |
-| `status` | 查看会话、目标、线程、暂停原因、断点、信号回调和正在运行的脚本。查询保留目标状态和待收集的输出。 |
+| `script_run` | `src` 是 TypeScript 模块源码。可通过 `run: {path, arg, pause}` 先启动目标，通过 `wait_ms` 等待完成并收集输出。文本模式默认等 100 毫秒。传入 `wait_ms: 0` 可立即收集当前进度。 |
+| `script_wait` | 按 `script_id` 等待已提交的脚本，默认等 5 秒。超时后脚本继续执行。 |
+| `status` | 查看会话、目标、线程、暂停原因、断点、观察点、信号策略、运行中的脚本、输入请求和待处理事件。查询保留目标状态和待收集的输出。 |
 | `gdb` | 执行支持的 GDB 指令。传入 `command`，例如 `bt`、`info locals` 或 `disassemble main`。 |
 | `snapshot` | 可传入 `tid` 获取指定线程的快照。默认暂停预算为 1 秒，超时可返回部分结果。采集时先保存已暂停线程的寄存器，再分配栈展开预算。`stop_timeout_ms: 0` 仅采集已暂停线程。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
 | `send_input` | 向正在通过 `ask()` 等待回复的 `handler` 传入字符串 `data`。 |
 | `interrupt_input` | 向指定 `handler` 抛出异常，可传入消息 `msg`。 |
 | `perf` | 传入 `pid`，选择 `hotspot` 或 `stack`。可选 `tid`、`duration_ms`、`frequency_hz`。 |
-| `ps` | 返回结构化 JSON，默认省略命令行参数并隐藏内核线程。支持 `threads`、`pattern`、`fields`、`limit`、`offset`。 |
+| `ps` | 列出进程，默认省略命令行参数并隐藏内核线程。支持 `threads`、`pattern`、`fields`、`limit`、`offset`。 |
 | `syscall_table` | 列出服务端原生架构的 Linux syscall ID、名称和六个顺序固定的参数槽。可按 `id` 或 `name` 筛选。 |
 | `set_fork_policy` | 传入 `mode: "parent"` 或 `mode: "child"`，设置普通 fork 后跟踪哪一侧。 |
 
@@ -51,15 +53,17 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 
 GDB 兼容指令与脚本共享目标和断点。支持 `bt`、`thread apply all bt`、`thread TID`、`frame`、`up`、`down`、常用 `info` 查询、`b`、`delete`、`disable`、`enable`、`c`、`si`、`ni`、`finish` 和 `disassemble`。`p` 和 `ptype` 接受当前帧的变量名。`x` 支持默认的十六进制字和显式 `x/16xb`。源代码重映射可通过 `set substitute-path FROM TO` 或 `dbg.substitutePath(from, to)` 注册。`list` 读取重映射后的路径。
 
-工具响应里的 `paused_stops` 提供线程暂停原因。`waiting_inputs` 和 `running_scripts` 报告脚本状态。异步断点回调可以等待输入。脚本输出缓存在服务端，随工具响应返回。`run` 启动的进程会在 `process_output` 中附带新增 stdout 和 stderr。脚本也可用 `await dbg.waitOutput(pid, timeoutMs)` 从独立游标主动读取，结果包含退出状态或超时信息。目标切换通过 `released` 报告被释放的 PID，旧目标的输出仍可按 PID 读取。live 和 core 共用 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。
+调试器用 `*` 标记事件和警告。异步脚本报告脚本 ID 和运行或等待状态，完成时会通知。异步断点回调可以通过 `ask()` 等待输入。使用 `status` 可重新查看待处理事件，该查询保留事件和未收集的输出。
+
+`run` 捕获 stdout 和 stderr，工具收集到新输出时会按捕获顺序标注所属流。缓冲区溢出和分批返回会有各自的提示。脚本可用 `await dbg.waitOutput(pid, timeoutMs)` 从独立游标读取输出及退出或超时信息。目标切换后，仍可按旧 PID 查询保留的输出。live 和 core 共用 TypeScript 声明，core 中的执行控制和写入操作会抛出 `NotSupport`。
 
 `run` 和 `attach` 用于调试。一般 shell 命令请使用 shell 工具。普通 fork 默认跟踪父进程，未注册 `SIGCHLD` 处理器时自动将该信号交付目标。
 
 ## TypeScript
 
-等待响应中的 `completed` 表示模块已成功求值，具名导出已可通过同一会话的 `$` 使用。零等待时可从日志读取 `script_complete`。切换调试目标会重置导出。
+脚本成功完成后，可通过同一会话的 `$` 使用其具名导出。切换调试目标会重置导出。
 
-- `console.log({address: 0x1234n})` 可直接输出含 BigInt 的对象。需要 JSON 文本时用 `dbg.stringify(value)`，其中 BigInt 保留为十进制字符串。
+- `console.log({address: 0x1234n})` 可直接输出含 BigInt 的对象。需要 JSON 文本时用 `dbg.stringify(value)`，其中 BigInt 保留为十进制字符串。控制台会标出循环引用和数组、对象或字符串的显示裁剪。脚本直接输出的字符串会按原文呈现。大批脚本输出会分次返回，缓冲区丢失另行报告。
 - `dbg.continueForStop("all", {pausedOnly: true})` 等待仍暂停的现场或退出。已经继续的命中可用 `dbg.waitStops()` 读取。`dbg.traceHits("push")` 可记录断点命中并自动继续。
 - `dbg.backtraceAll()` 从一次全线程快照读取调用栈。快照可在 live 目标运行时采集，`incomplete` 报告未完成的阶段。
 - `dbg.list(frame, 5, [{from: "/build/project", to: "/srv/src/project"}])` 按第一条匹配规则替换 DWARF 路径前缀。路径在调试服务端解析。`frame.inlineFrames` 显示 DWARF 为当前指令记录的逻辑内联调用。
@@ -89,7 +93,7 @@ dbg.resumeAll();
 
 `m.findTypes()` 查询 DWARF 类型及模块。同步 `dbg.attachDwarf(file, position?)` 可加载额外的 ELF 调试文件。`position` 支持 ELF 加载偏移或节起始地址映射，省略时要求唯一匹配模块。加载后可在下一次 `script_run` 中用 `m.fromDwarf()` 获取静态类型检查。调用栈提供 `missingDebugSections` 以标识缺少的符号和 DWARF 节。
 
-`dbg.coredump` 将压缩 core 写到服务端路径。使用 `core_open` 可以重新打开它。TypeScript 中地址与寄存器为 `bigint`，MCP JSON 中的地址与寄存器使用十六进制字符串。
+`dbg.coredump` 将压缩 core 写到服务端路径。使用 `core_open` 可以重新打开它。TypeScript 中地址与寄存器为 `bigint`，MCP 文本通常以十六进制显示地址与寄存器。
 
 软件观察点通过单步检测常见指令的内存访问，并通过前后对照检测其它写入引起的值变化。原生函数调用支持整数、指针和浮点 ABI。动态链接的 ELF 目标文件需使用受支持的重定位，并放入调用者提供的可写映射。
 

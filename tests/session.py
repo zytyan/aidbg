@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import select
 import signal
@@ -23,11 +24,11 @@ class Client:
         self.rpc("initialize", protocolVersion="2024-11-05", capabilities={},
                  clientInfo={"name": "aidbg integration test", "version": "1"})
         self.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        summary = self.rpc("tools/call", name="docs", arguments={})["structuredContent"]
+        summary = self.rpc("tools/call", name="docs", arguments={"output_format": "structured"})["structuredContent"]
         assert "interface TypeSystem" in summary["declarations"], summary
-        disconnected = self.rpc("tools/call", name="ps", arguments={})
+        disconnected = self.rpc("tools/call", name="ps", arguments={"output_format": "structured"})
         assert disconnected["isError"] and "connect" in disconnected["structuredContent"]["error"], disconnected
-        connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token})
+        connected = self.rpc("tools/call", name="connect", arguments={"socket": socket, "session": token, "output_format": "structured"})
         assert connected["structuredContent"] == {"status": "connected", "socket": socket, "session": token}, connected
         failed = self.rpc("tools/call", name="connect", arguments={"socket": socket + ".missing"})
         assert failed["isError"], failed
@@ -49,7 +50,7 @@ class Client:
         return reply["result"]
 
     def tool(self, name, /, *, error=False, **arguments):
-        result = self.rpc("tools/call", name=name, arguments=arguments)["structuredContent"]
+        result = self.rpc("tools/call", name=name, arguments={**arguments, "output_format": "structured"})["structuredContent"]
         assert {"paused_threads", "waiting_inputs", "running_scripts", "output"} <= result.keys(), result
         if not error:
             assert result["error"] is None and result["target_error"] is None, result
@@ -160,6 +161,133 @@ def validate_types_and_input(client):
     if reply["waiting_inputs"]:
         reply = await_state(client, lambda state: not state["waiting_inputs"])
     assert logs(reply) == [["input timed out"]], reply
+
+
+def validate_text_output(client, fixture, owned):
+    def tool(name, /, *, error=False, **arguments):
+        result = client.rpc("tools/call", name=name, arguments=arguments)
+        assert "structuredContent" not in result, result
+        assert bool(result.get("isError")) == error, result
+        assert len(result["content"]) == 1 and result["content"][0]["type"] == "text", result
+        return result["content"][0]["text"]
+
+    def script(src, **args):
+        return tool("script_run", src=src, **args)
+
+    def running_id(text):
+        match = re.search(r"Script #(\d+) running", text)
+        assert match, text
+        return int(match[1])
+
+    assert script("await Promise.resolve();") == "OK"
+    invalid = script('const text: string = 123; console.log(text);', error=True)
+    assert "script.ts:1:7: error TS2322:" in invalid and "^" in invalid, invalid
+    runtime = script('throw new Error("runtime evidence");', error=True)
+    assert "runtime evidence" in runtime and ".ts:1:" in runtime, runtime
+    assert "select a target" in script("await dbg.kill();", error=True)
+    values = script("""
+        const row = { wide: 18446744073709551615n, empty: [], no: false,
+            zero: 0, none: null, absent: undefined, circular: {} };
+        row.circular = row;
+        fmt.print("format");
+        console.log(row);
+        console.log(JSON.stringify({no:false, none:null, zero:0}));
+    """)
+    for evidence in ("18446744073709551615n", "empty: []", "no: false", "zero: 0",
+                     "none: null", "absent: undefined", "<circular>",
+                     '{"no":false,"none":null,"zero":0}'):
+        assert evidence in values, (evidence, values)
+    native = script('const custom = m.i32().withFormatter(v => "native=" + v.$read()); console.log(custom.value(42));')
+    assert native == "native=42", native
+    assert values.startswith("format\n") and "Script #" not in values, values
+    limited = script('console.log({a: Array(100).fill(1), s: "é".repeat(1500)});')
+    assert "68 more elements" in limited and "truncated string" in limited, limited
+    deep = script('let row: unknown = 0; for (let i=0; i<10; i++) row = {child:row}; console.log(row);')
+    assert "truncated at depth limit" in deep, deep
+    assert script('console.log("x".repeat(1100000));') == "* Script output was dropped from its buffer."
+
+    batch = script('console.log("first chunk " + "x".repeat(40000)); console.log("second chunk " + "y".repeat(40000));')
+    assert "first chunk" in batch and "More script output is buffered" in batch, batch[:200]
+    assert "second chunk" not in batch and "dropped" not in batch, batch[-200:]
+    remainder = tool("syscall_table", name="read")
+    assert "second chunk" in remainder and "dropped" not in remainder, remainder[-200:]
+
+    first = running_id(script('console.log("first"); await sleep(150); console.log("last");', wait_ms=0))
+    second = running_id(script('await sleep(60); fmt.print("second");', wait_ms=0))
+    done = tool("script_wait", script_id=first, wait_ms=2000)
+    assert f"Script #{first} completed" in done and f"Script #{second} completed" in done, done
+    assert done.index("second") < done.index("last"), done
+    assert f"[Script #{first}]" in done and f"[Script #{second}]" in done, done
+
+    failure_id = running_id(script('await sleep(60); throw new Error("async evidence");', wait_ms=0))
+    failed = tool("script_wait", script_id=failure_id, error=True)
+    assert f"Script #{failure_id} failed" in failed and "async evidence" in failed, failed
+    asking = script('console.log(await dbg.ask({question: "Which thread?"}));')
+    assert "Which thread?" in asking and "awaiting input" in asking, asking
+    handler = asking.split("Request ", 1)[1].split(":", 1)[0]
+    assert handler in tool("status")
+    answered = tool("send_input", handler=handler, data="thread answer")
+    assert "thread answer" in answered and "completed" in answered, answered
+
+    pending = running_id(script("await sleep(10000);", wait_ms=0))
+    started = tool("run", path=fixture, arg=["output"])
+    assert "Started process" in started and f"Script #{pending} cancelled" in started, started
+    deadline = time.monotonic() + 3
+    recorded = started
+    while "stdout tail" not in recorded or "stderr tail" not in recorded:
+        assert time.monotonic() < deadline, recorded
+        recorded += tool("syscall_table", name="read")
+    assert " stdout\nstdout tail" in recorded and " stderr\nstderr tail" in recorded, recorded
+    assert "exited with code 39" in tool("status")
+
+    with subprocess.Popen([fixture, "attach"], stdout=subprocess.PIPE, text=True) as target:
+        try:
+            assert target.stdout.readline().strip() == "ready"
+            attached = tool("attach", pid=target.pid)
+            assert attached.startswith(f"Attached to PID {target.pid}.\nState: running"), attached
+            attached = tool("attach", pid=target.pid, pause=True)
+            assert "State: paused" in attached and f"Stopped threads: {target.pid}" in attached, attached
+            resumed = tool("attach", pid=target.pid)
+            assert "State: running" in resumed, resumed
+            assert script("await dbg.detach();") == f"Detached from PID {target.pid}."
+            assert target.poll() is None
+        finally:
+            if target.poll() is None:
+                target.kill()
+
+    running = tool("run", path=fixture, arg=["fault"], pause=True)
+    pid = int(running.split("Started process ", 1)[1].split(":", 1)[0])
+    owned.add(pid)
+    waiting = script("const event = await dbg.continueForStop(dbg.pid, {timeoutMs: 5000}); if (event.kind !== 'signal') throw new Error(event.kind);", wait_ms=0)
+    deadline = time.monotonic() + 3
+    stopped = waiting
+    while "SIGSEGV" not in stopped:
+        assert time.monotonic() < deadline, stopped
+        stopped += tool("syscall_table", name="read")
+    assert "Fault address:" in stopped and "Target PID" in stopped, stopped
+    assert "SIGSEGV" in tool("status")
+    assert script("await dbg.kill();") == f"Killed process {pid}."
+    owned.remove(pid)
+
+    running = tool("run", path=fixture, arg=["events"], pause=True)
+    pid = int(running.split("Started process ", 1)[1].split(":", 1)[0])
+    owned.add(pid)
+    waiting = script("""
+        const addr = (await dbg.getSymbol("fixture_stop"))!.address;
+        dbg.softwareBreakpoint(addr);
+        const hit = await dbg.continueForStop(dbg.pid, {timeoutMs: 5000});
+        console.log(hit.kind);
+    """, wait_ms=0)
+    assert "waiting for a target stop" in waiting, waiting
+    deadline = time.monotonic() + 3
+    status = tool("status")
+    while "breakpoint #" not in status:
+        assert time.monotonic() < deadline, status
+        status = tool("status")
+    assert "[event " in status and "breakpoint #" in tool("status"), status
+    killed = script("await dbg.kill();")
+    assert f"Killed process {pid}." in killed, killed
+    owned.remove(pid)
 
 
 def validate_presentation(client, fixture, owned):
@@ -1070,6 +1198,7 @@ def main():
                 assert Path(socket).exists(), "debugger server did not start"
                 token = "integration-session-" + os.urandom(16).hex()
                 client = Client(client_exe, socket, token)
+                validate_text_output(client, fixtures[0], owned)
                 validate_types_and_input(client)
                 validate_presentation(client, fixtures[0], owned)
                 validate_session_extensions(client, fixtures[0], owned)

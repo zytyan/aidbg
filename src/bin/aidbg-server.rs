@@ -85,6 +85,10 @@ impl Service {
     }
 
     async fn command<T>(&self, request: Request<T>, command: impl FnOnce(T) -> Command) -> Reply {
+        let text_output = request
+            .metadata()
+            .get("aidbg-presentation")
+            .is_some_and(|value| value == "text");
         let receiver = {
             let mut sessions = self.sessions.lock().map_err(internal)?;
             let lease = Self::lease(&request, &mut sessions)?;
@@ -95,10 +99,21 @@ impl Service {
                 ),
             };
             worker
-                .request(command(request.into_inner()))
+                .request(command(request.into_inner()), text_output)
                 .map_err(internal)?
         };
-        Ok(Response::new(receiver.await.map_err(internal)?))
+        let mut reply = receiver.await.map_err(internal)?;
+        if !text_output {
+            reply.script_output.retain(|row| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&row.json).unwrap_or_default();
+                !matches!(
+                    value["kind"].as_str(),
+                    Some("operation_result" | "script_cancelled")
+                )
+            });
+        }
+        Ok(Response::new(reply))
     }
 }
 

@@ -86,12 +86,25 @@ pub(super) struct Location {
     pub column: Option<u64>,
 }
 
+static FRAME: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"script-(\d+)\.js:(\d+)(?::(\d+))?").unwrap());
+
+pub(super) fn origin(stack: &str, active: impl Fn(u64) -> bool) -> Option<u64> {
+    let mut nearest = None;
+    for frame in FRAME.captures_iter(stack) {
+        let id = frame[1].parse().ok()?;
+        if active(id) {
+            return Some(id);
+        }
+        nearest = nearest.or(Some(id));
+    }
+    nearest
+}
+
 pub(super) fn remap(
     stack: &str,
     maps: &BTreeMap<u64, SourceMap>,
 ) -> (String, Option<u64>, Option<Location>) {
-    static FRAME: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"script-(\d+)\.js:(\d+)(?::(\d+))?").unwrap());
     let mut script = None;
     let mut location = None;
     let mapped = FRAME

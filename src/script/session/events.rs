@@ -25,6 +25,7 @@ pub(super) enum Kind {
 #[serde(rename_all = "camelCase")]
 pub(super) struct Request {
     pub kind: Kind,
+    pub script_id: Option<u64>,
     pub tid: Option<i32>,
     pub timeout_ms: Option<u64>,
     pub resume: Option<bool>,
@@ -35,6 +36,7 @@ pub(super) struct Request {
 
 struct Wait {
     kind: Kind,
+    script_id: Option<u64>,
     paused_only: bool,
     tid: Option<i32>,
     after: u64,
@@ -184,6 +186,7 @@ impl Queue {
         }
         let wait = Wait {
             kind: request.kind,
+            script_id: request.script_id,
             paused_only: request.paused_only == Some(true),
             tid: request.tid,
             after: if request.fresh == Some(true) {
@@ -263,7 +266,11 @@ impl Queue {
         results
     }
 
-    pub fn status(&self) -> Vec<Value> {
+    pub fn pending(&self) -> impl Iterator<Item = &Value> {
+        self.events.iter().map(|entry| &entry.row)
+    }
+
+    pub fn status(&self, text_output: bool) -> Vec<Value> {
         self.waiters
             .iter()
             .map(|(&id, wait)| {
@@ -274,7 +281,11 @@ impl Queue {
                     Kind::ProcessExit => "process_exit",
                     Kind::Batch => "stops",
                 };
-                json!({"id":id, "kind":kind, "tid":wait.tid})
+                let mut row = json!({"id":id, "kind":kind, "tid":wait.tid});
+                if text_output {
+                    row["scriptId"] = json!(wait.script_id);
+                }
+                row
             })
             .collect()
     }

@@ -10,6 +10,8 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tonic::{Request, metadata::AsciiMetadataValue};
 
+mod mcp_text;
+
 const API_URI: &str = "aidbg://debugger.d.ts";
 const NODE_API_URI: &str = "aidbg://node.d.ts";
 
@@ -170,6 +172,8 @@ struct Mcp {
 struct Connection {
     client: Client,
     session: AsciiMetadataValue,
+    presentation: Arc<Mutex<mcp_text::Presentation>>,
+    text_output: bool,
 }
 
 impl Connection {
@@ -178,6 +182,11 @@ impl Connection {
         request
             .metadata_mut()
             .insert("aidbg-session", self.session.clone());
+        if self.text_output {
+            request
+                .metadata_mut()
+                .insert("aidbg-presentation", "text".parse().unwrap());
+        }
         request
     }
 
@@ -210,6 +219,18 @@ impl rmcp::ServerHandler for Mcp {
                     .list_all()
                     .into_iter()
                     .chain(Connection::tool_router().list_all())
+                    .map(|mut tool| {
+                        let schema = Arc::make_mut(&mut tool.input_schema);
+                        if !schema.get("properties").is_some_and(Value::is_object) {
+                            schema.insert("properties".into(), json!({}));
+                        }
+                        schema.get_mut("properties").unwrap().as_object_mut().unwrap().insert(
+                            "output_format".into(),
+                            json!({"type":"string","enum":["text","structured"],"default":"text",
+                                "description":"Select structured output explicitly for existing machine clients."}),
+                        );
+                        tool
+                    })
                     .collect(),
             ))
         }
@@ -249,28 +270,80 @@ impl rmcp::ServerHandler for Mcp {
 
     async fn call_tool(
         &self,
-        request: rmcp::model::CallToolRequestParams,
+        mut request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> std::result::Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         use rmcp::handler::server::tool::ToolCallContext;
-
-        if matches!(request.name.as_ref(), "connect" | "docs") {
-            return Self::tool_router()
-                .call(ToolCallContext::new(self, request, context))
-                .await;
+        let format = request
+            .arguments
+            .as_mut()
+            .and_then(|args| args.remove("output_format"));
+        let structured = match format.as_ref().and_then(Value::as_str) {
+            Some("structured") => true,
+            Some("text") => false,
+            None if format.is_none() => false,
+            _ => return Ok(mcp_text::error("output_format must be text or structured").into()),
+        };
+        let name = request.name.clone();
+        let source = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("src"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let path = request
+            .arguments
+            .as_ref()
+            .and_then(|args| {
+                if name == "script_run" {
+                    args.get("run").and_then(|run| run.get("path"))
+                } else {
+                    args.get("path")
+                }
+            })
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut connection = self.connection.lock().await.clone();
+        if let Some(connection) = &mut connection {
+            connection.text_output = !structured;
         }
-        let connection = self.connection.lock().await.clone();
-        match connection {
-            Some(connection) => {
-                Connection::tool_router()
-                    .call(ToolCallContext::new(&connection, request, context))
-                    .await
-            }
-            None => Ok(CallToolResult::structured_error(json!({
+        let response = if matches!(name.as_ref(), "connect" | "docs") {
+            Self::tool_router()
+                .call(ToolCallContext::new(self, request, context))
+                .await?
+        } else if let Some(connection) = &connection {
+            Connection::tool_router()
+                .call(ToolCallContext::new(connection, request, context))
+                .await?
+        } else {
+            mcp_text::document_error(json!({
                 "error": "Call connect with a server socket or endpoint first."
             }))
-            .into()),
-        }
+            .into()
+        };
+        let rmcp::model::CallToolResponse::Complete(result) = response else {
+            return Ok(response);
+        };
+        let rendered = if let Some(connection) = &connection
+            && !matches!(name.as_ref(), "connect" | "docs")
+        {
+            connection.presentation.lock().await.render(
+                result,
+                &name,
+                source.as_deref(),
+                path.as_deref(),
+                structured,
+            )
+        } else {
+            mcp_text::Presentation::default().render(
+                result,
+                &name,
+                source.as_deref(),
+                path.as_deref(),
+                structured,
+            )
+        };
+        Ok(rendered.into())
     }
 }
 
@@ -278,7 +351,7 @@ impl rmcp::ServerHandler for Mcp {
 impl Mcp {
     #[tool(description = "Show script entry semantics and a TypeScript API summary.")]
     async fn docs(&self) -> CallToolResult {
-        CallToolResult::structured(json!({
+        mcp_text::document(json!({
             "instructions": "script_run executes the module's top-level code. Exports are available on $ to subsequent scripts. Use run and attach for debugging and a shell tool for shell commands. The default fork policy follows the parent.",
             "declarations": include_str!("script/session/summary.d.ts"),
             "modules": include_str!("script/session/node.d.ts"),
@@ -291,8 +364,8 @@ impl Mcp {
     )]
     async fn connect(&self, Parameters(args): Parameters<ConnectArgs>) -> CallToolResult {
         match self.open_connection(args).await {
-            Ok(result) => CallToolResult::structured(result),
-            Err(error) => CallToolResult::structured_error(json!({"error": error.to_string()})),
+            Ok(result) => mcp_text::document(result),
+            Err(error) => mcp_text::document_error(json!({"error": error.to_string()})),
         }
     }
 
@@ -320,6 +393,8 @@ impl Mcp {
         let connection = Connection {
             client: connect(endpoint).await?,
             session: session.parse()?,
+            presentation: Arc::default(),
+            text_output: false,
         };
         connection.heartbeat().await?;
         *active = Some(connection);
@@ -340,7 +415,7 @@ fn reply(
 ) -> CallToolResult {
     let result = match response {
         Ok(response) => response.into_inner(),
-        Err(error) => return CallToolResult::structured_error(json!({"error":error.message()})),
+        Err(error) => return mcp_text::document_error(json!({"error":error.message()})),
     };
     let inputs: Vec<_> = result
         .waiting_inputs
@@ -398,9 +473,9 @@ fn reply(
         "prompts":prompts,
     });
     if result.error.is_some() {
-        CallToolResult::structured_error(document)
+        mcp_text::document_error(document)
     } else {
-        CallToolResult::structured(document)
+        mcp_text::document(document)
     }
 }
 
@@ -439,20 +514,12 @@ impl Connection {
 
     #[tool(description = "Read the current debugger session and target state without pausing it.")]
     async fn status(&self) -> CallToolResult {
-        let response = self
-            .client
-            .clone()
-            .status(self.request(HeartbeatRequest {}))
-            .await;
-        let text = response
-            .as_ref()
-            .ok()
-            .and_then(|row| serde_json::from_slice::<String>(&row.get_ref().result_json).ok());
-        let mut result = reply(response);
-        if let Some(text) = text {
-            result.content = vec![rmcp::model::ContentBlock::text(text)];
-        }
-        result
+        reply(
+            self.client
+                .clone()
+                .status(self.request(HeartbeatRequest {}))
+                .await,
+        )
     }
 
     #[tool(
@@ -473,7 +540,7 @@ impl Connection {
     #[tool(description = "Execute a supported GDB command against the current aidbg session.")]
     async fn gdb(&self, Parameters(args): Parameters<GdbArgs>) -> CallToolResult {
         if args.command.is_empty() || args.command.len() > 4096 {
-            return CallToolResult::structured_error(
+            return mcp_text::document_error(
                 json!({"error":"expected a GDB command of 1–4096 bytes"}),
             );
         }
@@ -496,19 +563,21 @@ impl Connection {
         reply(
             self.client
                 .clone()
-                .script_run(
-                    self.request(RunScriptRequest {
-                        src: args.src,
-                        wait_ms: args
-                            .wait_ms
-                            .unwrap_or(if args.run.is_some() { 5000 } else { 0 }),
-                        run: args.run.map(|run| RunProcessRequest {
-                            path: run.path,
-                            arg: run.arg,
-                            pause: run.pause,
-                        }),
+                .script_run(self.request(RunScriptRequest {
+                    src: args.src,
+                    wait_ms: args.wait_ms.unwrap_or(if self.text_output {
+                        100
+                    } else if args.run.is_some() {
+                        5000
+                    } else {
+                        0
                     }),
-                )
+                    run: args.run.map(|run| RunProcessRequest {
+                        path: run.path,
+                        arg: run.arg,
+                        pause: run.pause,
+                    }),
+                }))
                 .await,
         )
     }
@@ -616,7 +685,7 @@ impl Connection {
     }
 
     #[tool(
-        description = "List processes as structured JSON. Use threads for individual TIDs and fields to include command lines."
+        description = "List processes. Use threads for individual TIDs and fields to include command lines."
     )]
     async fn ps(&self, Parameters(args): Parameters<PsArgs>) -> CallToolResult {
         reply(

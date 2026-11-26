@@ -35,6 +35,7 @@ use std::{
 use tokio::sync::oneshot;
 
 const MAX_OUTPUT: usize = 1024 * 1024;
+const TEXT_OUTPUT_BATCH: usize = 64 * 1024;
 const MAX_GLOBALS: usize = 1024 * 1024;
 const MAX_PENDING: usize = 64;
 const SCRIPT_SLICE: Duration = Duration::from_secs(2);
@@ -63,7 +64,7 @@ pub enum Command {
     Result(Result<Value>),
 }
 
-type Message = (Command, oneshot::Sender<ToolReply>);
+type Message = (Command, oneshot::Sender<ToolReply>, bool);
 
 pub struct Worker {
     queue: mpsc::SyncSender<Message>,
@@ -90,12 +91,14 @@ impl Worker {
         })
     }
 
-    pub fn request(&self, cmd: Command) -> Result<oneshot::Receiver<ToolReply>> {
+    pub fn request(&self, cmd: Command, text_output: bool) -> Result<oneshot::Receiver<ToolReply>> {
         let (send, receive) = oneshot::channel();
-        self.queue.try_send((cmd, send)).map_err(|err| match err {
-            mpsc::TrySendError::Full(_) => error("debugger session queue is full"),
-            mpsc::TrySendError::Disconnected(_) => error("debugger session has ended"),
-        })?;
+        self.queue
+            .try_send((cmd, send, text_output))
+            .map_err(|err| match err {
+                mpsc::TrySendError::Full(_) => error("debugger session queue is full"),
+                mpsc::TrySendError::Disconnected(_) => error("debugger session has ended"),
+            })?;
         Ok(receive)
     }
 
@@ -114,6 +117,7 @@ impl Drop for Worker {
 }
 
 struct Waiting {
+    script_id: Option<u64>,
     tid: Option<i32>,
     deadline: Instant,
     payload: Value,
@@ -125,6 +129,7 @@ struct State {
     released_output: VecDeque<(i32, process_io::ProcessIo, Option<crate::trace::LaunchExit>)>,
     follow_fork: bool,
     generation: u64,
+    target_change_script: Option<u64>,
     state_dir: PathBuf,
     cancelled: Arc<AtomicBool>,
     waiting: BTreeMap<String, Waiting>,
@@ -157,6 +162,16 @@ impl State {
             }
             None => String::from("Target: none\n"),
         });
+        let fork = if self.follow_fork { "child" } else { "parent" };
+        writeln!(text, "Fork policy: {fork}").unwrap();
+        if matches!(self.target, Some(Target::Live(_))) {
+            let sigchld = if self.signals.contains(&(nix::libc::SIGCHLD)) {
+                "script callback"
+            } else {
+                "pass to target"
+            };
+            writeln!(text, "Signal policy: stop on delivery (SIGCHLD: {sigchld})").unwrap();
+        }
         writeln!(text, "Pending events: {}", self.events.len()).unwrap();
         let scripts = self
             .active_scripts
@@ -224,12 +239,12 @@ impl State {
             live.trace.follow_fork = self.follow_fork;
         }
         self.generation += 1;
+        self.target_change_script = None;
         self.signals.clear();
         self.events.reset();
         self.dispatches.clear();
         self.reported_signals.clear();
         self.timers.clear();
-        self.source_maps.clear();
         self.target_error = None;
         released
     }
@@ -310,7 +325,7 @@ impl State {
                 && let Some(row) = self.events.row(sequence)
                 && let Some(summary) = live.stop_summary(tid, row)
             {
-                summaries.push(summary);
+                summaries.push((sequence, summary));
             }
             if let Some(report) = self
                 .reported_signals
@@ -320,8 +335,11 @@ impl State {
                 report["paused"] = json!(held);
             }
         }
-        for text in summaries {
-            self.log(0, json!({"kind":"stop_summary", "text":text}));
+        for (sequence, text) in summaries {
+            self.log(
+                0,
+                json!({"kind":"stop_summary", "text":text, "sequence":sequence, "tid":tid}),
+            );
         }
     }
 
@@ -482,6 +500,7 @@ impl State {
                 self.waiting.insert(
                     handler.clone(),
                     Waiting {
+                        script_id: args["scriptId"].as_u64(),
                         tid,
                         payload: payload.clone(),
                         deadline: Instant::now() + Duration::from_millis(timeout),
@@ -561,13 +580,19 @@ impl State {
                 Ok(Value::Null)
             }
             "detach" => {
+                let script_id = args["scriptId"].as_u64();
                 self.target.as_mut().ok_or_else(no_target)?.operation(
                     op,
                     args,
                     &self.state_dir,
                     &self.cancelled,
                 )?;
-                self.replace(None);
+                let released = self.replace(None);
+                if let Some(pid) = released.first() {
+                    self.target_change_script = script_id;
+                    self.log(script_id.unwrap_or_default(),
+                        json!({"kind":"operation_result","text":format!("Detached from PID {pid}.")}));
+                }
                 Ok(Value::Null)
             }
             "kill" => {
@@ -577,11 +602,27 @@ impl State {
                     nix::libc::SIGKILL
                 };
                 let live = self.target.as_mut().ok_or_else(no_target)?.live()?;
+                let pid = live.pid;
                 let result = live.kill_and_detach(signal);
                 if live.trace.threads.is_empty() {
                     self.replace(None);
+                    self.target_change_script = args["scriptId"].as_u64();
                 }
-                result.map(|()| Value::Null)
+                let exited = result?;
+                let text = if exited && signal == nix::libc::SIGKILL {
+                    format!("Killed process {pid}.")
+                } else if exited {
+                    format!("Sent signal {signal} to PID {pid}. The process exited.")
+                } else {
+                    format!(
+                        "Sent signal {signal} to PID {pid} and detached. Exit has not been confirmed."
+                    )
+                };
+                self.log(
+                    args["scriptId"].as_u64().unwrap_or_default(),
+                    json!({"kind":"operation_result","text":text}),
+                );
+                Ok(Value::Null)
             }
             _ => self.target.as_mut().ok_or_else(no_target)?.operation(
                 op,
@@ -595,16 +636,27 @@ impl State {
     fn send_reply(
         &mut self,
         reply: oneshot::Sender<ToolReply>,
-        result: Result<Value>,
+        mut result: Result<Value>,
         pending: &[Pending<'_>],
+        text_output: bool,
     ) {
         if !reply.is_closed() {
-            let mut message = crate::snapshot_timing::measure("reply_encoding", || {
-                self.tool_reply(result, pending, true)
-            });
+            if text_output
+                && let Ok(value) = &mut result
+                && matches!(value["status"].as_str(), Some("accepted" | "wait_timeout"))
+                && let Some(outcome) = value["script_id"]
+                    .as_u64()
+                    .and_then(|id| self.script_outcomes.get(&id))
+            {
+                value["status"] = json!(outcome);
+            }
+            let (mut message, collected) =
+                crate::snapshot_timing::measure("reply_encoding", || {
+                    self.tool_reply(result, pending, true, text_output)
+                });
             let output_cursor = match self.target.as_ref() {
                 Some(Target::Live(live)) => live.stdio.as_ref().map(|stdio| {
-                    let (mut value, cursor) = stdio.mcp_output();
+                    let (mut value, cursor) = stdio.mcp_output(text_output);
                     value["pid"] = json!(live.pid);
                     append_exit_status(&mut value, live.trace.exit);
                     message.process_output_json = value.to_string().into_bytes();
@@ -612,8 +664,33 @@ impl State {
                 }),
                 _ => None,
             };
+            let mut released_cursors = Vec::new();
+            if text_output {
+                let mut released = Vec::new();
+                for (index, (pid, stdio, _)) in self.released_output.iter().enumerate() {
+                    let (mut value, cursor) = stdio.mcp_output(true);
+                    if value["chunks"]
+                        .as_array()
+                        .is_some_and(|chunks| !chunks.is_empty())
+                        || value["truncated"] == true
+                    {
+                        value["pid"] = json!(pid);
+                        released.push(value);
+                        released_cursors.push((index, cursor));
+                    }
+                }
+                if !released.is_empty() {
+                    let mut process = serde_json::from_slice::<Value>(&message.process_output_json)
+                        .unwrap_or_default();
+                    process["released"] = json!(released);
+                    message.process_output_json = process.to_string().into_bytes();
+                }
+            }
             match reply.send(message) {
                 Ok(()) => {
+                    for (index, cursor) in released_cursors {
+                        self.released_output[index].1.acknowledge(cursor);
+                    }
                     if let Some(cursor) = output_cursor
                         && let Some(Target::Live(live)) = self.target.as_mut()
                         && let Some(stdio) = &mut live.stdio
@@ -621,13 +698,18 @@ impl State {
                         stdio.acknowledge(cursor);
                     }
                 }
-                Err(message) => {
+                Err(mut message) => {
+                    if text_output {
+                        message.script_output.pop();
+                    }
                     self.output_size += message
                         .script_output
                         .iter()
                         .map(|row| row.json.len() + 16)
                         .sum::<usize>();
-                    self.output.extend(message.script_output);
+                    for (position, row) in collected.into_iter().zip(message.script_output) {
+                        self.output.insert(position, row);
+                    }
                     self.output_dropped |= message.output_dropped;
                     self.reported_signals =
                         serde_json::from_slice(&message.signals_json).unwrap_or_default();
@@ -641,57 +723,129 @@ impl State {
         result: Result<Value>,
         pending: &[Pending<'_>],
         collect_output: bool,
-    ) -> ToolReply {
+        text_output: bool,
+    ) -> (ToolReply, Vec<usize>) {
         let (result_json, error) = match result {
             Ok(value) => (value.to_string().into_bytes(), None),
             Err(err) => (Vec::new(), Some(err.to_string())),
         };
         let mut script_output = Vec::new();
-        for _ in 0..if collect_output { self.output.len() } else { 0 } {
+        let mut collected = Vec::new();
+        let mut bytes = 0;
+        let mut more = false;
+        for position in 0..if collect_output { self.output.len() } else { 0 } {
             let row = self.output.pop_front().unwrap();
-            if self.script_waiting.contains(&row.script_id) {
-                self.output.push_back(row);
-            } else {
-                self.output_size -= row.json.len() + 16;
+            let size = row.json.len() + 16;
+            let reserved = self.script_waiting.contains(&row.script_id);
+            // Keep a single preformatted entry intact, even if it exceeds the batch budget.
+            if !reserved
+                && (!text_output || bytes == 0 || bytes + size <= TEXT_OUTPUT_BATCH)
+                && !more
+            {
+                self.output_size -= size;
+                bytes += size;
+                collected.push(position);
                 script_output.push(row);
+            } else {
+                more |= text_output;
+                self.output.push_back(row);
             }
         }
-        ToolReply {
-            result_json,
-            error,
-            paused_threads: match &self.target {
-                Some(Target::Live(live)) => live.paused.union(&live.callbacks).copied().collect(),
-                _ => Vec::new(),
-            },
-            paused_stops_json: match &self.target {
-                Some(Target::Live(live)) => json!(live.paused_stops()).to_string().into_bytes(),
-                _ => Vec::new(),
-            },
-            waiting_inputs: self
-                .waiting
-                .iter()
-                .map(|(handler, state)| WaitingInput {
-                    handler: handler.clone(),
-                    tid: state.tid,
-                    payload_json: state.payload.to_string().into_bytes(),
+        if text_output {
+            let target = match &self.target {
+                Some(Target::Live(live)) => {
+                    json!({"pid": live.pid, "state": live.execution_state()})
+                }
+                Some(Target::Core(core)) => json!({"pid": core.session_pid(), "state": "core"}),
+                None => Value::Null,
+            };
+            let events = self
+                .events
+                .pending()
+                .map(|row| {
+                    let mut summary = serde_json::Map::new();
+                    for key in [
+                        "sequence",
+                        "kind",
+                        "tid",
+                        "paused",
+                        "breakpointId",
+                        "address",
+                        "faultAddress",
+                        "signalName",
+                        "scope",
+                        "code",
+                        "signal",
+                        "parentPid",
+                        "executable",
+                        "before",
+                        "after",
+                        "hitCount",
+                        "reason",
+                        "name",
+                        "number",
+                        "phase",
+                    ] {
+                        if let Some(value) = row.get(key) {
+                            summary.insert(key.into(), value.clone());
+                        }
+                    }
+                    summary
                 })
-                .collect(),
-            script_output,
-            output_dropped: collect_output && std::mem::take(&mut self.output_dropped),
-            running_scripts: pending.iter().map(|script| script.id).collect(),
-            target_error: self.target_error.clone(),
-            waiting_events_json: json!(self.events.status()).to_string().into_bytes(),
-            signals_json: if collect_output {
-                json!(self.reported_signals.drain(..).collect::<Vec<_>>())
-                    .to_string()
-                    .into_bytes()
-            } else {
-                Vec::new()
-            },
-            pending_events: self.events.len() as u32,
-            event_queue_full: self.events.len() >= events::QUEUE_LIMIT,
-            process_output_json: Vec::new(),
+                .collect::<Vec<_>>();
+            script_output.push(ScriptOutput {
+                script_id: 0,
+                json: json!({"kind":"session_presentation","target":target,"events":events,
+                    "inputScripts": self.waiting.iter().filter_map(|(handler, wait)|
+                        wait.script_id.map(|id| (handler, id))).collect::<BTreeMap<_, _>>(),
+                    "outcomes": self.script_outcomes, "outputDropped": self.output_dropped, "moreOutput": more})
+                .to_string()
+                .into_bytes(),
+            });
         }
+        (
+            ToolReply {
+                result_json,
+                error,
+                paused_threads: match &self.target {
+                    Some(Target::Live(live)) => {
+                        live.paused.union(&live.callbacks).copied().collect()
+                    }
+                    _ => Vec::new(),
+                },
+                paused_stops_json: match &self.target {
+                    Some(Target::Live(live)) => json!(live.paused_stops()).to_string().into_bytes(),
+                    _ => Vec::new(),
+                },
+                waiting_inputs: self
+                    .waiting
+                    .iter()
+                    .map(|(handler, state)| WaitingInput {
+                        handler: handler.clone(),
+                        tid: state.tid,
+                        payload_json: state.payload.to_string().into_bytes(),
+                    })
+                    .collect(),
+                script_output,
+                output_dropped: collect_output && std::mem::take(&mut self.output_dropped),
+                running_scripts: pending.iter().map(|script| script.id).collect(),
+                target_error: self.target_error.clone(),
+                waiting_events_json: json!(self.events.status(text_output))
+                    .to_string()
+                    .into_bytes(),
+                signals_json: if collect_output {
+                    json!(self.reported_signals.drain(..).collect::<Vec<_>>())
+                        .to_string()
+                        .into_bytes()
+                } else {
+                    Vec::new()
+                },
+                pending_events: self.events.len() as u32,
+                event_queue_full: self.events.len() >= events::QUEUE_LIMIT,
+                process_output_json: Vec::new(),
+            },
+            collected,
+        )
     }
 }
 
@@ -723,6 +877,7 @@ struct ScriptWait {
     until: Instant,
     response: Value,
     reply: oneshot::Sender<ToolReply>,
+    text_output: bool,
 }
 
 struct Pending<'js> {
@@ -833,6 +988,7 @@ fn run(
         released_output: VecDeque::new(),
         follow_fork: false,
         generation: 0,
+        target_change_script: None,
         state_dir,
         cancelled: cancelled.clone(),
         waiting: BTreeMap::new(),
@@ -862,8 +1018,17 @@ fn run(
         let mut script_waits = BTreeMap::<u64, ScriptWait>::new();
         let host = state.clone();
         let operation = Function::new(ctx.clone(), move |ctx: Ctx<'_>, op:String, args:String| {
-            let result = serde_json::from_str(&args).map_err(Into::into)
-                .and_then(|args| host.borrow_mut().operation(&op, args));
+            let result = serde_json::from_str::<Value>(&args).map_err(Into::into)
+                .and_then(|mut args| {
+                    let mut state = host.borrow_mut();
+                    if matches!(op.as_str(), "ask" | "eventWait" | "detach" | "kill") {
+                        if let Some(stack) = args["scriptStack"].as_str() {
+                            let script = source_map::origin(stack, |id| state.active_scripts.contains(&id));
+                            args["scriptId"] = json!(script);
+                        }
+                    }
+                    state.operation(&op, args)
+                });
             match result {
                 Ok(value) => Ok(value.to_string()),
                 Err(err) => {
@@ -900,8 +1065,9 @@ fn run(
             sync_generation(&state, &input, &reset, &mut exports, &mut current_generation)?;
             let mut state_ref = state.borrow_mut();
             let ready_waits: Vec<_> = script_waits.extract_if(.., |id, wait| {
+                let awaiting_input = wait.text_output && state_ref.waiting.values().any(|input| input.script_id == Some(*id));
                 let status = state_ref.script_outcomes.get(id).copied()
-                    .or_else(|| (Instant::now() >= wait.until).then_some("wait_timeout"));
+                    .or_else(|| (awaiting_input || Instant::now() >= wait.until).then_some("wait_timeout"));
                 if let Some(status) = status {
                     wait.response["status"] = json!(status);
                 }
@@ -909,10 +1075,10 @@ fn run(
             }).collect();
             for (id, wait) in ready_waits {
                 state_ref.script_waiting.remove(&id);
-                state_ref.send_reply(wait.reply, Ok(wait.response), &pending);
+                state_ref.send_reply(wait.reply, Ok(wait.response), &pending, wait.text_output);
             }
             drop(state_ref);
-            let (command, reply) = match commands.recv_timeout(TICK) {
+            let (command, reply, text_output) = match commands.recv_timeout(TICK) {
                 Ok(message) => message,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -921,7 +1087,7 @@ fn run(
             if matches!(command, Command::Status) {
                 let mut state = state.borrow_mut();
                 let text = state.status();
-                let _ = reply.send(state.tool_reply(Ok(json!(text)), &pending, false));
+                let _ = reply.send(state.tool_reply(Ok(json!(text)), &pending, false, text_output).0);
                 continue;
             }
             deadline.set(Instant::now() + SCRIPT_SLICE);
@@ -950,7 +1116,7 @@ fn run(
                         }
                         let mut state = state.borrow_mut();
                         let Some(Target::Live(live)) = &mut state.target else { unreachable!() };
-                        if pause { live.pause(None)?; }
+                        if pause { live.pause(None)?; } else { live.resume_attach_stops()?; }
                         Ok(json!({"pid":pid,"state":live.execution_state(),"attached":true,"released":[]}))
                     }
                     Command::Core(args) => {
@@ -995,7 +1161,7 @@ fn run(
                         if current.source_maps.len()>=512 {current.source_maps.pop_first();}
                         current.source_maps.insert(id,source_map::SourceMap::parse(&map)?);
                         drop(current);
-                        let js = format!("const [console, fmt] = globalThis.__aidbgOutput({id}, {generation});\n{js}");
+                        let js = format!("const [console, fmt] = globalThis.__aidbgOutput({id}, {generation}, {text_output});\n{js}");
                         deadline.set(Instant::now() + SCRIPT_SLICE);
                         state.borrow_mut().active_scripts.insert(id);
                         let evaluated = Module::declare(ctx.clone(), format!("script-{id}.js"), js)
@@ -1042,9 +1208,10 @@ fn run(
                         until: Instant::now() + Duration::from_millis(u64::from(wait_ms)),
                         response,
                         reply,
+                        text_output,
                     });
                 }
-                result => state.borrow_mut().send_reply(reply, result, &pending),
+                result => state.borrow_mut().send_reply(reply, result, &pending, text_output),
             }
         }
         state.borrow_mut().replace(None);
@@ -1221,7 +1388,7 @@ fn tick(
                         && let Some(Target::Live(live)) = &state.target
                         && let Some(text) = live.stop_summary(tid, &row)
                     {
-                        state.log(0, json!({"kind":"stop_summary", "text":text}));
+                        state.log(0, json!({"kind":"stop_summary", "text":text, "sequence":sequence, "tid":tid}));
                     }
                     state.reported_signals.push_back(row.clone());
                     if callback {
@@ -1327,16 +1494,19 @@ fn pump<'js>(
     }
     let generation = state.borrow().generation;
     pending.retain(|script| {
-        if script.generation != generation {
-            state
-                .borrow_mut()
-                .record_script_outcome(script.id, "cancelled");
+        let changed = script.generation != generation;
+        let result = script.promise.result::<JsValue>();
+        if changed && (state.borrow().target_change_script != Some(script.id) || result.is_none()) {
+            let mut state = state.borrow_mut();
+            state.record_script_outcome(script.id, "cancelled");
+            state.log(script.id, json!({"kind":"script_cancelled"}));
             return false;
         }
-        let Some(result) = script.promise.result::<JsValue>() else {
+        let Some(result) = result else {
             return true;
         };
         let result = match result.catch(ctx) {
+            Ok(_) if changed => Ok(()),
             Ok(_) => (|| -> Result<()> {
                 let namespace = script.module.namespace()?;
                 let keys = namespace

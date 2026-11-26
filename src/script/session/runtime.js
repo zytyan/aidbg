@@ -200,14 +200,77 @@
         });
     }
 
-    function makeConsole(id, generation) {
+    function consoleText(values) {
+        // A standalone string is already formatted by the script.
+        if (values.length === 1 && typeof values[0] === "string") return values[0];
+
+        const active = new WeakSet();
+        const chunks = [];
+        let remaining = 16_384;
+        let truncated = false;
+        const write = text => {
+            if (text.length > remaining) {
+                chunks.push(text.slice(0, remaining).replace(/[\uD800-\uDBFF]$/, ""));
+                truncated = true;
+                remaining = 0;
+            } else {
+                chunks.push(text);
+                remaining -= text.length;
+            }
+        };
+        const format = (value, depth) => {
+            if (valueStore(value)) { write(value.$format()); return; }
+            if (typeof value === "string") {
+                const excerpt = value.slice(0, 1024).replace(/[\uD800-\uDBFF]$/, "");
+                write(depth === 0 ? excerpt : stringify(excerpt));
+                if (excerpt.length < value.length) write(" <truncated string>");
+                return;
+            }
+            if (typeof value === "bigint") { write(String(value) + "n"); return; }
+            if (typeof value === "number" && Object.is(value, -0)) { write("-0"); return; }
+            if (value === null || typeof value !== "object") { write(String(value)); return; }
+            if (active.has(value)) { write("<circular>"); return; }
+            if (depth >= 5) { write("<truncated at depth limit>"); return; }
+            const indexed = Array.isArray(value) || ArrayBuffer.isView(value) && Number.isSafeInteger(value.length);
+            const keys = indexed ? undefined : Object.keys(value);
+            const count = keys?.length ?? value.length;
+            const limit = Math.min(count, 32);
+            active.add(value);
+            write(indexed ? "[" : "{");
+            for (let i = 0; i < limit && !truncated; i++) {
+                if (i) write(", ");
+                const key = indexed ? String(i) : keys[i];
+                if (!indexed) write((/^[a-zA-Z_$][\w$]*$/.test(key) ? key : stringify(key)) + ": ");
+                const property = Object.getOwnPropertyDescriptor(value, key);
+                if (property && !("value" in property)) write("<accessor>");
+                else format(property?.value, depth + 1);
+            }
+            if (count > limit) write((limit ? ", " : "") + "<truncated: " + (count - limit) +
+                (indexed ? " more elements>" : " more fields>"));
+            write(indexed ? "]" : "}");
+            active.delete(value);
+        };
+        for (let i = 0; i < values.length && !truncated; i++) {
+            if (i) write(" ");
+            try { format(values[i], 0); }
+            catch (error) { write("<formatting failed: " + error + ">"); }
+        }
+        if (truncated) chunks.push("\n* Output truncated: console formatting limit reached.");
+        return chunks.join("");
+    }
+
+    function makeConsole(id, generation, textOutput) {
         const check = () => {
             if (generation !== targetGeneration()) throw new Error("debugger target changed");
         };
         return Object.freeze({
             log(...values) {
                 check();
-                rpc("log", {id, value:{kind:"console", values:parse(jsonText(values))}});
+                if (textOutput) {
+                    rpc("log", {id, value:{kind:"console", text:consoleText(values)}});
+                } else {
+                    rpc("log", {id, value:{kind:"console", values:parse(jsonText(values))}});
+                }
             },
 
         });
@@ -674,7 +737,7 @@
             args = {...options, handoff:callback.token, handoffTid:callback.tid,
                 pass:callback.pass, counts:callback.counts};
         }
-        const id = rpc("eventWait", args);
+        const id = rpc("eventWait", {...args, scriptStack: new Error().stack});
         if (callback?.active) callback.active = false;
         return new Promise((resolve, reject) => eventWaiters.set(id, {resolve, reject}));
     }
@@ -684,7 +747,7 @@
         if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 86400000)) {
             throw new RangeError("invalid timeoutMs");
         }
-        const handler = rpc("ask", {payload:parse(jsonText(payload)), timeoutMs, tid});
+        const handler = rpc("ask", {payload:parse(jsonText(payload)), timeoutMs, tid, scriptStack: new Error().stack});
         return new Promise((resolve, reject) => inputs.set(handler,{resolve,reject}));
     }
 
@@ -912,7 +975,7 @@
         async waitExit(timeoutMs) { return waitEvent({kind:"process_exit",timeoutMs},callbackContext); },
         async waitStops(limit, timeoutMs) { return waitEvent({kind:"batch",limit,timeoutMs},callbackContext); },
         async ask(payload, timeoutMs) { return ask(payload,timeoutMs,callbackTid); },
-        async detach() { rpc("detach"); },
+        async detach() { rpc("detach", {scriptStack: new Error().stack}); },
         setForkPolicy(mode) { rpc("setForkPolicy", {mode}); },
         attachDwarf(file, position) {
             if (position !== undefined && typeof position !== "bigint" &&
@@ -931,7 +994,7 @@
             if (phase == null) syscallCatches.delete(key);
             else syscallCatches.set(key, {id:catchId, callback});
         },
-        async kill(signal) { rpc("kill", {signal}); },
+        async kill(signal) { rpc("kill", {signal, scriptStack: new Error().stack}); },
         async prepare() { rpc("prepare"); },
         async prepareScratchPad() { rpc("prepareScratchPad"); },
         onSignal(signal, callback) {
@@ -2276,7 +2339,7 @@
                         : undefined;
                 },
             });
-            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgOutput(id,generation) { return [makeConsole(id,generation),makeFormat(id,generation)]; },setTimeout,clearTimeout,queueMicrotask,sleep,AbortController})) {
+            for (const [name,value] of Object.entries({dbg,m,$:scope,__aidbgOutput(id,generation,textOutput) { return [makeConsole(id,generation,textOutput),makeFormat(id,generation)]; },setTimeout,clearTimeout,queueMicrotask,sleep,AbortController})) {
                 Object.defineProperty(globalThis,name,{value});
             }
         },

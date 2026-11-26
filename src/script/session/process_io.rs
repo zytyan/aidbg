@@ -204,12 +204,12 @@ impl ProcessIo {
         json!({"text":text,"eof":eof,"truncated":std::mem::take(&mut cursor.truncated)})
     }
 
-    pub fn mcp_output(&self) -> (Value, u64) {
-        self.output_at(3)
+    pub fn mcp_output(&self, ordered: bool) -> (Value, u64) {
+        self.output_at(3, ordered)
     }
 
     pub(super) fn wait_output(&mut self) -> (Value, bool) {
-        let (mut result, next) = self.output_at(4);
+        let (mut result, next) = self.output_at(4, false);
         self.cursors[4].next = next;
         self.cursors[4].truncated = false;
         result["eof"] =
@@ -217,9 +217,10 @@ impl ProcessIo {
         (result, next == self.next)
     }
 
-    fn output_at(&self, index: usize) -> (Value, u64) {
+    fn output_at(&self, index: usize, ordered: bool) -> (Value, u64) {
         let cursor = &self.cursors[index];
         let mut parts = [String::new(), String::new()];
+        let mut groups: Vec<(&str, String)> = Vec::new();
         let mut next = cursor.next;
         let mut size = 0;
         for chunk in self
@@ -230,14 +231,25 @@ impl ProcessIo {
             if size + chunk.text.len() > TICK_LIMIT {
                 break;
             }
-            parts[chunk.stream].push_str(&chunk.text);
+            if ordered {
+                let name = ["stdout", "stderr"][chunk.stream];
+                if let Some((_, text)) = groups.last_mut().filter(|(stream, _)| *stream == name) {
+                    text.push_str(&chunk.text);
+                } else {
+                    groups.push((name, chunk.text.clone()));
+                }
+            } else {
+                parts[chunk.stream].push_str(&chunk.text);
+            }
             size += chunk.text.len();
             next = chunk.sequence + 1;
         }
-        (
-            json!({"stdout":parts[0],"stderr":parts[1],"truncated":cursor.truncated}),
-            next,
-        )
+        let result = if ordered {
+            json!({"chunks":groups,"truncated":cursor.truncated,"more":next < self.next})
+        } else {
+            json!({"stdout":parts[0],"stderr":parts[1],"truncated":cursor.truncated})
+        };
+        (result, next)
     }
 
     pub fn acknowledge(&mut self, next: u64) {
