@@ -148,7 +148,7 @@ impl Index {
 }
 
 pub(super) struct Data {
-    pub(super) id: String,
+    id: OnceLock<String>,
     sections: DwarfSections<Vec<u8>>,
     index: OnceLock<Option<Index>>,
     index_queued: AtomicBool,
@@ -157,18 +157,13 @@ pub(super) struct Data {
 
 impl Data {
     pub fn load(obj: &object::File<'_>) -> Result<Arc<Self>> {
-        use sha2::{Digest, Sha256};
         let section_bytes = std::cell::Cell::new(0);
-        let digest = std::cell::RefCell::new(Sha256::new());
         let sections = load_sections(obj, |bytes| {
             section_bytes.set(section_bytes.get() + bytes.len());
-            let mut digest = digest.borrow_mut();
-            digest.update((bytes.len() as u64).to_le_bytes());
-            digest.update(&bytes);
             bytes.into_owned()
         })?;
         let data = Arc::new(Self {
-            id: crate::modules::id_hex(&digest.into_inner().finalize()),
+            id: OnceLock::new(),
             sections,
             index: OnceLock::new(),
             index_queued: AtomicBool::new(false),
@@ -176,6 +171,19 @@ impl Data {
         });
         data.schedule();
         Ok(data)
+    }
+
+    pub(super) fn id(&self) -> &str {
+        use sha2::{Digest, Sha256};
+        self.id.get_or_init(|| {
+            let mut digest = Sha256::new();
+            let _ = self.sections.borrow(|bytes| {
+                digest.update((bytes.len() as u64).to_le_bytes());
+                digest.update(bytes);
+                EndianSlice::new(bytes, LittleEndian)
+            });
+            crate::modules::id_hex(&digest.finalize())
+        })
     }
 
     pub fn schedule(self: &Arc<Self>) {

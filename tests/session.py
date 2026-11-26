@@ -934,7 +934,12 @@ def validate_debug_cases(client, fixtures, owned):
         }
         if (!output.includes("refresh started") || !output.includes("reconcile started")) throw new Error(output);
         const {threads, incomplete} = await dbg.backtraceAll();
-        if (incomplete?.length) throw new Error(dbg.stringify(incomplete));
+        if (incomplete?.some(issue => ["stop","registers"].includes(issue.stage))) {
+            throw new Error(dbg.stringify(incomplete));
+        }
+        if (threads.some(thread => Object.keys(thread.registers).length === 0)) {
+            throw new Error("snapshot lost registers");
+        }
         const frames = threads.flatMap(thread => thread.frames);
         if (!frames.some(frame => frame.symbol === "refresh") || !frames.some(frame => frame.symbol === "reconcile"))
             throw new Error(dbg.stringify(threads));

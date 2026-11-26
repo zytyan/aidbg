@@ -163,7 +163,7 @@ impl offline::DwarfImage {
                 candidate.priority,
                 Graph {
                     root,
-                    identity: graph_identity(&self.data.id, &builder, root),
+                    identity: graph_identity(self.data.id(), &builder, root),
                     nodes: builder.nodes,
                     module: self.path.clone(),
                 },
@@ -246,7 +246,7 @@ impl offline::DwarfImage {
                 };
                 let graph = builder.entry(entry.offset(), 0).map(|root| Graph {
                     root,
-                    identity: graph_identity(&self.data.id, &builder, root),
+                    identity: graph_identity(self.data.id(), &builder, root),
                     nodes: builder.nodes,
                     module: self.path.clone(),
                 });

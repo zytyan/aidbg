@@ -207,14 +207,17 @@ pub(crate) fn general_from_bytes(raw: &[u8]) -> Result<BTreeMap<String, String>>
         .collect()
 }
 
-pub(crate) fn api_read(tid: i32, full: bool) -> Result<serde_json::Value> {
-    let mut general = read(tid)?.general;
+pub(crate) fn api_general(mut general: BTreeMap<String, String>) -> Result<serde_json::Value> {
     #[cfg(target_arch = "x86_64")]
     general.insert("rflags".into(), general["eflags"].clone());
     #[cfg(target_arch = "aarch64")]
     general.insert("cpsr".into(), general["pstate"].clone());
     general.retain(|name, _| API_REGISTERS.iter().any(|(key, _)| key == name));
-    let mut value = serde_json::to_value(general)?;
+    Ok(serde_json::to_value(general)?)
+}
+
+pub(crate) fn api_read(tid: i32, full: bool) -> Result<serde_json::Value> {
+    let mut value = api_general(read(tid)?.general)?;
     if full {
         add_vectors(&mut value, &fp_bytes(tid)?)?;
     }

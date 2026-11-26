@@ -35,7 +35,7 @@ target/release/aidbg-server --state-dir "$state_dir" --socket "$state_dir/aidbg.
 | `script_wait` | 按 `script_id` 等待已提交的脚本，默认等 5 秒。返回 `wait_timeout` 时脚本继续运行。 |
 | `status` | 查看会话、目标、线程、暂停原因、断点、信号回调和正在运行的脚本。查询保留目标状态和待收集的输出。 |
 | `gdb` | 执行支持的 GDB 指令。传入 `command`，例如 `bt`、`info locals` 或 `disassemble main`。 |
-| `snapshot` | 可传入 `tid` 获取指定线程的快照。默认暂停预算为 1 秒，超时可返回部分结果，`stop_timeout_ms: 0` 仅采集已暂停线程。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
+| `snapshot` | 可传入 `tid` 获取指定线程的快照。默认暂停预算为 1 秒，超时可返回部分结果。采集时先保存已暂停线程的寄存器，再分配栈展开预算。`stop_timeout_ms: 0` 仅采集已暂停线程。`context: true` 会附上 live 目标的状态、syscall、文件描述符和等待点。 |
 | `send_input` | 向正在通过 `ask()` 等待回复的 `handler` 传入字符串 `data`。 |
 | `interrupt_input` | 向指定 `handler` 抛出异常，可传入消息 `msg`。 |
 | `perf` | 传入 `pid`，选择 `hotspot` 或 `stack`。可选 `tid`、`duration_ms`、`frequency_hz`。 |

@@ -64,6 +64,12 @@ struct PendingPoint {
     enabled: bool,
 }
 
+struct FrameImages {
+    images: Images,
+    modules: Vec<modules::Module>,
+    executable: Option<fs::Metadata>,
+}
+
 pub(super) struct Live {
     pub pid: i32,
     start: u64,
@@ -646,7 +652,8 @@ impl Live {
                 .into_iter()
                 .collect(),
         };
-        let stop_deadline = Instant::now() + Duration::from_millis(stop_timeout_ms.into());
+        let started = Instant::now();
+        let stop_deadline = started + Duration::from_millis(stop_timeout_ms.into());
         let stop = if stop_timeout_ms == 0 {
             if threads_requested.is_subset(&previous) {
                 Ok(())
@@ -662,14 +669,16 @@ impl Live {
         if tid.is_none() {
             threads_requested.extend(self.tids());
         }
-        let deadline = Instant::now() + DEADLINE;
+        // Keep the complete operation inside the script slice while allowing
+        // more time for collection when stopping the target was fast.
+        let deadline = started + Duration::from_millis(1800);
         let collect = |live: &mut Self| -> Result<_> {
             live.trace.rewind_software_stops()?;
-            let mut threads = Vec::new();
             let mut incomplete = Vec::new();
             if let Err(err) = &stop {
                 incomplete.push(json!({"stage":"stop","error":err.to_string()}));
             }
+            let mut captured = Vec::new();
             for &tid in &threads_requested {
                 if live
                     .trace
@@ -679,47 +688,87 @@ impl Live {
                 {
                     incomplete
                         .push(json!({"tid":tid,"stage":"stop","error":"thread did not stop"}));
-                    continue;
-                }
-                if Instant::now() >= deadline {
+                } else if Instant::now() >= deadline {
                     incomplete.push(
-                        json!({"tid":tid,"stage":"threads","error":"snapshot deadline reached"}),
+                        json!({"tid":tid,"stage":"registers","error":"snapshot deadline reached"}),
                     );
-                    continue;
-                }
-                let thread = (|| -> Result<Value> {
-                    let registers = regs::api_read(tid, false)?;
-                    let frames = live.frames_until(tid, limit, deadline)?;
-                    let locals = frames.first().map(flatten_frame_values).unwrap_or_default();
-                    Ok(json!({"tid":tid,"registers":registers,"frames":frames,"locals":locals}))
-                })();
-                match thread {
-                    Ok(thread) => {
-                        threads.push(thread);
-                        if Instant::now() >= deadline {
-                            incomplete.push(json!({"tid":tid,"stage":"frames","error":"snapshot deadline reached"}));
-                        }
+                } else {
+                    match regs::read(tid) {
+                        Ok(registers) => captured.push((tid, registers, Vec::new())),
+                        Err(err) => incomplete
+                            .push(json!({"tid":tid,"stage":"registers","error":err.to_string()})),
                     }
-                    Err(err) => incomplete
-                        .push(json!({"tid":tid,"stage":"threads","error":err.to_string()})),
                 }
             }
-            let mappings = if Instant::now() < deadline {
-                match live.mappings() {
-                    Ok(mappings) => mappings,
-                    Err(err) => {
-                        incomplete.push(json!({"stage":"mappings","error":err.to_string()}));
-                        json!([])
-                    }
+            let mappings = match live.mappings() {
+                Ok(mappings) => mappings,
+                Err(err) => {
+                    incomplete.push(json!({"stage":"mappings","error":err.to_string()}));
+                    json!([])
                 }
-            } else {
-                incomplete.push(json!({"stage":"mappings","error":"snapshot deadline reached"}));
-                json!([])
             };
+            if !captured.is_empty() {
+                match live.frame_images() {
+                    Ok(mut images) => {
+                        let count = captured.len();
+                        for (index, (tid, registers, frames)) in captured.iter_mut().enumerate() {
+                            let now = Instant::now();
+                            let share =
+                                deadline.saturating_duration_since(now) / (count - index) as u32;
+                            if share.is_zero() {
+                                incomplete.push(json!({"tid":tid,"stage":"frames","error":"snapshot deadline reached"}));
+                                continue;
+                            }
+                            let frame_deadline = now + share;
+                            match live.unwind_frames(
+                                registers.stack,
+                                limit,
+                                frame_deadline,
+                                &mut images,
+                            ) {
+                                Ok(rows) => {
+                                    *frames = rows;
+                                    if Instant::now() >= frame_deadline {
+                                        incomplete.push(json!({"tid":tid,"stage":"frames","error":"snapshot unwind budget exhausted"}));
+                                    }
+                                }
+                                Err(err) => incomplete.push(
+                                    json!({"tid":tid,"stage":"frames","error":err.to_string()}),
+                                ),
+                            }
+                        }
+                    }
+                    Err(err) => incomplete.push(json!({"stage":"frames","error":err.to_string()})),
+                }
+            }
+            let mut threads = Vec::with_capacity(captured.len());
+            for (tid, registers, frames) in captured {
+                let mut rows = Vec::with_capacity(frames.len());
+                let mut skipped = false;
+                for (mut row, stack) in frames {
+                    if Instant::now() < deadline {
+                        live.add_frame_values(&mut row, stack, deadline);
+                    } else {
+                        skipped = true;
+                    }
+                    rows.push(row);
+                }
+                if skipped {
+                    incomplete.push(
+                        json!({"tid":tid,"stage":"variables","error":"snapshot deadline reached"}),
+                    );
+                }
+                let locals = rows.first().map(flatten_frame_values).unwrap_or_default();
+                threads.push(json!({"tid":tid,"registers":regs::api_general(registers.general)?,"frames":rows,"locals":locals}));
+            }
             let mut snapshot = json!({"timestamp":procfs::epoch_ms(),"threads":threads, "mappings":mappings, "threadCount":threads_requested.len(),
                 "consistency":if stop.is_err() { "partial" } else if tid.is_some() { "thread" } else { "all-stopped" }});
-            if context && Instant::now() < deadline {
-                snapshot["context"] = live.process_context();
+            if context {
+                if Instant::now() < deadline {
+                    snapshot["context"] = live.process_context();
+                } else {
+                    incomplete.push(json!({"stage":"context","error":"snapshot deadline reached"}));
+                }
             }
             if !incomplete.is_empty() {
                 snapshot["incomplete"] = json!(incomplete);
@@ -868,23 +917,46 @@ impl Live {
         self.frames_until(tid, limit, Instant::now() + DEADLINE)
     }
 
+    fn frame_images(&self) -> Result<FrameImages> {
+        Ok(FrameImages {
+            images: Images::new(),
+            modules: modules::read(&self.root)?,
+            executable: fs::metadata(self.root.join("exe")).ok(),
+        })
+    }
+
     fn frames_until(&self, tid: i32, limit: usize, deadline: Instant) -> Result<Vec<Value>> {
         let regs = regs::read(tid)?.stack;
-        let maps = modules::read(&self.root)?;
-        let exe = fs::metadata(self.root.join("exe")).ok();
-        let mut images = Images::new();
+        let mut images = self.frame_images()?;
+        Ok(self
+            .unwind_frames(regs, limit, deadline, &mut images)?
+            .into_iter()
+            .map(|(mut row, registers)| {
+                self.add_frame_values(&mut row, registers, deadline);
+                row
+            })
+            .collect())
+    }
+
+    fn unwind_frames(
+        &self,
+        regs: regs::Registers,
+        limit: usize,
+        deadline: Instant,
+        loaded: &mut FrameImages,
+    ) -> Result<Vec<(Value, regs::Registers)>> {
         let mut frame_registers = Vec::new();
-        let mut stack = images.walk_registers(
+        let mut stack = loaded.images.walk_registers(
             &self.trace,
             regs,
-            &maps,
+            &loaded.modules,
             &self.root,
-            exe.as_ref(),
+            loaded.executable.as_ref(),
             deadline,
             |_, registers| frame_registers.push(registers),
         );
         stack.frames.truncate(limit);
-        images.symbolize_until(&mut stack, deadline);
+        loaded.images.symbolize_until(&mut stack, deadline);
         stack
             .frames
             .into_iter()
@@ -901,9 +973,6 @@ impl Live {
                 };
                 let frame = serde_json::to_value(frame)?;
                 let fp = registers.get(regs::FP).ok().map(hex);
-                let values = self
-                    .frame_values(registers, deadline)
-                    .unwrap_or(Value::Null);
                 let source = (Instant::now() < deadline)
                     .then(|| {
                         self.attached_source(registers.get(regs::PC).ok()?)
@@ -915,14 +984,22 @@ impl Live {
                     || (frame["file"].clone(), frame["line"].clone()),
                     |source| (json!(source.file), json!(source.line)),
                 );
-                Ok(json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
+                Ok((json!({"pc":frame["pc"],"lookupPc":frame["lookup_pc"],
                     "sp":frame["sp"],"fp":fp,"symbol":frame["function"],
                     "file":file,"line":line,"unwindMethod":frame["method"],
-                    "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames,
-                    "locals":values["locals"],"parameters":values["parameters"],
-                    "unavailableLocals":values["unavailableLocals"],"unavailableParameters":values["unavailableParameters"]}))
+                    "missingDebugSections":frame["missing_debug_sections"], "inlineFrames":inline_frames}), registers))
             })
             .collect()
+    }
+
+    fn add_frame_values(&self, row: &mut Value, registers: regs::Registers, deadline: Instant) {
+        if let Ok(Value::Object(fields)) = self.frame_values(registers, deadline) {
+            for (key, value) in fields {
+                if !value.is_null() {
+                    row[key] = value;
+                }
+            }
+        }
     }
 
     fn frame_values(&self, registers: regs::Registers, deadline: Instant) -> Result<Value> {
