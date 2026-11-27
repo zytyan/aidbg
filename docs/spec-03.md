@@ -311,3 +311,48 @@ attach/run 新目标时旧目标被悄悄 detach（TracerPid 归 0）。响应�
 threads=true 48KB 直接落盘。加 pattern、limit、fields，默认精简。
 12. help/docs 工具
 aidbg://debugger.d.ts 对 tools-only 客户端不可读，入口语义（"只执行顶层代码，导出函数不自动调用"）也不在 server instructions 里。加一个 docs 工具返回 d.ts 摘要 + 语义说明，能省掉我这次 Object.getOwnPropertyNames(dbg) 的反射。
+
+## 后续改进
+
+### 已定事项
+
+- `m.fromDwarf(name)` 接受运行时字符串。解析失败在调用处报告。静态可确定且能解析的名称继续参与精确类型推导。
+- `$format()` 默认把 C `char[N]` 展示为字符串，最多读取 `N` 字节，在首个 NUL 处停止，并遵守字符串展示上限。没有 NUL 时按有界字符序列展示。`$toJS()` 是否同步返回字符串待定。
+- MCP 已提供 `gdb`，其中 `c` 继续执行并等待停点。补充分离、暂停和立即恢复的工具入口。沿用 `gdb` 命令还是增加 `debug({action})` 待定。
+- `fmt` 直接打印已落地。结构化数据继续由 `dbg` 等 API 提供，`fmt.sprintf()` 和字节数组版 `fmt.hexdump()` 返回字符串。
+
+### 待排期建议
+
+1. 调用栈与 `symbolAt` 共享底层符号查找和缓存，为结构化结果提供 `demangledName`，展示优先采用可读名称。调用者帧使用 `lookupPc`，区分符号区间命中和最近符号候选。
+2. 从 DWARF 导入枚举成员名及其数值。`$format()` 默认显示已知名称，例如 `UV_SIGNAL`，未知值显示数值。`{enums: "raw"}` 始终显示数值。
+3. 为 `$toJS()` 和 `$toJson()` 补空指针与 BigInt 示例。普通空指针在 `$toJS()` 中为 `null`，在 `$toJson()` 摘要中显示为十六进制地址字符串。`$toJS({pointer: "string"})` 只转换地址值，64 位整数仍为 BigInt。序列化报错时提示使用 `$toJson()`。
+4. 补齐基本控制动词的 MCP 入口，并在速查中区分继续并等待停点与立即恢复。
+5. `layout()` 按 C 声明展示指针成员及偏移，例如 `uv_loop_t *loop; // byteoffset: 8`，避免在成员行展开 pointee。
+6. 文档说明 `m.cStr().at(addr)` 读取指针槽位，字符串首地址用 `dbg.memory.readCString(addr, maxLen)` 读取。
+7. 明确 `withFormatter()` 返回新的类型描述符。审视声明签名时保留接收者的具体类型和方法链，并补充 `m.self()` 示例。
+8. 错误信息给出可执行的下一步。`p`/`ptype` 说明支持当前帧中的裸局部变量和形参，并区分不支持的表达式、变量不存在和值不可读。DWARF 类型找不到时提示 `m.findTypes("*Name*")`。考虑让 `deref: true` 表示默认深度。
+9. 在 Quick Start 集中说明 `attach`/`run` 默认 running、`$format()` 默认 `deref: 2`，以及 `maxElements` 控制序列、`maxFields` 控制字段。
+10. 保持 `fmt.*` 作为主命名空间，以 `fmt.backtrace` 为主名。现有 `pVar`、`pType` 的去留及 `pBacktrace` 兼容别名待定。工具描述提供一屏速查。
+11. 从 DWARF 声明独立取得栈帧变量和形参类型。即使值被优化掉或内存不可读，只要声明类型已知，`ptype` 仍应显示它。
+12. 用同一运行时地址和原始回包核对 `addrToLine` 的差异，检查调用者帧 PC、模块地址换算及行表覆盖。按确认的缺口决定是否增加符号级源码回退。
+13. 评估 `fmt.symbols({pattern})` 的字符串模式、`fmt.disassemble(addr, count)` 简写和 `fmt.hexdump(addr, len)` 重载。`fmt.memory(addr, len)` 已覆盖按地址读取并直接打印的场景。
+
+### C++ 标准库
+
+#### DWARF 类型名称匹配
+
+- 优先按真实限定名查找。根据 DWARF 父作用域拼接限定名，命中 typedef 后沿 `DW_AT_type` 获取实际类型。
+- 真实限定名未命中时，复用现有 C++ 名称规则生成标准库简写的候选。优先比较 DWARF 模板参数和类型引用，缺少结构化元数据时解析模板名称。识别已知的标准库 ABI 命名空间，仅在默认模板参数一致时允许省略。例如 `std::vector<app::MyType>` 匹配采用 `std::allocator<app::MyType>` 的实例，自定义 allocator 可用完整名称查询。
+- 返回目标的原始 DWARF 类型，保留模块、ABI 和实际限定名。指向同一类型记录的 typedef 和类定义可去重，存在多个有效候选时报告歧义。
+- 第一批覆盖 `std::string`、`std::string_view` 及对应的宽字符和 UTF 字符别名，以及 `std::vector<T>` 和 `std::array<T, N>`。用固定工具链生成 GCC/libstdc++ 和 Clang/libc++ 的 ELF 与 DWARF 样本，验证标准别名、非类型模板参数、用户类型、自定义 allocator 和 ABI 歧义。标准库头文件作为样本生成依赖。
+- 第二批考虑 `map`、`set`、`unordered_map`、`unordered_set`、`deque`、`list` 和 `forward_list`。后续考虑 `pair`、`tuple`、`optional`、`variant` 和智能指针。`std::pmr` 别名保留其 allocator 语义。
+
+#### 值展示
+
+- 基于目标 DWARF 验证字段和偏移，内置适配器直接生成有界预览。第一批覆盖 `string`、`string_view`、普通 `vector<T>` 和 `array<T, N>`。`vector<bool>` 的压缩布局单独处理。未知布局回退普通字段展示。
+- 后续优先展示 `map` 和 `unordered_map` 的键值对，再扩展其他容器和智能指针。沿节点读取时遵循元素和读取预算。
+
+### 长期项
+
+- 完善 C++ 继承、引用、vtable 和 RTTI。
+- 多目标及会话生命周期沿用 [spec-02 的多实例规划](spec-02.md#暂停恢复和进程生命周期)。客户端通过 TCP 连接远端 `aidbg-server` 已有，`gdbserver` 等远程目标协议待定。
