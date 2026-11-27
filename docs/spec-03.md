@@ -352,6 +352,24 @@ aidbg://debugger.d.ts 对 tools-only 客户端不可读，入口语义（"只执
 - 基于目标 DWARF 验证字段和偏移，内置适配器直接生成有界预览。第一批覆盖 `string`、`string_view`、普通 `vector<T>` 和 `array<T, N>`。`vector<bool>` 的压缩布局单独处理。未知布局回退普通字段展示。
 - 后续优先展示 `map` 和 `unordered_map` 的键值对，再扩展其他容器和智能指针。沿节点读取时遵循元素和读取预算。
 
+### Type System 类模板
+
+```ts
+const Pair = m.template((T, U) => m.class({
+    first: T,
+    second: U,
+}, { name: "app::Pair" }));
+
+fmt.pType(Pair);
+const Concrete = Pair.of(m.i32(), m.u64());
+fmt.pType(Concrete);
+```
+
+- `m.class(fields, options?)` 的名称可选，放在字段之后的选项中。名称用于展示。绑定到目标模块的持久化规则以模块构建和原始 DWARF 类型标识为准。
+- 未实例化模板保留参数与类定义，支持 `fmt.pType()` 和 `.of()`。实例化后的描述符提供大小、对齐和 `.at(address)`。模板定义展示类型参数，实例布局展示实际字段类型和偏移。
+- 复用现有两遍编译。第一遍从内联回调的位置形参提取数量和位置。对可静态解析的 `.of()`，在第二遍的检查副本中注入实例的具体类型。脚本仍按原始代码执行，由 `.of()` 把实际描述符传给回调并校验参数和布局。
+- 实参只能在运行时确定时，静态返回类型退回 `Type.Base<unknown>`。能静态解析时，验收覆盖不同参数数量、嵌套字段、数组和指针的精确推导，以及未实例化模板直接调用 `.at()` 的诊断。`m.self()` 在实例内绑定到自身，递归模板和非类型参数可分别验收。
+
 ### 长期项
 
 - 完善 C++ 继承、引用、vtable 和 RTTI。
