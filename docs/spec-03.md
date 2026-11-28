@@ -1,3 +1,9 @@
+## 实现状态
+
+- 截至 v0.8.1，类型系统已有位域、手工枚举、字节序、pack/align、匿名成员、类型发现、`offsetOf()`、C 字符与终止序列、字节读写和 `layout()` 的实现。[Spec 03 集成用例](../tests/session.py) 覆盖了其中的主要路径。
+- 文档入口已有 MCP `docs`，服务端说明已区分调试启动与普通 shell 命令。快照上下文、停点原因和进程输出等待也已有实现。
+- [Spec 04](spec-04.md) 延续本篇的类型发现、布局和工具体验工作，包含新增的 DWARF 枚举、指针声明展示、C++ 标准库支持和模型评估。
+
 ## TypeSystem 功能完善与问题修复
 
 ### 1. 通用约束
@@ -311,93 +317,3 @@ attach/run 新目标时旧目标被悄悄 detach（TracerPid 归 0）。响应�
 threads=true 48KB 直接落盘。加 pattern、limit、fields，默认精简。
 12. help/docs 工具
 aidbg://debugger.d.ts 对 tools-only 客户端不可读，入口语义（"只执行顶层代码，导出函数不自动调用"）也不在 server instructions 里。加一个 docs 工具返回 d.ts 摘要 + 语义说明，能省掉我这次 Object.getOwnPropertyNames(dbg) 的反射。
-
-## 后续改进
-
-### 已定事项
-
-- `m.fromDwarf(name)` 接受运行时字符串。解析失败在调用处报告。静态可确定且能解析的名称继续参与精确类型推导。
-- `$format()` 默认把 C `char[N]` 展示为字符串，最多读取 `N` 字节，在首个 NUL 处停止，并遵守字符串展示上限。没有 NUL 时按有界字符序列展示。`$toJS()` 是否同步返回字符串待定。
-- MCP 已提供 `gdb`，其中 `c` 继续执行并等待停点。补充分离、暂停和立即恢复的工具入口。沿用 `gdb` 命令还是增加 `debug({action})` 待定。
-- `fmt` 直接打印已落地。结构化数据继续由 `dbg` 等 API 提供，`fmt.sprintf()` 和字节数组版 `fmt.hexdump()` 返回字符串。
-
-### 待排期建议
-
-1. 调用栈与 `symbolAt` 共享底层符号查找和缓存，为结构化结果提供 `demangledName`，展示优先采用可读名称。调用者帧使用 `lookupPc`，区分符号区间命中和最近符号候选。
-2. 从 DWARF 导入枚举成员名及其数值。`$format()` 默认显示已知名称，例如 `UV_SIGNAL`，未知值显示数值。`{enums: "raw"}` 始终显示数值。
-3. 为 `$toJS()` 和 `$toJson()` 补空指针与 BigInt 示例。普通空指针在 `$toJS()` 中为 `null`，在 `$toJson()` 摘要中显示为十六进制地址字符串。`$toJS({pointer: "string"})` 只转换地址值，64 位整数仍为 BigInt。序列化报错时提示使用 `$toJson()`。
-4. 补齐基本控制动词的 MCP 入口，并在速查中区分继续并等待停点与立即恢复。
-5. `layout()` 按 C 声明展示指针成员及偏移，例如 `uv_loop_t *loop; // byteoffset: 8`，避免在成员行展开 pointee。
-6. 文档说明 `m.cStr().at(addr)` 读取指针槽位，字符串首地址用 `dbg.memory.readCString(addr, maxLen)` 读取。
-7. 明确 `withFormatter()` 返回新的类型描述符。审视声明签名时保留接收者的具体类型和方法链，并补充 `m.self()` 示例。
-8. 错误信息给出可执行的下一步。`p`/`ptype` 说明支持当前帧中的裸局部变量和形参，并区分不支持的表达式、变量不存在和值不可读。DWARF 类型找不到时提示 `m.findTypes("*Name*")`。考虑让 `deref: true` 表示默认深度。
-9. 在 Quick Start 集中说明 `attach`/`run` 默认 running、`$format()` 默认 `deref: 2`，以及 `maxElements` 控制序列、`maxFields` 控制字段。
-10. 保持 `fmt.*` 作为主命名空间，以 `fmt.backtrace` 为主名。现有 `pVar`、`pType` 的去留及 `pBacktrace` 兼容别名待定。工具描述提供一屏速查。
-11. 从 DWARF 声明独立取得栈帧变量和形参类型。即使值被优化掉或内存不可读，只要声明类型已知，`ptype` 仍应显示它。
-12. 用同一运行时地址和原始回包核对 `addrToLine` 的差异，检查调用者帧 PC、模块地址换算及行表覆盖。按确认的缺口决定是否增加符号级源码回退。
-13. 评估 `fmt.symbols({pattern})` 的字符串模式、`fmt.disassemble(addr, count)` 简写和 `fmt.hexdump(addr, len)` 重载。`fmt.memory(addr, len)` 已覆盖按地址读取并直接打印的场景。
-
-### C++ 标准库
-
-#### DWARF 类型名称匹配
-
-- 优先按真实限定名查找。根据 DWARF 父作用域拼接限定名，命中 typedef 后沿 `DW_AT_type` 获取实际类型。
-- 真实限定名未命中时，复用现有 C++ 名称规则生成标准库简写的候选。优先比较 DWARF 模板参数和类型引用，缺少结构化元数据时解析模板名称。识别已知的标准库 ABI 命名空间，仅在默认模板参数一致时允许省略。例如 `std::vector<app::MyType>` 匹配采用 `std::allocator<app::MyType>` 的实例，自定义 allocator 可用完整名称查询。
-- 返回目标的原始 DWARF 类型，保留模块、ABI 和实际限定名。指向同一类型记录的 typedef 和类定义可去重，存在多个有效候选时报告歧义。
-- 第一批覆盖 `std::string`、`std::string_view` 及对应的宽字符和 UTF 字符别名，以及 `std::vector<T>` 和 `std::array<T, N>`。用固定工具链生成 GCC/libstdc++ 和 Clang/libc++ 的 ELF 与 DWARF 样本，验证标准别名、非类型模板参数、用户类型、自定义 allocator 和 ABI 歧义。标准库头文件作为样本生成依赖。
-- 第二批考虑 `map`、`set`、`unordered_map`、`unordered_set`、`deque`、`list` 和 `forward_list`。后续考虑 `pair`、`tuple`、`optional`、`variant` 和智能指针。`std::pmr` 别名保留其 allocator 语义。
-
-#### 值展示
-
-- 基于目标 DWARF 验证字段和偏移，内置适配器直接生成有界预览。第一批覆盖 `string`、`string_view`、普通 `vector<T>` 和 `array<T, N>`。`vector<bool>` 的压缩布局单独处理。未知布局回退普通字段展示。
-- 后续优先展示 `map` 和 `unordered_map` 的键值对，再扩展其他容器和智能指针。沿节点读取时遵循元素和读取预算。
-
-### Type System 类模板
-
-```ts
-const Pair = m.template((T, U) => m.class({
-    first: T,
-    second: U,
-}, { name: "app::Pair" }));
-
-fmt.pType(Pair);
-const Concrete = Pair.of(m.i32(), m.u64());
-fmt.pType(Concrete);
-```
-
-- `m.class(fields, options?)` 的名称可选，放在字段之后的选项中。名称用于展示。绑定到目标模块的持久化规则以模块构建和原始 DWARF 类型标识为准。
-- 未实例化模板保留参数与类定义，支持 `fmt.pType()` 和 `.of()`。实例化后的描述符提供大小、对齐和 `.at(address)`。模板定义展示类型参数，实例布局展示实际字段类型和偏移。
-- 复用现有两遍编译。第一遍从内联回调的位置形参提取数量和位置。对可静态解析的 `.of()`，在第二遍的检查副本中注入实例的具体类型。脚本仍按原始代码执行，由 `.of()` 把实际描述符传给回调并校验参数和布局。
-- 实参只能在运行时确定时，静态返回类型退回 `Type.Base<unknown>`。能静态解析时，验收覆盖不同参数数量、嵌套字段、数组和指针的精确推导，以及未实例化模板直接调用 `.at()` 的诊断。`m.self()` 在实例内绑定到自身，递归模板和非类型参数可分别验收。
-
-### 长期项
-
-- 完善 C++ 继承、引用、vtable 和 RTTI。
-- 多目标及会话生命周期沿用 [spec-02 的多实例规划](spec-02.md#暂停恢复和进程生命周期)。客户端通过 TCP 连接远端 `aidbg-server` 已有，`gdbserver` 等远程目标协议待定。
-
-## C 调试优先项
-
-- P0 优先修复跨模块全局变量查找、灵活数组展示、`long double` 类型保真和 DWARF 枚举。查找先尊重当前作用域及局部变量遮蔽，再用符号表缩小全局候选范围，必要时搜索其他模块的 DWARF。同名全局定义应报告歧义。未知长度的灵活数组以内联提示保留其他字段，单次展示可后续支持按字段提供长度。对未支持的 `long double` 保留类型名和布局信息。枚举默认展示已知名称，`enums: "raw"` 保留数值。
-- P1 完善有界 `char[N]` 字符串展示、backtrace 和 `symbolAt` 的共享符号解析、`layout()` 的指针声明、字符串首地址读取说明、`wchar_t` 可选字符展示和静态字段偏移的 `Type.fromField()`。以 GCC 和 Clang 样本验证 `_Atomic` 的 DWARF 表示和读取语义。
-- P2 放宽 `fromDwarf` 的静态字符串限制并保留可解析名称的精确推导。补齐 MCP 执行控制入口、`fmt` 速查、错误处理指引、默认值说明、`withFormatter()` 类型保留验收及 `fmt.symbols(string)` 和 `fmt.disassemble` 数量简写。
-- 类型构造、布局验证和 `Value` 沿用现有 JS 实现。Rust 保留现有 DWARF 解析与导入职责，Rust 类型图和布局引擎迁移不纳入本轮规划。
-
-## 开源项目调试能力验证
-
-D01–D15 保留为基础回归。新增题组面向常规能力模型，使用真实 C/C++ 项目考查从现象定位到对象、状态和代码路径的能力。参测模型独立使用 aidbg 给出诊断及证据。参与实现 aidbg 或编写题目的一方不作为参测者。
-
-### 首批题目
-
-| 题目 | 场景与产物 | 评分依据 |
-| --- | --- | --- |
-| libuv 事件循环无法退出 | 用小型驱动程序构造一个未关闭的 handle，同时提供能正常退出的对照。固定 libuv 版本和构建参数，提供带 DWARF 和仅动态符号两个版本。 | 晚 attach 档确认阻塞点、模块和可恢复的调用链。从启动跟踪档再用公开 API 调用及对象地址确认哪个 handle 一直活跃。带 DWARF 档覆盖停在 libc 时查找驱动程序的全局 loop，并从对象和回调关联到关闭路径。 |
-| OpenCV WeChatQRCode 扫描崩溃 | 使用已知现场或经确认的样本。候选基线为 2021 年的 `opencv-contrib-python==4.5.4.60`，源码构建对应 `opencv` 和 `opencv_contrib` 的 `4.5.4` 标签。记录运行器版本、模型文件和匹配的共享库。当前样本、候选版本复现及新版修复状态均待确认。 | 带符号档报告故障指令、访问地址和源码位置，并追溯异常状态的来源。仅动态符号档报告模块、模块内偏移、故障指令和可恢复的调用链。只有崩溃栈顶算部分完成。 |
-
-后续候选包括 SQLite 的事务持锁与 `SQLITE_BUSY`、LevelDB 快照读到已删除键的旧值，以及 OpenSSL 本地握手的证书验证故障。每题用可复现的驱动或现成故障现场，验收结论所需证据。
-
-### WSL 产物生成与自动验收
-
-- 提供可在 Ubuntu WSL 使用的准备脚本，负责构建、执行正常对照、验证故障症状并保存产物。libuv 对照须在时限内退出，故障组须先完成初始化并在时限到达时仍未退出。脚本失败时输出对应构建或验收日志。
-- 仅动态符号档使用无 `-g` 构建并剥离静态符号。脚本用 `readelf` 确认目标没有 DWARF、`.symtab` 或外部调试链接，仍保留 `.dynsym` 和 unwind 信息。评测环境禁用 debuginfod，避免独立调试包补回题目涉及的模块符号。
-- 对已确认的本地故障命令，GDB 批处理在 `SIGSEGV` 停止后自动执行 `generate-core-file`。脚本检查实际停止信号和非空 ELF core，同时记录匹配的可执行文件、共享库及构建 ID。已有 core 可以直接入题。OpenCV 可用于正式评分的前提是配齐可核验的现场与匹配构建。
-- 参测模型只收到题面和该档需要的程序、core、共享库及符号文件。故障生成源码、对照日志、GDB 采集日志及标准证据留在出题方。脚本仅验收产物与症状，定位与解释由参测模型完成。
